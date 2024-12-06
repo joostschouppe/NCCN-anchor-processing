@@ -271,58 +271,11 @@ GRANT ALL ON TABLE fdw.fdw_stations TO paragon;
                             
 ### Execute the SQL commands ----
 
-create_ingestion_table <- function() {
-  con_pg <- get_con()
-  tryCatch(
-    {
-      for (sql_command in ingestion_table_sql) {
-        dbExecute(con_pg, sql_command)
-      }
-      print("Ingestion table SQL ran without error")
-    },
-    error = function(err) {
-      print("The SQL functions for the ingestion table failed")
-      print(err)  # Print the error message for more details
-    }
-  )
-  dbDisconnect(con_pg)
-}
 
+create_ingestion_table <- function() {execute_sql_commands(ingestion_table_sql, "Ingestion table")}
+create_transformation_table <- function() {execute_sql_commands(transformation_table_sql, "Transformation table")}
+create_fdw_views <- function() {execute_sql_commands(fdw_views_sql, "FDW view")}
 
-create_transformation_table <- function() {
-  con_pg <- get_con()
-  tryCatch(
-    {
-      for (sql_command in transformation_table_sql) {
-        dbExecute(con_pg, sql_command)
-      }
-      print("Transformation table SQL ran without error")
-    },
-    error = function(err) {
-      print("The SQL functions for the transformation table failed")
-      print(err)  # Print the error message for more details
-    }
-  )
-  dbDisconnect(con_pg)
-}
-
-
-create_fdw_views <- function() {
-  con_pg <- get_con()
-  tryCatch(
-    {
-      for (sql_command in fdw_views_sql) {
-        dbExecute(con_pg, sql_command)
-      }
-      print("FDW table SQL ran without error")
-    },
-    error = function(err) {
-      print("The SQL functions for the FDW views failed")
-      print(err)  # Print the error message for more details
-    }
-  )
-  dbDisconnect(con_pg)
-}
 
 
 # set to TRUE if you want to update the transformation table even if the checks fail. 

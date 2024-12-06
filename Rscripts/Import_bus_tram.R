@@ -42,6 +42,10 @@ distance_threshold_merge_extraregional <- 15
 
 # Libraries -------------------------------
 # """""""""""""""""" ----------------------
+library(sf) # simple features packages for handling vector GIS data
+library(httr) # generic webservice package
+library(tidyverse) # a suite of packages for data wrangling, transformation, plotting, ...
+library(ows4R) # interface for OGC webservices
 
 
 # Download data -----------------------------------------------------------
@@ -98,6 +102,10 @@ vl_haltes <- do.call(rbind, all_features)
 
 vl_haltes_raw<-vl_haltes
 
+# set all columns to lowercase
+vl_haltes <- vl_haltes %>% 
+  rename_all(tolower)
+
 # Print the number of features retrieved
 cat("Total VL stops retrieved:", nrow(vl_haltes), "\n")
 
@@ -119,18 +127,23 @@ cat("Total VL routes retrieved:", nrow(reiswegen), "\n")
 
 reiswegen_raw<-reiswegen
 
+# set all columns to lowercase
+reiswegen <- reiswegen %>% 
+  rename_all(tolower)
+
+
 # turn into SF dataset
 reiswegen <- reiswegen %>% 
   st_cast(to = "MULTILINESTRING")
 
 # select only if voertuig=Tram
 reiswegen_tram <- reiswegen %>% 
-  filter(VOERTUIG == "Tram")
+  filter(voertuig == "Tram")
 
 
 # keep only voertuig column
 reiswegen_tram <- reiswegen_tram %>% 
-  select(VOERTUIG)
+  select(voertuig)
 
 # add to haltes using st_within distance_matched_threshold
 haltes_joined <- st_join(vl_haltes, reiswegen_tram, join = st_is_within_distance, dist = distance_threshold_tram)
@@ -139,9 +152,6 @@ haltes_joined <- st_join(vl_haltes, reiswegen_tram, join = st_is_within_distance
 haltes_joined <- haltes_joined %>% 
   distinct()
 
-# set all columns to lower case
-haltes_joined <- haltes_joined %>% 
-  rename_all(tolower)
 
 #standardize data format
 vl_haltes<-haltes_joined
@@ -152,19 +162,45 @@ vl_haltes<-vl_haltes %>%
   mutate(tram=ifelse(voertuig=="Tram", 1, 0))
 
 
-# aggregate
-# TODO: replace with faster procedure
-vl_haltes_agg <- vl_haltes %>%
+
+# Step 1: Identify non-unique geometries
+geom_duplicates <- vl_haltes %>%
   mutate(geom_wkt = st_as_text(geometry)) %>%
+  group_by(geom_wkt) %>%
+  filter(n() > 1) %>%
+  ungroup()
+
+# Step 2: Separate unique geometries
+geom_duplicate_ids <- as.data.frame(geom_duplicates) %>%
+  select(id)
+
+geom_unique <- vl_haltes %>%
+  mutate(geom_wkt = st_as_text(geometry),
+         original_id = id,
+         stopid = as.character(stopid),
+         source = "De Lijn") %>%
+  anti_join(geom_duplicate_ids, by = "id")
+
+# Step 3: Aggregate the duplicates
+geom_aggregated <- geom_duplicates %>%
   group_by(geom_wkt) %>%
   summarize(
     original_id = paste(unique(id), collapse = '; '),
-    source="De Lijn",
+    source = "De Lijn",
     tram = max(tram),
     name_dut = paste(unique(naamhalte), collapse = '; '),
-    stop_type= paste(unique(lbltypehal), collapse = '; '),
-    stopid = paste(unique(stopid), collapse = '; ')) %>%
+    stop_type = paste(unique(lbltypehal), collapse = '; '),
+    stopid = paste(unique(stopid), collapse = '; '),
+    geometry = first(geometry) # Retain the geometry
+  ) %>%
+  ungroup() %>%
   select(-geom_wkt)
+
+# Step 4: Combine unique and aggregated geometries
+vl_haltes_agg <- bind_rows(geom_unique, geom_aggregated)
+
+
+
 
 
 cat("Total VL stops retrieved:", nrow(vl_haltes), "\n")
@@ -192,8 +228,17 @@ unzipped_folder <- unzipped_contents[1]
 brussels_stops <- st_read(paste0(unzipped_folder,"/ACTU_STOPS.shp"))
 brussels_stops_raw<-brussels_stops
 
+# set all columns to lowercase
+brussels_stops <- brussels_stops %>% 
+  rename_all(tolower)
+
+
 brussels_lines <- st_read(paste0(unzipped_folder,"/ACTU_LIGNES_BRUTES.shp"))
 brussels_lines_raw<-brussels_lines
+
+# set all columns to lowercase
+brussels_lines <- brussels_lines %>% 
+  rename_all(tolower)
 
 cat("Total BRU stops:", nrow(brussels_stops), "\n")
 cat("Total BRU lines:", nrow(brussels_lines), "\n")
@@ -219,19 +264,44 @@ brussels_stops <- brussels_stops %>%
   )
 
 
-brussels_stops_agg <- brussels_stops %>%
+
+# Identify non-unique geometries
+geom_duplicates <- brussels_stops %>%
   mutate(geom_wkt = st_as_text(geometry)) %>%
+  group_by(geom_wkt) %>%
+  filter(n() > 1) %>%
+  ungroup()
+
+# Step 2: Separate unique geometries
+geom_duplicate_ids <- as.data.frame(geom_duplicates) %>%
+  select(stop_id)
+
+geom_unique <- brussels_stops %>%
+  mutate(geom_wkt = st_as_text(geometry),
+         original_id = as.character(stop_id),
+         source = "STIB") %>% # Ensure stop_id is character
+  anti_join(geom_duplicate_ids, by = "stop_id")
+
+# Step 3: Aggregate the duplicates
+geom_aggregated <- geom_duplicates %>%
   group_by(geom_wkt) %>%
   summarize(
     original_id = paste(unique(stop_id), collapse = '; '),
-    source="STIB",
+    source = "STIB",
     tram = max(tram),
     metro = max(metro),
     bus = max(bus),
     name_dut = paste(unique(alpha_nl), collapse = '; '),
-    name_fre = paste(unique(alpha_fr), collapse = '; ')
+    name_fre = paste(unique(alpha_fr), collapse = '; '),
+    geometry = first(geometry) # Retain the geometry
   ) %>%
+  ungroup() %>%
   select(-geom_wkt)
+
+# Step 4: Combine unique and aggregated geometries
+brussels_stops_agg <- bind_rows(geom_unique, geom_aggregated)
+
+
 
 cat("Total BRU stops:", nrow(brussels_stops), "\n")
 cat("Total BRU lines:", nrow(brussels_lines), "\n")
@@ -294,6 +364,9 @@ cat("Total WAL stops:", nrow(wal_poteaux), "\n")
 
 wal_poteaux_raw <- wal_poteaux
 
+# set all columns to lowercase
+wal_poteaux <- wal_poteaux %>% 
+  rename_all(tolower)
 
 # Download Wallonia lines
 # Define the base WFS URL
@@ -345,11 +418,15 @@ cat("Total WAL lines:", nrow(wal_lines), "\n")
 
 wal_lines_raw <- wal_lines
 
+# set all columns to lowercase
+wal_lines <- wal_lines %>% 
+  rename_all(tolower)
+
 # metro lines: "LGN_NUM" = 'M1', M2', 'M3', 'M3AB', 'M4'
 wal_lines <- wal_lines %>%
-  mutate(tram=ifelse(LGN_NUM %in% c('M1','M1AB', 'M2', 'M3', 'M3AB', 'M4', 'M4AB'),1,0)) %>%
+  mutate(tram=ifelse(lgn_num %in% c('M1','M1AB', 'M2', 'M3', 'M3AB', 'M4', 'M4AB'),1,0)) %>%
   mutate(metro=0) %>%
-  mutate(bus=ifelse(LGN_NUM %in% c('M1','M1AB', 'M2', 'M3', 'M3AB', 'M4', 'M4AB'),0,1))
+  mutate(bus=ifelse(lgn_num %in% c('M1','M1AB', 'M2', 'M3', 'M3AB', 'M4', 'M4AB'),0,1))
 
 # check: count the number of times any value of lgn_id is used
 wal_lines_check <- as.data.frame(wal_lines) %>%
@@ -371,21 +448,49 @@ wal_poteaux_joined <- st_join(wal_poteaux, wal_lines_tram, join = st_is_within_d
 wal_poteaux_joined <- wal_poteaux_joined %>% 
   distinct()
 
+# if pmr is '<Nul>' or 'null' or an empty string, set it as NA
+wal_poteaux_joined <- wal_poteaux_joined %>%
+  mutate(pmr=ifelse(pmr %in% c('<Nul>', 'null', ''), NA, pmr))
+
+
 
 # spatial aggregation
-wal_poteaux_agg <- wal_poteaux_joined %>%
+# Step 1: Identify non-unique geometries
+geom_duplicates <- wal_poteaux_joined %>%
   mutate(geom_wkt = st_as_text(geometry)) %>%
   group_by(geom_wkt) %>%
+  filter(n() > 1) %>%
+  ungroup()
+
+# Step 2: Separate unique geometries
+geom_duplicate_ids <- as.data.frame(geom_duplicates) %>%
+  select(globalid)
+
+geom_unique <- wal_poteaux_joined %>%
+  mutate(geom_wkt = st_as_text(geometry),
+         original_id=as.character(globalid),
+         source = "TEC") %>% # Ensure globalid is character
+  anti_join(geom_duplicate_ids, by = "globalid")
+
+# Step 3: Aggregate the duplicates
+geom_aggregated <- geom_duplicates %>%
+  group_by(geom_wkt) %>%
   summarize(
-    original_id = paste(unique(GlobalID), collapse = '; '),
-    source="TEC",
-    name_fre = paste(unique(POT_NOM), collapse = '; '),
-    arret_id = paste(unique(ARRET_ID), collapse = '; '),
-    pmr = paste(unique(PMR), collapse = '; '),
-    pot_id = paste(unique(POT_ID), collapse = '; '),
-    tram = max(tram)
+    original_id = paste(unique(globalid), collapse = '; '),
+    source = "TEC",
+    name_fre = paste(unique(pot_nom), collapse = '; '),
+    arret_id = paste(unique(arret_id), collapse = '; '),
+    pmr = paste(unique(pmr), collapse = '; '),
+    pot_id = paste(unique(pot_id), collapse = '; '),
+    tram = max(tram),
+    geometry = first(geometry) # Retain the geometry
   ) %>%
+  ungroup() %>%
   select(-geom_wkt)
+
+# Step 4: Combine unique and aggregated geometries
+wal_poteaux_agg <- bind_rows(geom_unique, geom_aggregated)
+
 
 cat("Total WAL stops:", nrow(wal_poteaux), "\n")
 cat("Total WAL lines:", nrow(wal_lines), "\n")
@@ -394,7 +499,7 @@ cat("Total WAL stops after simplify:", nrow(wal_poteaux_agg), "\n")
 
 ### Unify the lines ----
 
-# VL set all names to lower
+
 # keep only some columns
 reiswegen <- reiswegen %>%
   rename_all(tolower) %>%
@@ -410,9 +515,8 @@ reiswegen <- reiswegen %>%
 
 # BRU
 brussels_lines <- brussels_lines %>%
-  select(LIGNE,VARIANTE) %>%
-  mutate(source="STIB") %>%
-  rename_all(tolower)
+  select(ligne,variante) %>%
+  mutate(source="STIB")
 
 # extract the last digit of the ligne
 brussels_lines <- brussels_lines %>% 
@@ -426,7 +530,6 @@ brussels_lines <- brussels_lines %>%
 
 # WAL
 wal_lines <- wal_lines %>%
-  rename_all(tolower) %>%
   select(-gmlid,-shape_length) %>%
   mutate(source="TEC")
 
@@ -445,6 +548,7 @@ all_lines <- all_lines %>%
 
 # combine all stops
 all_stops <- bind_rows(vl_haltes_agg, brussels_stops_agg, wal_poteaux_agg)
+
 
 # join region
 
@@ -469,6 +573,7 @@ ngi_muni <- st_transform(ngi_muni, 31370)
 # spatial join to stop data
 all_stops <- st_join(all_stops, ngi_muni, join = st_within)
 
+
 # identify stops outside their main region
 all_stops <- all_stops %>%
   mutate (region_type=ifelse(
@@ -486,8 +591,6 @@ all_stops <- all_stops %>%
 
 
 
-
-
 # merge stops from outside the region to nearest stop within the region if closer than 15 meters
 # 1. Separate the stops into normal and special
 normal_stops <- all_stops %>% filter(region_type == "normal")
@@ -497,10 +600,16 @@ special_stops <- all_stops %>% filter(region_type == "special")
 # Get the distance between each special stop and all normal stops
 distances <- st_distance(special_stops, normal_stops)
 
+
+
+
+
 # 3. Identify the closest normal stop
 # For each special stop, find the index of the nearest normal stop
 min_distances <- apply(distances, 1, min)
 nearest_indices <- apply(distances, 1, which.min)
+
+
 
 # 4. Assign merge_id if the distance is less than 15 meters
 special_stops <- special_stops %>%
@@ -509,11 +618,11 @@ special_stops <- as.data.frame(special_stops) %>%
   select(original_id,merge_id) %>%
   filter(!is.na(merge_id))
 
-
 # 5. Combine the datasets back together
 all_stops <- all_stops %>%
   left_join(special_stops, by = c("original_id" = "original_id")) %>%
   mutate(merge_id = ifelse(is.na(merge_id), original_id, merge_id))
+
 
 # 6. Aggregate the stops
 
@@ -524,40 +633,85 @@ all_stops <- all_stops %>%
   mutate(count = n()) %>%
   ungroup()
 
-# create tec_properties
+# create TEC properties
 all_stops <- all_stops %>%
-  rowwise() %>%
-  mutate(tec_properties = jsonlite::toJSON(
-    purrr::discard(list(
-      original_id = original_id,
-      arret_id=arret_id,
-      pmr=pmr,
-      pot_id=pot_id
-    ), is.na), auto_unbox = TRUE))
+  mutate(
+    tec_properties = ifelse(
+      source == "TEC",
+      jsonlite::toJSON(
+        purrr::discard(list(
+          arret_id = arret_id,
+          pmr = pmr,
+          pot_id = pot_id
+        ), is.na), auto_unbox = TRUE
+      ),
+      NA
+    ),
+    tec_properties_secondary = ifelse(
+      source == "TEC",
+      jsonlite::toJSON(
+        purrr::discard(list(
+          original_id = original_id,
+          arret_id = arret_id,
+          pmr = pmr,
+          pot_id = pot_id
+        ), is.na), auto_unbox = TRUE
+      ),
+      NA
+    )
+  )
+
 
 # create delijn_properties
 
 all_stops <- all_stops %>%
   rowwise() %>%
-  mutate(delijn_properties = jsonlite::toJSON(
-    purrr::discard(list(
-      original_id = original_id,
-      stop_type= stop_type,
-      stopid = stopid),
-      is.na), auto_unbox = TRUE))
+  mutate(
+    delijn_properties = ifelse(
+      source == "De Lijn",
+      jsonlite::toJSON(
+        purrr::discard(list(
+          stop_type = stop_type,
+          stopid = stopid
+        ), is.na), auto_unbox = TRUE),
+      NA
+    ),
+    delijn_properties_secondary = ifelse(
+      source == "De Lijn",
+      jsonlite::toJSON(
+        purrr::discard(list(
+          original_id = original_id,
+          stop_type = stop_type,
+          stopid = stopid
+        ), is.na), auto_unbox = TRUE),
+      NA
+    )
+  )
+
+
 
 # create mivb_properties
 all_stops <- all_stops %>%
   rowwise() %>%
-  mutate(mivb_properties = jsonlite::toJSON(
-    purrr::discard(list(
-      original_id = original_id),
-      is.na), auto_unbox = TRUE))
+  mutate(
+    mivb_properties_secondary = ifelse(
+      source == "STIB",
+      jsonlite::toJSON(
+        purrr::discard(list(
+          original_id = original_id
+        ), is.na), auto_unbox = TRUE),
+      NA
+    )
+  )
+
+
 
 
 # remove the columns used to make properties
 all_stops <- all_stops %>%
   select(-arret_id, -pot_id, -pmr, -stop_type, -stopid)
+
+
 
 
 all_stops <- all_stops %>%
@@ -577,6 +731,7 @@ all_stops <- all_stops %>%
 
 
 
+
 # put the correct properties in the correct columns
 ## select rows where count > 1 and the source is not the source of the region. Remove these rows from the main dataset
 mergeable_stops <- all_stops %>% filter(count > 1 & region_type == "special")
@@ -585,20 +740,22 @@ unmergeable_stops <- all_stops %>% filter(count == 1 | (count > 1 & region_type 
 ## in the main dataset, set the properties column with the content of that region if count=1 or count>1 and source is the source of the region
 unmergeable_stops <- unmergeable_stops %>%
   mutate(properties = case_when(
-    source == "STIB" ~ mivb_properties,
     source == "De Lijn" ~ delijn_properties,
     source == "TEC" ~ tec_properties
   ))
 unmergeable_stops <- unmergeable_stops %>%
-  select(-mivb_properties, -delijn_properties, -tec_properties)
+  select(-delijn_properties, -tec_properties)
 
 ## in the selection, set properties_secondary with the content of the source
 mergeable_stops <- mergeable_stops %>%
   mutate(properties_secondary = case_when(
-    source == "STIB" ~ mivb_properties,
-    source == "De Lijn" ~ delijn_properties,
-    source == "TEC" ~ tec_properties
+    source == "STIB" ~ mivb_properties_secondary,
+    source == "De Lijn" ~ delijn_properties_secondary,
+    source == "TEC" ~ tec_properties_secondary
   ))
+
+
+
 
 ## add the uuid of the source to the properties
 
@@ -880,102 +1037,14 @@ SELECT id, original_id, name, legend_item, data_list_id, properties, geometry, c
 ")
 
 
-### Create fdw views ----
-fdw_views_stops_sql <- c("
-DROP VIEW IF EXISTS fdw.fdw_bus_tram_metro_stops CASCADE;
-","
-CREATE OR REPLACE VIEW fdw.fdw_bus_tram_metro_stops
-AS
-SELECT id,
-original_id,
-name,
-legend_item,
-NULL::uuid as best_address_id,
-NULL::uuid as capakey_id,
-data_list_id,
-risk_level,
-properties,
-properties_secondary,
-imported_at,
-tags,
-deleted_at,
-updated_at,
-created_at,
-created_by,
-updated_by,
-st_reduceprecision(geometry, 0.000001::double precision) AS geometry,
-st_reduceprecision(st_pointonsurface(geometry), 0.000001::double precision) AS geometry_pt,
-CASE
-  WHEN st_geometrytype(geometry) = ANY (ARRAY['ST_Point'::text, 'ST_LineString'::text]) THEN st_reduceprecision(st_transform(st_buffer(st_transform(geometry, 31370), 20::double precision), 4326), 0.000001::double precision)
-  ELSE geometry
-  END AS geometry_pg
-FROM transformation.bus_tram_metro_stops;
-","
-GRANT ALL ON TABLE fdw.fdw_bus_tram_metro_stops TO paragon;
-")
-
-fdw_views_routes_sql <- c("
-DROP VIEW IF EXISTS fdw.fdw_bus_tram_metro_routes CASCADE;
-","
-CREATE OR REPLACE VIEW fdw.fdw_bus_tram_metro_routes
-AS
-SELECT id,
-original_id,
-name,
-legend_item,
-NULL::uuid as best_address_id,
-NULL::uuid as capakey_id,
-data_list_id,
-risk_level,
-properties,
-properties_secondary,
-imported_at,
-tags,
-deleted_at,
-updated_at,
-created_at,
-created_by,
-updated_by,
-st_reduceprecision(geometry, 0.000001::double precision) AS geometry,
-st_reduceprecision(st_pointonsurface(geometry), 0.000001::double precision) AS geometry_pt,
-CASE
-  WHEN st_geometrytype(geometry) = ANY (ARRAY['ST_Point'::text, 'ST_LineString'::text]) THEN st_reduceprecision(st_transform(st_buffer(st_transform(geometry, 31370), 20::double precision), 4326), 0.000001::double precision)
-  ELSE geometry
-  END AS geometry_pg
-FROM transformation.bus_tram_metro_routes;
-","
-GRANT ALL ON TABLE fdw.fdw_bus_tram_metro_routes TO paragon;
-")
 
 
 
 ### Execute the SQL commands ----
-execute_sql_commands <- function(sql_commands, task_name) {
-  con_pg <- get_con()
-  tryCatch(
-    {
-      for (sql_command in sql_commands) {
-        dbExecute(con_pg, sql_command)
-      }
-      print(paste(task_name, "SQL ran without error"))
-    },
-    error = function(err) {
-      message(paste("The SQL functions for", task_name, "failed"))
-      message(err)  # Print the error message for more details
-    }
-  )
-  dbDisconnect(con_pg)
-}
-
-# Now you can call this function for different tasks:
-
 create_ingestion_table_stops <- function() {execute_sql_commands(ingestion_table_stops_sql, "Stops Ingestion table")}
 create_ingestion_table_routes <- function() {execute_sql_commands(ingestion_table_routes_sql, "Routes Ingestion table")}
 create_transformation_table_stops <- function() {execute_sql_commands(transformation_table_stops_sql, "Stops Transformation table")}
 create_transformation_table_routes <- function() {execute_sql_commands(transformation_table_routes_sql, "Routes Transformation table")}
-create_fdw_views_stops <- function() {execute_sql_commands(fdw_views_stops_sql, "FDW Stops views")}
-create_fdw_views_routes <- function() {execute_sql_commands(fdw_views_routes_sql, "FDW Routes views")}
-
 
 
 # set to TRUE if you want to update the transformation table even if the checks fail. 
@@ -984,7 +1053,7 @@ update_even_if_checks_fail<-FALSE
 
 run_smart_update = function() {
   smart_update_process("bus_tram_metro_stops", 50, 100, 50, format(Sys.Date(), "%Y-%m-%d"), update_even_if_checks_fail)
-  smart_update_process("bus_tram_metro_routes", 50, 100, 50, format(Sys.Date(), "%Y-%m-%d"), update_even_if_checks_fail)
+  smart_update_process("bus_tram_metro_routes", 200, 400, 200, format(Sys.Date(), "%Y-%m-%d"), update_even_if_checks_fail)
 }
 
 
@@ -1008,8 +1077,6 @@ main_function = function() {
   run_smart_update()
   #create_transformation_table_stops()
   #create_transformation_table_routes()
-  #create_fdw_views_stops()
-  #create_fdw_views_routes()
 }
 
 if(F){
