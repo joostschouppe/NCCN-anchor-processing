@@ -12,6 +12,7 @@
 ## ---------------------------
 
 
+
 # Load variables -----------------------------------------------------------
 #  """""""""""""""""" ----------------------
 
@@ -24,6 +25,7 @@ db_name<- Sys.getenv("POSTGRES_DB_NAME_CURATED")
 
 data_list_id_osm<-"bd623971-34e3-4518-a220-eb8d26d757ad"
 data_list_id_helipad<-"14d5bc60-ffb0-4565-b132-fc4bd9dd156d"
+data_list_id_emergency_entrance<-"6f0fbe5c-7731-40e7-b50b-33c4aecd16a5"
 log_folder <- "C:/temp/logs/"
 
 ### Load external functions ------
@@ -41,13 +43,10 @@ library(DBI)
 
 ## Data processing libraries
 library(dplyr)
-
+library(stringr)
 
 ## OSM library
 library(osmdata)
-
-# TODO
-## analyse for hospital within hospital with new cc logic?
 
 
 
@@ -61,16 +60,16 @@ library(osmdata)
 # EXTRACT ----
 # """""""""""""""""" ----
 
+# Load & transform hospital data ----
 
-# Download OSM data ----
 ### OSM DOWNLOAD PARAMETERS ----
 
 # Define the list of features
-features_list <- list("amenity"="hospital", "healthcare"="hospital")
+features_list <- list("amenity"="hospital")
 # If default server fails, set to TRUE to use mail.ru server (older data)
-alternative_overpass_server<-TRUE
+alternative_overpass_server<-FALSE
 # Define extra tags to use as columns for properties
-extra_columns <- c("amenity","description","email","emergency","emergency:phone","fax","full_name","healthcare", "healthcare:speciality","loc_name","opening_hours:visitors","start_date")
+extra_columns <- c("amenity","description","email","emergency","emergency:phone","fax","full_name","healthcare", "healthcare:speciality","loc_name","opening_hours:visitors","start_date", "ref:fps_health:recognition", "ref:fps_health:campus","emergency_ward")
 # Choose which datatypes are needed, as a list of datatypes, using any of "points", "lines", "mpolygons" (this is polygons+multipolygons together)
 datatypes <- c("points", "mpolygon")
 
@@ -78,31 +77,20 @@ datatypes <- c("points", "mpolygon")
 
 tryCatch({
   # Call the large function
-  osm_all<-download_osm_process(features_list, datatypes, extra_columns, alternative_overpass_server, keep_region=TRUE)
+  osm_all<-download_osm_process(features_list, datatypes, extra_columns, keep_region=TRUE, postgres=TRUE)
   print("OSM data downloaded & processes succesfully")
 }, error = function(e) {
   # Print error message
   print(paste("Something went wrong:", e$message))
 })
 
-
-
-
-
-
-# TRANSFORM ----
-# """""""""""""""""" ----
-
 # remove objects that do NOT actually have a hospital tag (this is an artifact from the site relation)
 osm_all <- osm_all %>%
-  filter(amenity=="hospital" | healthcare=="hospital")
+  filter(amenity=="hospital")
 
 # remove emergency ward entrances (these are interesting, but not actual hospitals)
 osm_all <- osm_all %>%
   filter(emergency!="emergency_ward_entrance" | is.na(emergency))
-
-
-
 
 # Find all hospitals within other hospitals
 joined_all <- st_join(osm_all, osm_all, join = st_within)
@@ -120,13 +108,10 @@ osm_all <- osm_all %>%
   mutate(risk_level=ifelse(grepl("psychiatry|child_psychiatry|neuropsychiatry",healthcare_speciality),3,2))
 
 
-# Load helipads
-
+# Load & transform helipads ----
 
 # Define the list of features
 features_list <-list("operator:type"="hospital")
-# If default server fails, set to TRUE to use mail.ru server (older data)
-alternative_overpass_server<-TRUE
 # Define extra tags to use as columns for properties
 extra_columns <- c("description","no:network","not:network","icao","maxweight","reservation","surface","aeroway","diameter","network")
 # Choose which datatypes are needed, as a list of datatypes, using any of "points", "lines", "mpolygons" (this is polygons+multipolygons together)
@@ -136,7 +121,7 @@ datatypes <- c("points", "mpolygon")
 
 tryCatch({
   # Call the large function
-  osm_helipad<-download_osm_process(features_list, datatypes, extra_columns, alternative_overpass_server, keep_region=TRUE)
+  osm_helipad<-download_osm_process(features_list, datatypes, extra_columns, keep_region=TRUE, postgres=TRUE)
   print("OSM data downloaded & processes succesfully")
 }, error = function(e) {
   # Print error message
@@ -154,8 +139,100 @@ helipad_test <- osm_helipad %>%
 cat(paste("Inconsistencies in helipad data: ",nrow(helipad_test),"\n"))
 
 
+# replace the geometry of heliports with the geometry of the helipad within it (if there's only one)
+## select heliports
+osm_heliport <- osm_helipad %>%
+  filter(aeroway=="heliport")
+## calculate bbox for each row
+
+osm_heliport_bbox <- osm_helipad %>%
+  filter(aeroway == "heliport") %>%
+  rowwise() %>%
+  mutate(
+    minx = as.numeric(st_bbox(geometry)["xmin"]),
+    miny = as.numeric(st_bbox(geometry)["ymin"]),
+    maxx = as.numeric(st_bbox(geometry)["xmax"]),
+    maxy = as.numeric(st_bbox(geometry)["ymax"])
+  ) %>%
+  ungroup()
+
+# Create a numeric vector from the four columns in each row
+osm_heliport_bbox <- osm_heliport_bbox %>%
+  mutate(bbox = pmap(list(minx, miny, maxx, maxy), ~ c(...)))
 
 
+bbox_numeric <- unlist(osm_heliport_bbox$bbox[1])
+
+# add a stop if this is more than one row
+if (nrow(osm_heliport_bbox) > 1) {
+  stop("More than one row in osm_heliport_bbox - please adapt script to deal with this")
+}
+
+
+features_list <-list("aeroway"="helipad")
+tryCatch({
+  # Call the large function
+  osm_helipad_within<-download_osm_process(features_list, datatypes, extra_columns, alternative_overpass_server, bbox=bbox_numeric, keep_region=TRUE)
+  print("OSM data downloaded & processes succesfully")
+}, error = function(e) {
+  # Print error message
+  print(paste("Something went wrong:", e$message))
+})
+
+# replace the geometry
+# Assuming both datasets are in sf format and each contains only one record
+# Extract the geometry from the first (and only) record in osm_helipad_within
+new_geometry <- osm_helipad_within$geometry[1]
+
+# Replace the geometry in osm_heliport
+osm_heliport$geometry[1] <- new_geometry
+
+# replace the record
+osm_helipad <- osm_helipad %>%
+  filter(aeroway=="helipad")
+osm_helipad <- rbind(osm_helipad, osm_heliport)
+
+
+
+
+# Load & transform emergency ward entrance data ----
+
+### OSM DOWNLOAD PARAMETERS ----
+
+# Define the list of features
+features_list <- list("emergency"="emergency_ward_entrance")
+# Define extra tags to use as columns for properties
+extra_columns <- c("emergency_ward_entrance")
+# Choose which datatypes are needed, as a list of datatypes, using any of "points", "lines", "mpolygons" (this is polygons+multipolygons together)
+datatypes <- c("points")
+
+### Actual OSM download & transformation ----
+
+tryCatch({
+  # Call the large function
+  osm_emergency_entrance<-download_osm_process(features_list, datatypes, extra_columns, keep_region=TRUE, postgres=TRUE)
+  print("OSM data downloaded & processes succesfully")
+}, error = function(e) {
+  # Print error message
+  print(paste("Something went wrong:", e$message))
+})
+
+
+# Select core hospital data (multipolygon only)
+hospitals <- osm_all %>%
+  mutate(geometry_type = st_geometry_type(geometry)) %>%
+  filter(geometry_type == "MULTIPOLYGON" | geometry_type == "POLYGON") %>%
+  select(hospital_osm_id=osm_id, hospital_name=name)
+
+# Join hospital data as point in polygon
+osm_emergency_entrance <- osm_emergency_entrance %>%
+  st_join(hospitals, join = st_within)
+
+# If there are emergency ward entrances that are not in a hospital, then they should be reviewed. There's only one case within Belgium though (18/10/2024); it's case we can throw out
+# select only wards within hopsitals
+osm_emergency_entrance <- osm_emergency_entrance %>%
+  filter(!is.na(hospital_osm_id))
+  
 
 ### Create SQL for proper ingestion table ----
 
@@ -192,10 +269,16 @@ WITH simplified as (
   CASE WHEN contact_email IS NULL AND email IS NULL THEN NULL
 	  ELSE CONCAT_WS('; ',contact_email, email,operator_email) END AS email,
   operator_email,
-  CONCAT_WS('; ',emergency_phone, contact_mobile, mobile, contact_phone, phone) AS phone,
-  CASE WHEN contact_mobile IS NULL AND mobile IS NULL AND contact_phone IS NULL AND phone IS NULL AND phone_2 IS NULL AND emergency_phone IS NULL AND contact_mobile IS NULL THEN NULL
-	ELSE CONCAT_WS('; ',contact_mobile, mobile, contact_phone, phone, phone_2, emergency_phone, contact_mobile) END AS local_phone,
+  CASE WHEN contact_mobile IS NULL AND mobile IS NULL AND contact_phone IS NULL AND phone IS NULL AND phone_2 IS NULL AND emergency_phone IS NULL THEN NULL
+	ELSE CONCAT_WS('; ',contact_mobile, mobile, contact_phone, phone, phone_2, emergency_phone) END AS phone,
   emergency AS has_emergency_ward,
+  CASE WHEN emergency_ward='complete' THEN 'complete' 
+  WHEN emergency_ward='limited' THEN 'limited' 
+  WHEN emergency='yes' then 'yes'
+  WHEN emergency='no' then 'no'
+  ELSE 'unknown' END AS emergency_ward_type,
+  ref_fps_health_recognition AS fps_health_recognition,
+  ref_fps_health_campus AS fps_health_campus,
   healthcare_speciality,
   image as image_url,
 jsonb_strip_nulls(jsonb_build_object(
@@ -203,16 +286,20 @@ jsonb_strip_nulls(jsonb_build_object(
               'fre', name_fr,
               'ger', name_de,
               'dut', name_nl)) as name,
-  CONCAT_WS('; ',short_name, official_name, alt_name, full_name, loc_name) AS other_names,
-  CONCAT_WS('; ',opening_hours, opening_hours_visitors) as opening_hours,
+  CASE WHEN short_name IS NULL AND official_name IS NULL AND alt_name IS NULL AND full_name IS NULL AND loc_name IS NULL THEN NULL
+     ELSE CONCAT_WS('; ', short_name, official_name, alt_name, full_name, loc_name)
+	 END AS other_names,
+	CASE WHEN opening_hours IS NULL AND opening_hours_visitors IS NULL THEN NULL
+	  ELSE CONCAT_WS('; ',opening_hours, opening_hours_visitors) END as opening_hours,
   operator,
   CASE WHEN website IS NULL AND contact_website IS NULL THEN NULL
 	ELSE CONCAT_WS('; ',website, contact_website) END AS website,
 	wikidata,
+	risk_level,
   geometry
   FROM raw_data.osm_hospitals)
 
-INSERT INTO ingestion.hospitals (original_id, name, legend_item, data_list_id, properties, geometry, created_at)
+INSERT INTO ingestion.hospitals (original_id, name, legend_item, data_list_id, risk_level, properties, geometry, created_at)
 SELECT
 osm_id as original_id,
 name,
@@ -223,11 +310,14 @@ JSONB_BUILD_OBJECT(
   'eng', 'hospital'
 ) as legend_item,
 '",data_list_id_osm,"'::uuid as data_list_id,
+risk_level as risk_level,
 JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
   'address', address,
   'email', email,
   'phone', phone,
-  'has emergency ward', has_emergency_ward,
+  'emergency_ward_type', emergency_ward_type,
+  'fps_health_recognition', fps_health_recognition,
+  'fps_health_campus', fps_health_campus,
   'healthcare speciality', healthcare_speciality,
   'image url', image_url,
   'opening hours', opening_hours,
@@ -277,9 +367,8 @@ WITH simplified as (
   CASE WHEN contact_email IS NULL AND email IS NULL THEN NULL
   ELSE CONCAT_WS('; ',contact_email, email,operator_email) END AS email,
   operator_email,
-  CONCAT_WS('; ', contact_mobile, mobile, contact_phone, phone) AS phone,
-  CASE WHEN contact_mobile IS NULL AND mobile IS NULL AND contact_phone IS NULL AND phone IS NULL AND phone_2 IS NULL AND contact_mobile IS NULL THEN NULL
-  ELSE CONCAT_WS('; ',contact_mobile, mobile, contact_phone, phone, phone_2, contact_mobile) END AS local_phone,
+  CASE WHEN contact_mobile IS NULL AND mobile IS NULL AND contact_phone IS NULL AND phone IS NULL AND phone_2 IS NULL THEN NULL
+  ELSE CONCAT_WS('; ',contact_mobile, mobile, contact_phone, phone, phone_2) END AS local_phone,
   opening_hours,
   operator,
   CASE WHEN website IS NULL AND contact_website IS NULL THEN NULL
@@ -330,6 +419,86 @@ CURRENT_DATE as created_at
 FROM simplified;"))
 
                                  
+                                 
+ingestion_table_emergency_sql <- c("
+DROP TABLE IF EXISTS ingestion.hospital_emergency CASCADE;
+","
+CREATE TABLE IF NOT EXISTS ingestion.hospital_emergency
+(
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  original_id text,    
+  name jsonb,
+  legend_item jsonb,
+  data_list_id uuid,
+  risk_level integer,
+  properties jsonb,
+  properties_secondary jsonb,
+  imported_at timestamptz,
+  tags jsonb,
+  deleted_at timestamptz,
+  updated_at timestamptz,
+  created_at timestamptz,
+  created_by uuid,
+  updated_by uuid,
+  geometry geometry(geometry, 4326),
+  CONSTRAINT hospital_emergency_pkey PRIMARY KEY (id)
+);
+",paste0("
+WITH simplified as (
+  SELECT
+  CONCAT('https://osm.org/',osm_id) AS original_id,
+  jsonb_strip_nulls(jsonb_build_object(
+    'und', CASE WHEN language IS NULL THEN 'emergency'
+            WHEN language='fre' THEN 'urgences'
+            WHEN language='ger' THEN 'Notaufnahme'
+            WHEN language='dut' THEN 'spoed'
+            WHEN language='brussels' THEN 'emergency'
+            ELSE 'emergency' END,
+    'fre', 'urgences',
+    'ger', 'Notaufnahme',
+    'dut', 'spoed')) as name,
+  CASE WHEN contact_email IS NULL AND email IS NULL THEN NULL
+  ELSE CONCAT_WS('; ',contact_email, email,operator_email) END AS email,
+  operator_email,
+  CASE WHEN contact_mobile IS NULL AND mobile IS NULL AND contact_phone IS NULL AND phone IS NULL AND phone_2 IS NULL THEN NULL
+  ELSE CONCAT_WS('; ',contact_mobile, mobile, contact_phone, phone, phone_2) END AS phone,
+  opening_hours,
+  hospital_name as operator,
+  CASE WHEN website IS NULL AND contact_website IS NULL THEN NULL
+  ELSE CONCAT_WS('; ',website, contact_website) END AS website,
+  operator_wikidata,
+  wikidata,
+  0 as risk_level,
+  geometry
+  FROM raw_data.osm_emergency_entrance)
+
+INSERT INTO ingestion.hospital_emergency (original_id, name, legend_item, risk_level, data_list_id, properties, geometry, created_at)
+SELECT
+original_id,
+name,
+JSONB_BUILD_OBJECT(
+  'dut', 'spoedingang',
+  'fre', 'entrée des urgences',
+  'ger', 'Notaufnahme',
+  'eng', 'emergencies entrance'
+) as legend_item,
+risk_level,
+'",data_list_id_emergency_entrance,"'::uuid as data_list_id,
+JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
+  'email', email,
+  'operator email', operator_email,
+  'phone', phone,
+  'opening hours', opening_hours,
+  'operator', operator,
+  'website', website,
+  'wikidata', wikidata
+  )) as properties,
+geometry,
+CURRENT_DATE as created_at
+FROM simplified;"))
+                                                                  
+
+                                                                  
 ### Create transformation table ----
 transformation_table_hospitals_sql <- c("
 DROP TABLE IF EXISTS transformation.hospitals CASCADE;
@@ -389,6 +558,35 @@ INSERT INTO transformation.hospital_helipads
 SELECT id, original_id, name, legend_item, data_list_id, properties, geometry, created_at FROM ingestion.hospital_helipads;
 ")
 
+transformation_table_emergency_sql <- c("
+DROP TABLE IF EXISTS transformation.hospital_emergency CASCADE;
+","
+CREATE TABLE IF NOT EXISTS transformation.hospital_emergency
+  (
+    id uuid NOT NULL DEFAULT gen_random_uuid(),
+    original_id text,    
+    name jsonb,
+    legend_item jsonb,
+	data_list_id uuid,
+	risk_level integer,
+    properties jsonb,
+	properties_secondary jsonb,
+	imported_at timestamptz,
+	tags jsonb,
+	deleted_at timestamptz,
+	updated_at timestamptz,
+	created_at timestamptz,
+	created_by uuid,
+	updated_by uuid,
+    geometry geometry(geometry, 4326),
+    CONSTRAINT hospital_emergency_pkey PRIMARY KEY (id)
+  );
+","
+INSERT INTO transformation.hospital_emergency
+(id, original_id, name, legend_item, data_list_id, properties, geometry, created_at)
+SELECT id, original_id, name, legend_item, data_list_id, properties, geometry, created_at FROM ingestion.hospital_emergency;
+")
+
 
 ### Create fdw views ----
 fdw_views_hospitals_sql <- c("
@@ -397,6 +595,7 @@ DROP VIEW IF EXISTS fdw.fdw_hospitals CASCADE;
 CREATE OR REPLACE VIEW fdw.fdw_hospitals
 AS
 SELECT id,
+row_number() OVER () AS gid,
 original_id,
 name,
 legend_item,
@@ -430,6 +629,7 @@ DROP VIEW IF EXISTS fdw.fdw_hospital_helipads CASCADE;
 CREATE OR REPLACE VIEW fdw.fdw_hospital_helipads
 AS
 SELECT id,
+row_number() OVER () AS gid,
 original_id,
 name,
 legend_item,
@@ -456,47 +656,66 @@ FROM transformation.hospital_helipads;
 ","
 GRANT ALL ON TABLE fdw.fdw_hospital_helipads TO paragon;")
 
+
+fdw_views_emergency_sql <- c("
+DROP VIEW IF EXISTS fdw.fdw_hospital_emergency CASCADE;
+","
+CREATE OR REPLACE VIEW fdw.fdw_hospital_emergency
+AS
+SELECT id,
+row_number() OVER () AS gid,
+original_id,
+name,
+legend_item,
+NULL::uuid as best_address_id,
+NULL::uuid as capakey_id,
+data_list_id,
+risk_level,
+properties,
+properties_secondary,
+imported_at,
+tags,
+deleted_at,
+updated_at,
+created_at,
+created_by,
+updated_by,
+st_reduceprecision(geometry, 0.000001::double precision) AS geometry,
+st_reduceprecision(st_pointonsurface(geometry), 0.000001::double precision) AS geometry_pt,
+CASE
+  WHEN st_geometrytype(geometry) = ANY (ARRAY['ST_Point'::text, 'ST_LineString'::text]) THEN st_reduceprecision(st_transform(st_buffer(st_transform(geometry, 31370), 20::double precision), 4326), 0.000001::double precision)
+  ELSE geometry
+  END AS geometry_pg
+FROM transformation.hospital_emergency;
+","
+GRANT ALL ON TABLE fdw.fdw_hospital_emergency TO paragon;")
+
+
 # LOAD ----
 # """""""""""""""""" ----
 
 
 ### Execute the SQL commands ----
 
-### Execute the SQL commands ----
-execute_sql_commands <- function(sql_commands, task_name) {
-  con_pg <- get_con()
-  tryCatch(
-    {
-      for (sql_command in sql_commands) {
-        dbExecute(con_pg, sql_command)
-      }
-      print(paste(task_name, "SQL ran without error"))
-    },
-    error = function(err) {
-      message(paste("The SQL functions for", task_name, "failed"))
-      message(err)  # Print the error message for more details
-    }
-  )
-  dbDisconnect(con_pg)
-}
-
-# Now you can call this function for different tasks:
-
 create_ingestion_table_hospitals <- function() {execute_sql_commands(ingestion_table_hospital_sql, "Hospital Ingestion table")}
 create_ingestion_table_helipads <- function() {execute_sql_commands(ingestion_table_helipad_sql, "Helipad Ingestion table")}
+create_ingestion_table_emergencies <- function() {execute_sql_commands(ingestion_table_emergency_sql, "Emergency Ingestion table")}
 create_transformation_table_hospitals <- function() {execute_sql_commands(transformation_table_hospitals_sql, "Hospital Transformation table")}
 create_transformation_table_helipads <- function() {execute_sql_commands(transformation_table_helipads_sql, "Helipad Transformation table")}
+create_transformation_table_emergencies <- function() {execute_sql_commands(transformation_table_emergency_sql, "Emergency Transformation table")}
 create_fdw_views_hospitals <- function() {execute_sql_commands(fdw_views_hospitals_sql, "Hospital FDW view")}
 create_fdw_views_helipads <- function() {execute_sql_commands(fdw_views_hospital_helipads_sql, "Helipad FDW view")}
-
+create_fdw_views_emergencies <- function() {execute_sql_commands(fdw_views_emergency_sql, "Emergency FDW view")}
 
 # set to TRUE if you want to update the transformation table even if the checks fail. 
 update_even_if_checks_fail<-FALSE
 # Don't forget to also set checks_failed<-0 if there were already some issues in the base data
 
+
 run_smart_update = function() {
   smart_update_process("hospitals", 50, 200, 100, format(Sys.Date(), "%Y-%m-%d"), update_even_if_checks_fail)
   smart_update_process("hospital_helipads", 50, 100, 50, format(Sys.Date(), "%Y-%m-%d"), update_even_if_checks_fail)
+  smart_update_process("hospital_emergency", 50, 100, 50, format(Sys.Date(), "%Y-%m-%d"), update_even_if_checks_fail)
 }
 
 
@@ -507,13 +726,17 @@ run_smart_update = function() {
 main_function = function() {
   CreateImportTable(dataset = osm_all, schema = "raw_data", table_name = "osm_hospitals")
   CreateImportTable(dataset = osm_helipad, schema = "raw_data", table_name = "osm_helipad")
+  CreateImportTable(dataset = osm_emergency_entrance, schema = "raw_data", table_name = "osm_emergency_entrance")
   create_ingestion_table_hospitals()
   create_ingestion_table_helipads()
+  create_ingestion_table_emergencies()
   run_smart_update()
   #create_transformation_table_hospitals()
   #create_transformation_table_helipads()
+  #create_transformation_table_emergencies()
   #create_fdw_views_hospitals()
   #create_fdw_views_helipads()
+  #create_fdw_views_emergencies()
 }
 
 

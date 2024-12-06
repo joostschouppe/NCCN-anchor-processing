@@ -25,7 +25,6 @@ postgres_user <- Sys.getenv("POSTGRES_USER")
 postgres_password <- Sys.getenv("POSTGRES_PASSWORD")
 db_name<- Sys.getenv("POSTGRES_DB_NAME_CURATED")
 
-data_list_id<-"b3f833af-1c7a-4d03-8ceb-ffd55bfea5f8"
 log_folder <- "C:/temp/logs/"
 
 data_folder <- "C:/projects/proto-anchors/raw-data/police/"
@@ -50,7 +49,6 @@ library(RPostgres)
 
 ## Geocoding libraries
 library(devtools)
-devtools::install_github("phacochr/phacochr")
 library(phacochr)
 phaco_setup_data()
 phacochr::phaco_best_data_update()
@@ -138,7 +136,7 @@ geocode_fedpol <- geocode_fedpol %>% distinct()
 
 fedpol <- left_join(fedpol, geocode_fedpol, by = "row_number")
 
-# turn lists into comma separeted values
+# turn lists into comma separated values
 process_data <- function(x) {
   if (is.numeric(x)) {
     # Convert numeric values to strings
@@ -722,114 +720,12 @@ WHERE geometry IS NOT NULL;
 
 ### Execute the SQL commands ----
 
-TransformLocalPolice <- function() {
-  con_pg <- get_con()
-  tryCatch(
-    {
-      for (sql_command in sql_local_police) {
-        dbExecute(con_pg, sql_command)
-      }
-      print("The SQL functions TransformLocalPolice ran without error")
-    },
-    error = function(err) {
-      print("The SQL functions TransformLocalPolice failed")
-      print(err)  # Print the error message for more details
-    }
-  )
-  dbDisconnect(con_pg)
-}
+
+TransformLocalPolice <- function() {execute_sql_commands(sql_local_police, "Official police data transformation")}
+TransformOSM <- function() {execute_sql_commands(sql_osm, "OSM police data transformation")}
+TransformMergeAll <- function() {execute_sql_commands(sql_merge, "Merge police data")}
 
 
-TransformOSM <- function() {
-  con_pg <- get_con()
-  tryCatch(
-    {
-      for (sql_command in sql_osm) {
-        dbExecute(con_pg, sql_command)
-      }
-      print("The SQL functions TransformOSM ran without error")
-    },
-    error = function(err) {
-      print("The SQL functions OSMpoints failed")
-      print(err)  # Print the error message for more details
-    }
-  )
-  dbDisconnect(con_pg)
-}
-
-
-TransformMergeAll <- function() {
-  con_pg <- get_con()
-  tryCatch(
-    {
-      for (sql_command in sql_merge) {
-        dbExecute(con_pg, sql_command)
-      }
-      print("The SQL functions TransformMergeAll ran without error")
-    },
-    error = function(err) {
-      print("The SQL functions for the merge failed")
-      print(err)  # Print the error message for more details
-    }
-  )
-  dbDisconnect(con_pg)
-}
-
-
-
-
-
-### Create fdw views ----
-fdw_views_sql <- c("
-DROP VIEW IF EXISTS fdw.fdw_police CASCADE;
-","
-CREATE OR REPLACE VIEW fdw.fdw_police
-AS
-SELECT id,
-original_id,
-name,
-legend_item,
-NULL::uuid as best_address_id,
-NULL::uuid as capakey_id,
-data_list_id,
-risk_level,
-properties,
-properties_secondary,
-imported_at,
-tags,
-deleted_at,
-updated_at,
-created_at,
-created_by,
-updated_by,
-geometry,
-st_pointonsurface(geometry) AS geometry_pt
-FROM transformation.police;
-","
-ALTER TABLE fdw.fdw_police
-OWNER TO paragon;
-","
-GRANT SELECT ON TABLE fdw.fdw_police TO fdw4dev;
-","
-GRANT ALL ON TABLE fdw.fdw_police TO paragon;
-")
-
-create_fdw_views <- function() {
-  con_pg <- get_con()
-  tryCatch(
-    {
-      for (sql_command in fdw_views_sql) {
-        dbExecute(con_pg, sql_command)
-      }
-      print("The SQL functions create FDW views ran without error")
-    },
-    error = function(err) {
-      print("The SQL functions for the FDW views failed")
-      print(err)  # Print the error message for more details
-    }
-  )
-  dbDisconnect(con_pg)
-}
 
 
 

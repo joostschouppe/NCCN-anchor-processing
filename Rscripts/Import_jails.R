@@ -22,7 +22,8 @@ postgres_user <- Sys.getenv("POSTGRES_USER")
 postgres_password <- Sys.getenv("POSTGRES_PASSWORD")
 db_name<- Sys.getenv("POSTGRES_DB_NAME_CURATED")
 
-data_list_id<-"b3f833af-1c7a-4d03-8ceb-ffd55bfea5f8"
+data_list_id_jails <- "e3277b09-8cb1-491e-8fc7-3ab9ef8dbb2a"
+data_list_id_asylum <- "fbc8ea91-872d-4d6d-b4dc-5eadd1e5f5a1"
 log_folder <- "C:/temp/logs/"
 
 ### Load external functions ------
@@ -93,8 +94,7 @@ tryCatch({
 
 ### Create SQL for proper ingestion table ----
 
-ingestion_table_sql <- c("
-DROP TABLE IF EXISTS ingestion.jails CASCADE;
+ingestion_table_sql <- c("DROP TABLE IF EXISTS ingestion.jails CASCADE;
 ","
 CREATE TABLE IF NOT EXISTS ingestion.jails
   (
@@ -121,7 +121,8 @@ WITH
 cleaned as (SELECT
 'https://osm.org/' || osm_id as original_id,
 jsonb_strip_nulls(jsonb_build_object(
-              'und', CASE WHEN name IS NULL THEN 'jail' ELSE name END,
+              'und', CASE WHEN name IS NULL AND prison='rejected_asylum_seekers' THEN 'closed centre for rejected asylum seekers'
+						WHEN name IS NULL THEN 'jail' ELSE name END,
               'fre', name_fr,
               'ger', name_de,
               'dut', name_nl)) as name,
@@ -131,30 +132,31 @@ jsonb_build_object(
 	'fre', 'prison Belge federal',
 	'ger', 'Belgisches Bundesgefängnis',
 	'eng', 'Belgian federal prison') 
+WHEN prison='rejected_asylum_seekers' THEN
+jsonb_build_object(
+	'dut', 'gesloten centrum voor uitgeprocedeerde asielzoekers',
+	'fre', 'centre fermé pour demandeurs d''asile ayant épuisé tous les recours légaux',
+	'ger', 'geschlossenes Zentrum für Asylbewerber, die alle Rechtsmittel ausgeschöpft haben',
+	'eng', 'closed centre for rejected asylum seekers') 
 ELSE jsonb_build_object(
 	'dut', 'gevangenis (overige)',
 	'fre', 'prison (autre)',
 	'ger', 'Gefängnis (andere)',
 	'eng', 'prison (other)') END
 			as legend_item,
-CASE WHEN short_name IS NULL AND official_name IS NULL AND alt_name IS NULL AND old_name IS NULL THEN NULL 
-	ELSE CONCAT_WS('; ',short_name, official_name, alt_name, old_name) END AS other_names,
+NULLIF(CONCAT_WS('; ',name, short_name, official_name, alt_name, old_name), '') AS other_names,
 CASE WHEN addr_street IS NULL THEN NULL 
 	ELSE LTRIM(CONCAT(addr_street, ' ' || CASE WHEN nohousenumber='yes' THEN 'w/n' ELSE addr_housenumber END, ', ' || CONCAT((addr_postcode || ' '), addr_city))) END
 	AS address,
-CASE WHEN contact_email IS NULL AND email IS NULL THEN NULL
-	ELSE CONCAT_WS('; ',contact_email, email) END AS local_email,
+NULLIF(CONCAT_WS('; ',contact_email, email), '') AS local_email,
 operator_email,
-CASE WHEN contact_mobile IS NULL AND mobile IS NULL AND contact_phone IS NULL AND phone IS NULL AND phone_2 IS NULL THEN NULL
-	ELSE CONCAT_WS('; ',contact_mobile, mobile, contact_phone, phone, phone_2) END AS local_phone,
-CASE WHEN website IS NULL AND contact_website IS NULL THEN NULL
-	ELSE CONCAT_WS('; ',website, contact_website) END AS local_website,
+NULLIF(CONCAT_WS('; ',contact_mobile, mobile, contact_phone, phone, phone_2),'') AS local_phone,
+NULLIF(CONCAT_WS('; ',website, contact_website),'') AS local_website,
 operator_website,
 operator_wikidata, operator, operator_type, image, 
-start_date,capacity,capacity_planned,capacity_female,capacity_theoretically,prison,
+start_date,capacity,capacity_planned,capacity_female,capacity_theoretically,prison,		
 geometry
 FROM raw_data.osm_jails)
-
 
 INSERT INTO ingestion.jails 
 (original_id, name, legend_item, data_list_id, risk_level, properties, geometry, created_at)
@@ -162,7 +164,8 @@ SELECT
 original_id,
 name,
 legend_item,
-'",data_list_id,"' as data_list_id,
+CASE WHEN prison='rejected_asylum_seekers' THEN '",data_list_id_asylum,"'
+ELSE '",data_list_id_jails,"' END as data_list_id,
 2 as risk_level,
 JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
 	'other_names', other_names,
@@ -219,96 +222,13 @@ SELECT original_id, name, legend_item, data_list_id::uuid, properties, geometry,
 
 
 
-### Create fdw views ----
-fdw_views_sql <- c("
-DROP VIEW IF EXISTS fdw.fdw_jails CASCADE;
-","
-CREATE OR REPLACE VIEW fdw.fdw_jails
-AS
-SELECT id,
-original_id,
-name,
-legend_item,
-NULL::uuid as best_address_id,
-NULL::uuid as capakey_id,
-data_list_id,
-risk_level,
-properties,
-properties_secondary,
-imported_at,
-tags,
-deleted_at,
-updated_at,
-created_at,
-created_by,
-updated_by,
-geometry,
-st_pointonsurface(geometry) AS geometry_pt
-FROM transformation.jails;
-","
-ALTER TABLE fdw.fdw_jails
-OWNER TO paragon;
-","
-GRANT SELECT ON TABLE fdw.fdw_jails TO fdw4dev;
-","
-GRANT ALL ON TABLE fdw.fdw_jails TO paragon;
-")
 
 ### Execute the SQL commands ----
 
-create_ingestion_table <- function() {
-  con_pg <- get_con()
-  tryCatch(
-    {
-      for (sql_command in ingestion_table_sql) {
-        dbExecute(con_pg, sql_command)
-      }
-      print("The SQL functions for the ingestion table completed without error")
-    },
-    error = function(err) {
-      print("The SQL functions for the ingestion table failed")
-      print(err)  # Print the error message for more details
-    }
-  )
-  dbDisconnect(con_pg)
-}
 
-
-create_transformation_table <- function() {
-  con_pg <- get_con()
-  tryCatch(
-    {
-      for (sql_command in transformation_table_sql) {
-        dbExecute(con_pg, sql_command)
-      }
-      print("The SQL functions for the transformation table completed without error")
-    },
-    error = function(err) {
-      print("The SQL functions for the transformation table failed")
-      print(err)  # Print the error message for more details
-    }
-  )
-  dbDisconnect(con_pg)
-}
-
-
-create_fdw_views <- function() {
-  con_pg <- get_con()
-  tryCatch(
-    {
-      for (sql_command in fdw_views_sql) {
-        dbExecute(con_pg, sql_command)
-      }
-      print("The SQL functions for the FDW view completed without error")
-    },
-    error = function(err) {
-      print("The SQL functions for the FDW views failed")
-      print(err)  # Print the error message for more details
-    }
-  )
-  dbDisconnect(con_pg)
-}
-
+create_ingestion_table <- function() {execute_sql_commands(ingestion_table_sql, "Ingestion table")}
+create_transformation_table <- function() {execute_sql_commands(transformation_table_sql, "Transformation table")}
+create_fdw_views <- function() {execute_sql_commands(fdw_views_sql, "FDW view")}
 
 
 # set to TRUE if you want to update the transformation table even if the checks fail. 
@@ -328,7 +248,6 @@ main_function = function() {
   create_ingestion_table()
   run_smart_update()
   #create_transformation_table()
-  #create_fdw_views()
 }
 
 
