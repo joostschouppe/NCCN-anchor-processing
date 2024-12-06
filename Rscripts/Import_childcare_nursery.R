@@ -15,7 +15,6 @@
 # TODO
 # standaard structuur
 # legend item: just "nursery" or with more categories
-# uitbreiden met KBO nummer & adres ID https://www.desocialekaart.be/api/leaflet/07062e240127d14887de332f3851859a9a8269766694ca3a9da49c5bd28101a9?includeHiddenData=false
 # risk level: just 3, or differentiate between groepsopvang & gezinsopvang
 
 
@@ -30,6 +29,7 @@ postgres_password <- Sys.getenv("POSTGRES_PASSWORD")
 db_name<- Sys.getenv("POSTGRES_DB_NAME_CURATED")
 
 data_list_id_soka<-"94f691c4-542d-4d90-be7d-ff7136779660"
+data_list_id_ostbelgien<-"c5321bf8-4772-4ec5-9f65-a462382b6892"
 log_folder <- "C:/temp/logs/"
 
 ### Load external functions ------
@@ -50,6 +50,7 @@ library(rvest)
 library(DBI)
 library(RPostgres)
 library(httr)
+library(readxl)
 
 ## Geocoding libraries
 library(devtools)
@@ -59,6 +60,8 @@ phacochr::phaco_best_data_update()
 
 # EXTRACT ----
 # """""""""""""""""" ----
+
+# 1. Sociale Kaart (SOKA) data ----
 
 # SOKA Loop through pages and content ------------------------------------------
 
@@ -140,6 +143,43 @@ url <- "https://www.desocialekaart.be/api/health-offers?rubrics=10.07.02.%20Groe
 df_tmp <- getPagesAndContent(query_url = url)
 groepsopvang <- transformTable(df = df_tmp)
 groepsopvang$type<- "Groepsopvang voor kinderen"
+
+
+
+# 2. Ostbelgien data ----
+
+# Load Excel at "C:\projects\proto-anchors\raw-data\childcare\20241008-childcare-ostbelgien.xlsx"
+ostbelgien_andere <- read_excel("C:/projects/proto-anchors/raw-data/childcare/20241008-childcare-ostbelgien.xlsx")
+# Load second tab ZKB from the same file
+ostbelgien_zkb <- read_excel("C:/projects/proto-anchors/raw-data/childcare/20241008-childcare-ostbelgien.xlsx", sheet = "ZKB")
+
+# Merge both tables
+ostbelgien <- rbind(ostbelgien_andere, ostbelgien_zkb)
+
+# Add an identifier (just the row number)
+ostbelgien$case_number <- seq_len(nrow(ostbelgien))
+
+# Geocode the data
+ostbelgien_sel <- ostbelgien %>% select (case_number, Straße, PLZ)
+ostbelgien_geocoded <- phaco_geocode(data_to_geocode=t_adresse <- ostbelgien_sel, colonne_num_rue="Straße", colonne_code_postal="PLZ")
+
+## change geometry column name and add results to all records
+simple_geocode_ob <- ostbelgien_geocoded$data_geocoded_sf[, c("case_number")]
+ostbelgien <- left_join(ostbelgien, simple_geocode_ob, by = "case_number")
+
+# select the records not geocoded
+ostbelgien_not_geocoded <- ostbelgien %>% filter(st_is_empty(geometry))
+
+ostbelgien <- ostbelgien %>% filter(!st_is_empty(geometry))
+
+#make sure it is SF dataframe
+ostbelgien <- st_as_sf(ostbelgien)
+#upload to raw data
+
+table(ostbelgien$"Form der Kinderbetreuung")
+
+
+
 
 # Transform ----
 # """""""""""""""""" ----
@@ -346,27 +386,25 @@ kinderopvang_sf <- kinderopvang_sf %>%
   ))
 
 # calculate distance
+##this was used during the building of the process to help find cases for manual inspection, in order to choose to trust the original or geocoded geometry as a rule
+#kinderopvang_sf <- kinderopvang_sf %>%
+#  filter(!is.na(geometry) & !is.na(original_geometry)) %>%
+#  mutate(
+#    distance_m = st_distance(
+#      st_transform(geometry, 31370),        # Transform 'geometry' to Belgian Lambert 72
+#      st_transform(original_geometry, 31370), # Transform 'original_geometry' to Belgian Lambert 72
+#      by_element = TRUE
+#    )
+#  )
+
+
+
+
+# overrule geometry with original_geometry if geometry is empty
 kinderopvang_sf <- kinderopvang_sf %>%
-  filter(!is.na(geometry) & !is.na(original_geometry)) %>%
-  mutate(
-    distance_m = st_distance(
-      st_transform(geometry, 31370),        # Transform 'geometry' to Belgian Lambert 72
-      st_transform(original_geometry, 31370), # Transform 'original_geometry' to Belgian Lambert 72
-      by_element = TRUE
-    )
-  )
+  mutate(new_geometry = ifelse(st_is_empty(geometry), original_geometry, geometry))
 
-
-
-
-# overrule geometry with original_geometry if geometry is null
-kinderopvang_sf <- kinderopvang_sf %>%
-  mutate(new_geometry = ifelse(is.na(geometry), st_as_sfc(original_geometry), geometry))
-
-# keep only cases with a non-empty geometry
-kinderopvang_sf <- kinderopvang_sf %>%
-  filter(!is.na(new_geometry))
-
+# remove unneeded geometry columns
 kinderopvang_sf<-as.data.frame(kinderopvang_sf) %>%
   select(-geometry, -original_geometry) %>%
   rename(geometry = new_geometry)
@@ -375,6 +413,14 @@ kinderopvang_sf<-as.data.frame(kinderopvang_sf) %>%
 kinderopvang_sf <- kinderopvang_sf %>%
   st_set_geometry("geometry")
 
+
+# keep only cases with a non-empty geometry
+kinderopvang_sf <- kinderopvang_sf %>%
+  filter(!is.na(geometry) & !st_is_empty(geometry))
+
+
+  
+  
 
 # add data list id
 kinderopvang_sf <- kinderopvang_sf %>%
@@ -399,9 +445,7 @@ process_id <- function(id, max_retries = 3) {
       content <- content(response, as = "text")
       parsed_data <- fromJSON(content, flatten = TRUE)
       
-      # Extract the id
-      id_value <- parsed_data$id$id
-      
+
       # Extract the value for CBE_ID from administrativeData
       cbe_id_value <- parsed_data$administrativeData$value[parsed_data$administrativeData$type == "CBE_ID"]
       
@@ -416,8 +460,16 @@ process_id <- function(id, max_retries = 3) {
         addresses$links <- list(data.frame(href = NA_character_))
       }
       
-      addresses$links <- map(addresses$links, ~ if (is.null(.x)) data.frame(href = NA_character_) else .x)
-      
+
+      # commented out because a syntax error is reported by R
+      #addresses$links <- map(addresses$links, ~ if (is.null(.x)) data.frame(href = NA_character_) else .x)
+      addresses$links <- map(addresses$links, ~ if (is.null(.x)) {
+        # Create a data frame with the same structure as non-NULL elements
+        data.frame(href = NA_character_, stringsAsFactors = FALSE) 
+      } else {
+        .x
+      })
+
       addresses <- addresses %>%
         unnest(links) %>%
         mutate(href = ifelse(is.null(href), NA_character_, href)) %>%
@@ -425,7 +477,7 @@ process_id <- function(id, max_retries = 3) {
       
       # Combine results into a single data frame
       result <- data.frame(
-        id = id_value,
+        id = id,
         CBE_ID = cbe_id_value
       )
       
@@ -479,8 +531,8 @@ for (i in seq_along(input_ids$id)) {
 # check for duplicates
 kinderopvang_extra <- kinderopvang_extra %>% distinct()
 
-# get a list of ids in kinderopvang that are not in kinderopvang_extra
-ids_not_in_kinderopvang_extra <- kinderopvang %>%
+# get a list of ids in kinderopvang_sf that are not in kinderopvang_extra
+ids_not_in_kinderopvang_extra <- kinderopvang_sf %>%
   anti_join(kinderopvang_extra, by = c("original_id"="id")) %>%
   select(id=original_id)
 
@@ -539,6 +591,8 @@ kinderopvang_kbo <- kinderopvang_kbo %>%
   rename(bestad_id = href)
 
 
+
+
 # LOAD ----
 # """""""" ----
 
@@ -546,7 +600,8 @@ kinderopvang_kbo <- kinderopvang_kbo %>%
 
 ### Create SQL for proper ingestion table ----
 
-ingestion_table_sql <- c("DROP TABLE IF EXISTS ingestion.nursery_soka CASCADE;
+
+soka_ingestion_table_sql <- c("DROP TABLE IF EXISTS ingestion.nursery_soka CASCADE;
 ","
 CREATE TABLE IF NOT EXISTS ingestion.nursery_soka
 (
@@ -572,7 +627,7 @@ cleaned as (SELECT
             original_id,
             jsonb_strip_nulls(jsonb_build_object(
               'und', CASE WHEN name IS NULL THEN type
-                          ELSE type END,
+                          ELSE name END,
               'dut', name)) as name,
             jsonb_build_object(
               'dut', 'kinderopvang',
@@ -610,14 +665,77 @@ geometry,
 CURRENT_DATE as created_at
 FROM cleaned;
 "))
-                         
+
+                             
+                              
+ostbelgien_ingestion_table_sql <- c("                              
+DROP TABLE IF EXISTS ingestion.nursery_ostbelgien CASCADE;
+","
+CREATE TABLE IF NOT EXISTS ingestion.nursery_ostbelgien (
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  original_id text,  
+  name jsonb,
+  legend_item jsonb,
+  data_list_id uuid,
+  risk_level integer,
+  properties jsonb,
+  properties_secondary jsonb,
+  imported_at timestamptz,
+  tags jsonb,
+  deleted_at timestamptz,
+  updated_at timestamptz,
+  created_at timestamptz,
+  created_by uuid,
+  updated_by uuid,
+  geometry geometry(geometry, 4326),
+  CONSTRAINT nursery_ostbelgien_pkey PRIMARY KEY (id)
+);",paste0("
+WITH cleaned as (
+  select
+  CASE WHEN \"ID\" IS NULL THEN 'none provided'
+  ELSE \"ID\"::text END as original_id,
+  jsonb_strip_nulls(jsonb_build_object(
+    'und', CASE WHEN \"Name\" IS NULL THEN \"Form der Kinderbetreuung\"
+    WHEN \"Form der Kinderbetreuung\" <> 'AUBE' THEN \"Form der Kinderbetreuung\" || ' ' || \"Name\"                          
+    ELSE \"Name\" END,
+    'ger', CASE WHEN \"Name\" IS NULL THEN \"Form der Kinderbetreuung\"
+    WHEN \"Form der Kinderbetreuung\" <> 'AUBE' THEN \"Form der Kinderbetreuung\" || ' ' || \"Name\"                          
+    ELSE \"Name\" END)) as name,
+  jsonb_build_object(
+    'dut', 'kinderopvang',
+    'fre', 'crèche',
+    'ger', 'Kinderkrippe',
+    'eng', 'nursery') 
+  as legend_item,
+  '",data_list_id_ostbelgien,"'::uuid as data_list_id,
+  3 as risk_level,
+  jsonb_strip_nulls(jsonb_build_object(	
+    'address', CONCAT(\"Straße\" || ', ' || \"PLZ\",  ' ' || \"Gemeinde\"),
+    'phone', \"Telefonnummer\",
+    'mobile', \"Handynummer\",
+    'email', \"E-Mail-Adresse\",
+    'capacity', \"Kapazität\",
+    'occupancy', \"Anzahl Kinder\",
+    'age_groups', \"Alter\",
+    'personnel', \"Anzahl Erwachsene\",
+    'opening_hours', CASE WHEN \"Öffnungszeiten\" <> '/' THEN \"Öffnungszeiten\" ELSE NULL END)) as properties,
+  st_transform(geometry,4326) as geometry
+  from
+  raw_data.ostbelgien_childcare)
+INSERT INTO ingestion.nursery_ostbelgien 
+(original_id, name, legend_item, data_list_id, risk_level, properties, geometry, created_at)
+SELECT
+*,
+CURRENT_DATE as created_at
+FROM cleaned;"))
+
 ### Execute the SQL commands ----
                          
-create_ingestion_table <- function() {
+create_ingestion_table_soka <- function() {
 con_pg <- get_con()
 tryCatch(
   {
-    for (sql_command in ingestion_table_sql) {
+    for (sql_command in soka_ingestion_table_sql) {
       dbExecute(con_pg, sql_command)
     }
     print("Ingestion table SQL ran without error")
@@ -629,6 +747,88 @@ tryCatch(
 )
 dbDisconnect(con_pg)
 }
+
+
+
+create_ingestion_table_ostbelgien <- function() {
+  con_pg <- get_con()
+  tryCatch(
+    {
+      for (sql_command in ostbelgien_ingestion_table_sql) {
+        dbExecute(con_pg, sql_command)
+      }
+      print("Ingestion table SQL ran without error")
+    },
+    error = function(err) {
+      print("The SQL functions for the ingestion table failed")
+      print(err)  # Print the error message for more details
+    }
+  )
+  dbDisconnect(con_pg)
+}
+
+
+### Create fdw views ----
+fdw_views_sql <- c("
+DROP VIEW IF EXISTS fdw.fdw_nursery CASCADE;
+","
+CREATE OR REPLACE VIEW fdw.fdw_nursery
+AS
+SELECT id,
+row_number() OVER () AS gid,
+original_id,
+name,
+legend_item,
+NULL::uuid as best_address_id,
+NULL::uuid as capakey_id,
+data_list_id,
+risk_level,
+properties,
+properties_secondary,
+imported_at,
+tags,
+deleted_at,
+updated_at,
+created_at,
+created_by,
+updated_by,
+st_reduceprecision(geometry, 0.000001::double precision) AS geometry,
+    st_reduceprecision(st_pointonsurface(geometry), 0.000001::double precision) AS geometry_pt,
+        CASE
+            WHEN st_geometrytype(geometry) = ANY (ARRAY['ST_Point'::text, 'ST_LineString'::text]) THEN st_reduceprecision(st_transform(st_buffer(st_transform(geometry, 31370), 20::double precision), 4326), 0.000001::double precision)
+            ELSE geometry
+        END AS geometry_pg
+FROM transformation.nursery;
+","
+ALTER TABLE fdw.fdw_nursery
+OWNER TO pgn_group_data_team_w;;
+","
+GRANT SELECT ON TABLE fdw.fdw_nursery TO pgn_group_acces2curation;
+","
+GRANT ALL ON TABLE fdw.fdw_nursery TO pgn_group_data_team_w;
+","
+GRANT SELECT ON TABLE fdw.fdw_nursery TO pgn_user_vectortiles;")
+
+
+create_fdw_views <- function() {
+  con_pg <- get_con()
+  tryCatch(
+    {
+      for (sql_command in fdw_views_sql) {
+        dbExecute(con_pg, sql_command)
+      }
+      print("FDW table SQL ran without error")
+    },
+    error = function(err) {
+      print("The SQL functions for the FDW views failed")
+      print(err)  # Print the error message for more details
+    }
+  )
+  dbDisconnect(con_pg)
+}
+
+
+
                          
 # Main function -----------------------------------------------------------
 # """"""""""""""""""""----
@@ -636,4 +836,7 @@ dbDisconnect(con_pg)
 CreateImportTable(dataset = gezinsopvang, schema = "raw_data", table_name = "vla_depzorg_socialekaart_gezinsopvang") 
 CreateImportTable(dataset = groepsopvang, schema = "raw_data", table_name = "vla_depzorg_socialekaart_groepsopvang")
 CreateImportTable(dataset = kinderopvang_kbo, schema = "raw_data", table_name = "vla_depzorg_socialekaart_kinderopvang")
-create_ingestion_table()
+CreateImportTable(dataset = ostbelgien, schema = "raw_data", table_name = "ostbelgien_childcare")
+create_ingestion_table_soka()
+create_ingestion_table_ostbelgien()
+create_fdw_views()

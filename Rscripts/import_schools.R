@@ -70,8 +70,6 @@ library(tidyr)
 
 
 # extra for geocoding
-library(devtools)
-devtools::install_github("phacochr/phacochr")
 library(phacochr)
 phaco_setup_data()
 phacochr::phaco_best_data_update()
@@ -83,7 +81,7 @@ library(stringi)
 library(PTXQC)
 
 # for the str_extract_all function
-library(stringr)
+#library(stringr)
 
 library(purrr)
 
@@ -156,7 +154,7 @@ return(geojson_vl)
 
 DownloadBRWA <- function(){ 
   tryCatch({
-geojson_brwa <- st_read(httr::GET("https://www.odwb.be/api/explore/v2.1/catalog/datasets/signaletique-fase/exports/geojson?lang=en&timezone=Europe%2FBrussels"))
+geojson_brwa <- st_read(httr::GET("https://www.odwb.be/api/explore/v2.1/catalog/datasets/fwb-age-fichier-signaletique-des-etablissements-d-enseignement-de-la-federation-/exports/geojson?lang=nl&timezone=Europe%2FBrussels"))
   }, 
   error = function(e) {
     print(paste("Error downloading BRWA:", e))
@@ -188,6 +186,10 @@ return(ger)
 
 
 # Download OSM data ----
+
+DownloadOSM <- function(){
+  tryCatch({
+
 ### OSM DOWNLOAD PARAMETERS ----
 
 # Define the list of features
@@ -273,15 +275,18 @@ osm_all <- osm_all %>%
   mutate(type_kindergarten = ifelse((grepl("kindergarten", osm_all$school, ignore.case = TRUE) | amenity=='kindergarten' | grepl("0", osm_all$isced_level, ignore.case = TRUE)), 1, 0),
          type_primary = ifelse((grepl("primary", osm_all$school, ignore.case = TRUE) | grepl("1", osm_all$isced_level, ignore.case = TRUE)), 1, 0),
          type_secondary = ifelse((grepl("secondary", osm_all$school, ignore.case = TRUE)| grepl("2", osm_all$isced_level, ignore.case = TRUE) | grepl("3", osm_all$isced_level, ignore.case = TRUE)), 1, 0),
-         type_higher_education = ifelse((amenity=='university' | amenity=='college'), 1, 0))
+         type_higher_education = ifelse((amenity=='university' | amenity=='college'), 1, 0),
+         type_special_needs = ifelse(grepl("special_education_needs", osm_all$school, ignore.case = TRUE), 1, 0))
 
 
 # filter points with a name
 osm_points <- osm_all %>% filter(st_geometry_type(.) %in% c("POINT"))
 osm_points <- osm_points %>% filter(!(is.na(name)))
+# remove points without one of the expected amenity types (artefact of site relations)
+osm_points <- osm_points %>% filter(amenity=='university' | amenity=='college' | amenity=='school' | amenity=='kindergarten')
 
 # keep only one case if osm_id has duplicates (unclear how exactly duplicates arise here)
-osm_points <- osm_points %>% distinct(osm_id, .keep_all = TRUE)
+osm_points <<- osm_points %>% distinct(osm_id, .keep_all = TRUE)
 
 
 # filter polygons from the relevant types
@@ -289,12 +294,24 @@ osm_mpoly <- osm_all %>% filter(st_geometry_type(.) %in% c("POLYGON", "MULTIPOLY
 # set all geometries as multipolygons
 osm_mpoly$geometry <- st_cast(osm_mpoly$geometry, "MULTIPOLYGON")
 
+# remove that one part of ugent that is in Korea if it is included
+osm_mpoly <<- osm_mpoly %>% filter(osm_id!='way/384532065')
 
-# paste the list of columns in osm_points
-osm_points_cols <- paste0(colnames(osm_points), collapse = ",")
-osm_mpoly_cols <- paste0(colnames(osm_mpoly), collapse = ",")
-print(osm_points_cols)
-print(osm_mpoly_cols)
+
+
+# paste the list of columns in osm_points (for visual checking)
+#osm_points_cols <- paste0(colnames(osm_points), collapse = ",")
+#osm_mpoly_cols <- paste0(colnames(osm_mpoly), collapse = ",")
+#print(osm_points_cols)
+#print(osm_mpoly_cols)
+
+  }, 
+error = function(e) {
+  print(paste("Error downloading OSM:", e))
+})
+  print("Download OSM is done")
+}
+
 
 # Upload to Postgresql ------------------------------
 # """""""""""""""""" ----------------------
@@ -536,7 +553,7 @@ r.niscode as niscode,
 osm.osm_id as id,
 osm.geometry as osm_geometry
 FROM raw_data.ngi_ign_region r, raw_data.osm_school_point osm
-WHERE ST_Intersects(r.shape,osm.geometry) 
+WHERE ST_Intersects(r.shape,osm.geometry) AND (osm.amenity='kindergarten' OR osm.amenity='school' OR osm.amenity='university' OR osm.amenity='college')
 ),
 
 -- prepare data and filter just the data outside of Belgium
@@ -544,25 +561,21 @@ final_table AS (
   SELECT
 	b.osm_id as id,
 	b.name, b.name_nl, b.name_fr, b.name_de,
-	CASE WHEN b.short_name IS NULL AND b.official_name IS NULL AND b.alt_name IS NULL AND b.old_name IS NULL THEN NULL 
-	ELSE CONCAT_WS('; ',b.short_name, b.official_name, b.alt_name, b.old_name) END AS other_names,
+	NULLIF(CONCAT_WS('; ',b.short_name, b.official_name, b.alt_name, b.old_name),'') AS other_names,
 CASE WHEN addr_street IS NULL THEN NULL 
 	ELSE LTRIM(CONCAT(b.addr_street, ' ' || CASE WHEN b.nohousenumber='yes' THEN 'w/n' ELSE b.addr_housenumber END, ', ' || CONCAT((b.addr_postcode || ' '), b.addr_city))) END
 	AS address,
-CASE WHEN b.contact_email IS NULL AND b.email IS NULL THEN NULL
-	ELSE CONCAT_WS('; ',b.contact_email, b.email) END AS local_email,
+ NULLIF(CONCAT_WS('; ',b.contact_email, b.email),'') AS local_email,
 operator_email,
-CASE WHEN b.contact_mobile IS NULL AND b.mobile IS NULL AND b.contact_phone IS NULL AND b.phone IS NULL AND b.phone_2 IS NULL THEN NULL
-	ELSE CONCAT_WS('; ',b.contact_mobile, b.mobile, b.contact_phone, b.phone, b.phone_2) END AS local_phone,
-CASE WHEN b.website IS NULL AND b.contact_website IS NULL THEN NULL
-	ELSE CONCAT_WS('; ',b.website, b.contact_website) END AS local_website,
+ NULLIF(CONCAT_WS('; ',b.contact_mobile, b.mobile, b.contact_phone, b.phone, b.phone_2),'') AS local_phone,
+ NULLIF(CONCAT_WS('; ',b.website, b.contact_website),'') AS local_website,
 	b.operator_website,
 	j.niscode as region,
-	b.type_kindergarten, b.type_primary, b.type_secondary, b.type_higher_education,
+	b.type_kindergarten, b.type_primary, b.type_secondary, b.type_higher_education, b.type_special_needs,
 	b.geometry as geometry
 FROM raw_data.osm_school_point b 
 LEFT JOIN join_region j ON b.osm_id=j.id
-WHERE niscode IS null
+WHERE j.niscode IS null AND (b.amenity='kindergarten' OR b.amenity='school' OR b.amenity='university' OR b.amenity='college')
 )
 
 
@@ -587,7 +600,8 @@ jsonb_strip_nulls(jsonb_build_object(
 			'type_kindergarten',type_kindergarten,
 			'type_primary',type_primary,
 			'type_secondary',type_secondary,
-			'type_higher_education',type_higher_education)	
+			'type_higher_education',type_higher_education,
+			'type_special_needs',type_special_needs)	
     	) AS properties,
     geometry,
 	CURRENT_DATE as created_at
@@ -654,12 +668,16 @@ sql_commands_osm_polygons <- c(
     WHERE
         ST_Contains(out.wkb_geometry, inn.wkb_geometry)
   ),
-  
+
   
   --- we also want background info from points in the polygon
   point_in_poly AS (
     SELECT
         out.osm_id AS outer_id,
+	    CASE WHEN 
+	  		((out.amenity!='kindergarten' AND out.amenity!='school' AND out.amenity!='university' AND out.amenity!='college') OR out.amenity IS NULL)
+	  		AND out.landuse='education' 
+	  		THEN '1' END AS landuse_indicator,
         inn.osm_id AS inner_id
     FROM
 		tst.osm_school_polygon out
@@ -668,17 +686,20 @@ sql_commands_osm_polygons <- c(
     ON
         out.osm_id <> inn.osm_id
     WHERE
-        ST_Contains(out.wkb_geometry, inn.geometry) 
+        ST_Contains(out.wkb_geometry, inn.geometry) AND (inn.amenity='kindergarten' OR inn.amenity='school' OR inn.amenity='university' OR inn.amenity='college')
   ),
   overlapping AS (
-	  select * from overlapping_poly UNION ALL select outer_id,NULL as landuse_indicator, inner_id  from point_in_poly),
-  
+	  select * from overlapping_poly UNION ALL select * from point_in_poly),
+
+
   -- we prepare a big attribute table from both points & polygons
   attributes AS (
-  	select osm_id,name,name_nl,operator_wikidata,operator,operator_type,addr_city,addr_housenumber,addr_street,addr_postcode,short_name,alt_name,contact_email,email,website,contact_website,phone,contact_phone,opening_hours,check_date,image,wikidata,amenity,faculty,religion,name_fr,name_de,nohousenumber,old_name,official_name,phone_2,mobile,contact_mobile,alt_website,operator_email,operator_website,landuse,grades,isced_level,max_age,min_age,pedagogy,school_language,language_nl,language_de,language_fr,school,language,type_kindergarten,type_primary,type_secondary,type_higher_education,geometry, 'poly' AS source FROM raw_data.osm_school_polygon
+  	select osm_id,name,name_nl,operator_wikidata,operator,operator_type,addr_city,addr_housenumber,addr_street,addr_postcode,short_name,alt_name,contact_email,email,website,contact_website,phone,contact_phone,opening_hours,check_date,image,wikidata,amenity,faculty,religion,name_fr,name_de,nohousenumber,old_name,official_name,phone_2,mobile,contact_mobile,alt_website,operator_email,operator_website,landuse,grades,isced_level,max_age,min_age,pedagogy,school_language,language_nl,language_de,language_fr,school,language,type_kindergarten,type_primary,type_secondary,type_higher_education,type_special_needs,geometry, 'poly' AS source FROM raw_data.osm_school_polygon
 	  UNION ALL
-    select osm_id,name,name_nl,operator_wikidata,operator,operator_type,addr_city,addr_housenumber,addr_street,addr_postcode,short_name,alt_name,contact_email,email,website,contact_website,phone,contact_phone,opening_hours,check_date,image,wikidata,amenity,faculty,religion,name_fr,name_de,nohousenumber,old_name,official_name,phone_2,mobile,contact_mobile,alt_website,operator_email,operator_website,landuse,grades,isced_level,max_age,min_age,pedagogy,school_language,language_nl,language_de,language_fr,school,language,type_kindergarten,type_primary,type_secondary,type_higher_education,geometry, 'point' AS source FROM raw_data.osm_school_point
+    select osm_id,name,name_nl,operator_wikidata,operator,operator_type,addr_city,addr_housenumber,addr_street,addr_postcode,short_name,alt_name,contact_email,email,website,contact_website,phone,contact_phone,opening_hours,check_date,image,wikidata,amenity,faculty,religion,name_fr,name_de,nohousenumber,old_name,official_name,phone_2,mobile,contact_mobile,alt_website,operator_email,operator_website,landuse,grades,isced_level,max_age,min_age,pedagogy,school_language,language_nl,language_de,language_fr,school,language,type_kindergarten,type_primary,type_secondary,type_higher_education,type_special_needs,geometry, 'point' AS source FROM raw_data.osm_school_point
+	  where amenity='kindergarten' OR amenity='school' OR amenity='university' OR amenity='college'
   ),
+  
   
   -- we now enrich the entire list with the shared 'outer' identifier
   merged AS (
@@ -701,36 +722,55 @@ sql_commands_osm_polygons <- c(
 	  		  ORDER BY final_id
   ),
 
--- if there are 2 or more osm_id with landuse_indicator='1' with the same final_id in a group overwrite the final_id with osm_id
- count_landuse AS (select *, SUM(landuse_indicator::integer) OVER (PARTITION BY final_id) as landuse_count from finalid),
- dealt_with_landuse AS (select *,
- CASE WHEN landuse_count>1 AND landuse_indicator='1' THEN osm_id
- ELSE final_id END as aggregation_id
- from count_landuse
- --if you want to throw out 'campus' features when they also have underlying schools: WHERE (landuse_indicator IS NULL AND landuse_count IS NULL) OR NOT (landuse_count>1 AND landuse_indicator IS NULL)
- ORDER BY landuse_count DESC, aggregation_id ASC),
-  
+
+count_landuse AS (select *, 
+				  SUM(landuse_indicator::integer) OVER (PARTITION BY final_id) as landuse_count,
+				  SUM(CASE WHEN source='point' THEN 1 ELSE 0 END) OVER (PARTITION BY final_id) as point_count,
+				  SUM(CASE WHEN source='poly' THEN 1 ELSE 0 END) OVER (PARTITION BY final_id) as poly_count,
+				  CASE WHEN landuse='education' AND (amenity!='kindergarten' AND amenity!='school' AND amenity!='university' AND amenity!='college') OR amenity IS NULL
+					THEN 1 ELSE 0 END as inner_landuse
+				  from finalid),
+
+
+dealt_with_landuse AS (select *,
+-- if no landuse involved, keep the case
+	CASE when 
+		-- no landuse at all
+		landuse_count IS NULL AND (inner_landuse=0 
+		-- the inner is landuse, but it is part of a bigger cluster)
+		OR (inner_landuse=1 AND (point_count>1 OR poly_count>1))) THEN final_id
+-- else if more than one way and no points involved, keep only the ways and remove the landuse object
+	-- NULLs to be removed next
+	WHEN poly_count>1 AND point_count=0 AND landuse_indicator IS NULL THEN NULL
+	WHEN poly_count>1 AND point_count=0 THEN osm_id				   
+-- else if landuse involved, keep landuse as outer for all inners if there are any
+	WHEN landuse_count>0 AND point_count+poly_count>1 THEN final_id
+-- else if it is landuse, but there are no inners, and there is no name, remove the object
+    WHEN inner_landuse=1 AND name IS NOT NULL THEN final_id
+	WHEN inner_landuse=1 THEN NULL 
+-- there should be no else
+	ELSE 'undefined' END AS aggregation_id
+	FROM count_landuse),
+	
+
+ 
   -- before we group, we simplify into just the columns we need
   -- the complex concat makes sure all the data that could be under different tags is merged into one column, without there being separators when not needed
   -- we only keep the geometry if you don't have an outer school or if you are the outer school
  simplified AS (
     SELECT b.aggregation_id, b.name, b.name_nl, b.name_fr, b.name_de,
-	  	CASE WHEN b.short_name IS NULL AND b.official_name IS NULL AND b.alt_name IS NULL AND b.old_name IS NULL THEN NULL 
-	ELSE CONCAT_WS('; ',b.short_name, b.official_name, b.alt_name, b.old_name) END AS other_names,
+	  	NULLIF(CONCAT_WS('; ',b.short_name, b.official_name, b.alt_name, b.old_name),'') AS other_names,
 CASE WHEN b.addr_street IS NULL THEN NULL 
 	ELSE LTRIM(CONCAT(b.addr_street, ' ' || CASE WHEN b.nohousenumber='yes' THEN 'w/n' ELSE b.addr_housenumber END, ', ' || CONCAT((b.addr_postcode || ' '), b.addr_city))) END
 	AS address,
 	b.addr_street AS addr_street,
 	b.addr_housenumber AS addr_housenumber,
-CASE WHEN b.contact_email IS NULL AND b.email IS NULL THEN NULL
-	ELSE CONCAT_WS('; ',b.contact_email, b.email) END AS local_email,
+  NULLIF(CONCAT_WS('; ',b.contact_email, b.email),'') AS local_email,
 operator_email,
-CASE WHEN b.contact_mobile IS NULL AND b.mobile IS NULL AND b.contact_phone IS NULL AND b.phone IS NULL AND b.phone_2 IS NULL THEN NULL
-	ELSE CONCAT_WS('; ',b.contact_mobile, b.mobile, b.contact_phone, b.phone, b.phone_2) END AS local_phone,
-CASE WHEN b.website IS NULL AND b.contact_website IS NULL THEN NULL
-	ELSE CONCAT_WS('; ',b.website, b.contact_website) END AS local_website,
+  NULLIF(CONCAT_WS('; ',b.contact_mobile, b.mobile, b.contact_phone, b.phone, b.phone_2),'') AS local_phone,
+  NULLIF(CONCAT_WS('; ',b.website, b.contact_website),'') AS local_website,
 	b.operator_website,
-	b.type_kindergarten, b.type_primary, b.type_secondary, b.type_higher_education, b.landuse_count, b.landuse_indicator,
+	b.type_kindergarten, b.type_primary, b.type_secondary, b.type_higher_education,b.type_special_needs, b.landuse_count, b.landuse_indicator,
 	  b.source,
      CASE 
 	    WHEN aggregation_id=osm_id THEN geometry
@@ -738,9 +778,11 @@ CASE WHEN b.website IS NULL AND b.contact_website IS NULL THEN NULL
 	    END
         AS geometry
     FROM dealt_with_landuse b
-	WHERE landuse_count IS NULL OR NOT (landuse_indicator IS NULL AND landuse_count>1 AND name IS NULL) 
+	WHERE aggregation_id IS NOT NULL AND aggregation_id!='undefined' 
   ),
-    
+
+
+
   join_region AS (
     SELECT 
     r.niscode as niscode,
@@ -771,6 +813,7 @@ CASE WHEN b.website IS NULL AND b.contact_website IS NULL THEN NULL
     max(s.type_primary) AS type_primary,
     max(s.type_secondary) AS type_secondary,
     max(s.type_higher_education) AS type_higher_education,
+    max(s.type_special_needs) AS type_special_needs,
     MIN(j.niscode) as region,
 	STRING_AGG(DISTINCT s.source, '; ') AS source,
     MIN(s.geometry) as geometry
@@ -785,7 +828,7 @@ final_table AS (
 select * from table_joined t
 WHERE source!='point')
 
-  -- include at 
+-- include at 
     INSERT INTO ingestion.osm_school_polygon (original_id, name, legend_item, name_source, categorie_name, properties, addr_street, addr_housenumber, REGION, created_at,geometry)
   SELECT
   id AS original_id,
@@ -808,7 +851,8 @@ WHERE source!='point')
 	  'type_kindergarten',type_kindergarten,
 	  'type_primary',type_primary,
 	  'type_secondary',type_secondary,
-	  'type_higher_education',type_higher_education)	
+	  'type_higher_education',type_higher_education,
+	  'type_special_needs',type_special_needs)	
   ) AS properties,
   addr_street AS addr_street,
   addr_housenumber AS addr_housenumber,
@@ -822,14 +866,52 @@ WHERE source!='point')
   DROP COLUMN REGION;")
 
 
+### Make OSM polygons available ----
+
+DownloadProcessedOSMpoly <- function(){ 
+  tryCatch({
+    print("Start downloading processed OSM polygon data")
+    start_time <- Sys.time()
+
+con_pg <- get_con()
+
+osm_cleaned <- dbGetQuery(con_pg, "SELECT 
+  original_id, name, legend_item, name_source, categorie_name, properties, addr_street, addr_housenumber, created_at, ST_AsText(geometry) as osm_geometry_wkt
+  FROM ingestion.osm_school_polygon;")
+
+dbDisconnect(con_pg)
+
+# make sf and reproject to lambert72
+osm_cleaned<-osm_cleaned %>% filter( !is.na(osm_geometry_wkt) & osm_geometry_wkt != "")
+osm_cleaned<-st_as_sf(osm_cleaned, wkt="osm_geometry_wkt")
+osm_cleaned$osm_geometry_wkt <- st_set_crs(osm_cleaned$osm_geometry_wkt, 4326)
+osm_cleaned_orig <<- osm_cleaned
+osm_cleaned <<- st_transform(osm_cleaned, 31370)
+
+  }, 
+error = function(e) {
+  print(paste("Error downloading OSM polygons:", e))
+})
+  
+  # status message
+  finish<-Sys.time()
+  total_time <- round(as.numeric(difftime(finish, start_time, units = "secs")), 2)
+  print(paste0("Downloading processed OSM poly data done (took ",total_time," seconds)"))
+}
+
 
 ### BRWA transformation ----
 
+TransformBRWA <- function(){ 
+  tryCatch({
+    print("Start transformation of BRWA data")
+    start_time <- Sys.time()
+  
 con_pg <- get_con()
 brwa <- dbGetQuery(con_pg, " SELECT 
   o.ogc_fid,
-  o.ndeg_fase_de_l_etablissement, 
-  o.ndeg_fase_de_l_implantation,
+  o.ndegfase_de_l_etablissement, 
+  o.ndegfase_de_l_implantation,
   o.nom_de_l_etablissement,
   o.type_d_enseignement, 
   o.niveau,
@@ -845,22 +927,13 @@ brwa <- dbGetQuery(con_pg, " SELECT
   FROM raw_data.brwa_cfwb_odata_schools o
   LEFT JOIN raw_data.brwa_cfwb_odata_schools_gl g ON o.ogc_fid=g.ogc_fid;")
 
-osm_cleaned <- dbGetQuery(con_pg, "SELECT 
-  original_id, name, legend_item, name_source, categorie_name, properties, addr_street, addr_housenumber, created_at, ST_AsText(geometry) as osm_geometry_wkt
-  FROM ingestion.osm_school_polygon;")
-
 dbDisconnect(con_pg)
 
-# make sf and reproject to lambert72
-osm_cleaned<-st_as_sf(osm_cleaned, wkt="osm_geometry_wkt")
-osm_cleaned$osm_geometry_wkt <- st_set_crs(osm_cleaned$osm_geometry_wkt, 4326)
-osm_cleaned_orig <- osm_cleaned
-osm_cleaned <- st_transform(osm_cleaned, 31370)
 
 
-# fix geometry issues caused by geocoding: if ndeg_fase_de_l_etablissement & ndeg_fase_de_l_implantation are identical, copy the first geocoded_geometry_wkt to all the records in the group
+# fix geometry issues caused by geocoding: if ndegfase_de_l_etablissement & ndegfase_de_l_implantation are identical, copy the first geocoded_geometry_wkt to all the records in the group
 brwa <- brwa %>%
-  group_by(ndeg_fase_de_l_etablissement, ndeg_fase_de_l_implantation) %>%
+  group_by(ndegfase_de_l_etablissement, ndegfase_de_l_implantation) %>%
   mutate(geocoded_geometry_wkt = ifelse(n() > 1, first(geocoded_geometry_wkt), geocoded_geometry_wkt)) %>%
   ungroup()
 
@@ -887,8 +960,12 @@ brwa_geocode$source <- "geocoded"
 # add cases from both brwa geometry versions together
 brwa_all <- rbind(brwa_orig, brwa_geocode)
 
+# status message
+download_time<-Sys.time()
+downloading_time <- round(as.numeric(difftime(download_time, start_time, units = "secs")), 2)
+print(paste0("Downloaded BRWA data (took ",downloading_time," seconds), now joining to OSM data"))
 
-
+      
 # join nearby objects from both datasets
 join <- st_join(brwa_all, osm_cleaned, join = st_is_within_distance, dist = distance_raw_threshold)
 join <- as.data.frame(join)
@@ -907,8 +984,10 @@ join$distance <- mapply(calculate_eucl_distance, join$osm_geometry_wkt, join$geo
 #join_all <- join
 #join<-join_all
 
-
-
+# status message
+join_time<-Sys.time()
+joining_time <- round(as.numeric(difftime(join_time, download_time, units = "secs")), 2)
+print(paste0("Joined BRWA data to OSM (took ",joining_time," seconds), now preparing choosing which links to keep"))
 
 
 
@@ -1151,17 +1230,20 @@ join$type_kindergarten <- as.numeric(sapply(join$properties, extract_json_value,
 join$type_primary <- as.numeric(sapply(join$properties, extract_json_value, key = "type_primary"))
 join$type_secondary <- as.numeric(sapply(join$properties, extract_json_value, key = "type_secondary"))
 join$type_tertiary <- as.numeric(sapply(join$properties, extract_json_value, key = "type_higher_education"))
+join$type_special_needs <- as.numeric(sapply(join$properties, extract_json_value, key = "type_special_needs"))
 
 join$off_kindergarten <- ifelse(grepl("Maternel", join$type_d_enseignement), 1, 0)
 join$off_primary <- ifelse(grepl("Primaire", join$type_d_enseignement), 1, 0)
 join$off_secondary <- ifelse(join$niveau == "Secondaire", 1, 0)
 join$off_tertiary <- ifelse(join$niveau == "Supérieur", 1, 0)
+join$off_special_needs <- ifelse(join$genre == "Spécialisé", 1, 0)
 
 # if any combination of type is both 1, set same_school_type to 1
 join$same_school_type <- ifelse(join$off_kindergarten == 1 & join$type_kindergarten == "1", 1, 0) +
   ifelse(join$off_primary == 1 & join$type_primary == "1", 1, 0) +
   ifelse(join$off_secondary == 1 & join$type_secondary == "1", 1, 0) +
-  ifelse(join$off_tertiary == 1 & join$type_tertiary == "1", 1, 0)
+  ifelse(join$off_tertiary == 1 & join$type_tertiary == "1", 1, 0) +
+  ifelse(join$off_special_needs == 1 & join$type_special_needs == "1", 1, 0)
 
 
 join <- join %>%
@@ -1181,6 +1263,11 @@ join<- join %>%
     streetsim >= 0.9 & hnr_sim < 0.9 ~ 0.85,
     TRUE ~ 0
   ))
+
+# status message
+choice_prep_time<-Sys.time()
+choice_prepping_time <- round(as.numeric(difftime(choice_prep_time, join_time, units = "secs")), 2)
+print(paste0("Prepared for choosing which links to keep (took ",choice_prepping_time," seconds), now making choices"))
 
 
 
@@ -1255,6 +1342,13 @@ join_simplified <- join %>%
   select(ogc_fid, osm_id=original_id) %>%
   distinct()
 
+
+# status message
+choice_time<-Sys.time()
+choosing_time <- round(as.numeric(difftime(choice_time, choice_prep_time, units = "secs")), 2)
+print(paste0("Choices made (took ",choosing_time," seconds), now summarizing data"))
+
+
 brwa_joined <- left_join(brwa, join_simplified, by = "ogc_fid")
 
 
@@ -1303,6 +1397,7 @@ brwa_joined$type_kindergarten <- ifelse(grepl("Maternel", brwa_joined$type_d_ens
 brwa_joined$type_primary <- ifelse(grepl("Primaire", brwa_joined$type_d_enseignement), 1, 0)
 brwa_joined$type_secondary <- ifelse(brwa_joined$niveau == "Secondaire", 1, 0)
 brwa_joined$type_tertiary <- ifelse(brwa_joined$niveau == "Supérieur", 1, 0)
+brwa_joined$type_special_needs <- ifelse(brwa_joined$genre == "Spécialisé", 1, 0)
 
 # aggregate
 brwa_summarized <- brwa_joined %>%
@@ -1310,7 +1405,7 @@ brwa_summarized <- brwa_joined %>%
   summarize(
     ogc_fid = paste(unique(ogc_fid), collapse = '; '),
     type_d_enseignement = paste(unique(type_d_enseignement), collapse = '; '),
-    original_id = paste(unique(paste0(ndeg_fase_de_l_etablissement,'_',ndeg_fase_de_l_implantation),'; '), collapse = '; '),
+    original_id = paste(unique(paste0(ndegfase_de_l_etablissement,'_',ndegfase_de_l_implantation),'; '), collapse = '; '),
     numero_bce_de_l_etablissement = paste(unique(numero_bce_de_l_etablissement), collapse = '; '),
     nom_de_l_etablissement = paste(unique(nom_de_l_etablissement), collapse = '; '),
     adresse_de_l_implantation = paste(unique(adresse_de_l_implantation), collapse = '; '),
@@ -1320,11 +1415,14 @@ brwa_summarized <- brwa_joined %>%
     type_primary = max(type_primary),
     type_secondary = max(type_secondary),
     type_tertiary = max(type_tertiary),
+    type_special_needs = max(type_special_needs),
     osm_id=first(osm_id),
     name=first(name),
     properties_osm=first(properties),
     geometry_point=first(geometry),
     geometry_osm=first(osm_geometry_wkt))
+
+
 
 # create BRWA properties
 
@@ -1333,18 +1431,20 @@ brwa_summarized <- brwa_summarized %>%
   mutate(off_properties = jsonlite::toJSON(
     purrr::discard(list(
       official_id = original_id,
-      address = adresse_de_l_implantation,
-      postcode = code_postal_de_l_implantation,
-      municipality = commune_de_l_implantation,
-      bce_number=numero_bce_de_l_etablissement,
+      address = paste0(
+        adresse_de_l_implantation, ", ",
+        code_postal_de_l_implantation, " ",
+        commune_de_l_implantation
+      ),
+      kbo_bce=numero_bce_de_l_etablissement,
       school_types = type_d_enseignement,
       name = ifelse(is.na(osm_id), NA, nom_de_l_etablissement),
       type_kindergarten = type_kindergarten,
       type_primary = type_primary,
       type_secondary = type_secondary,
-      type_tertiary = type_tertiary
+      type_tertiary = type_tertiary,
+      type_special_needs = type_special_needs
     ), is.na), auto_unbox = TRUE))
-
 
 brwa_summarized <- as.data.frame(brwa_summarized)
 
@@ -1384,16 +1484,31 @@ invalid_geometries <- brwa_summarized %>%
   filter(!st_is_valid(geometry))
 
 
-
-brwa_summarized <- brwa_summarized %>%
+#save the result beyond the function
+brwa_summarized <<- brwa_summarized %>%
   select(original_id,name,properties_osm, off_properties, name_source)
 
 
+  }, 
+error = function(e) {
+  print(paste("Error transforming BRWA data:", e))
+})
+  
+  # status message
+  finish<-Sys.time()
+  total_time <- round(as.numeric(difftime(finish, start_time, units = "secs")), 2)
+  print(paste0("Transformation of BRWA is done (took ",total_time," seconds)"))
+}
 
 
 # VLA transformation ----
 
+TransformVL <- function() {
+  tryCatch({
+    print("Start transformation of VLA data")
+    start_time <- Sys.time()
 
+  # connect to the database
 con_pg <- get_con()
 vla <- dbGetQuery(con_pg, "SELECT 
 	ogc_fid,
@@ -1414,14 +1529,20 @@ vla <- dbGetQuery(con_pg, "SELECT
         ST_AsText(geom) as off_geometry -- is already in Lambert72
 FROM raw_data.vla_depov_poiservice_schools;")
 
+
+
 dbDisconnect(con_pg)
+
 
 # create vla as sf with the original geometry
 vla <- st_as_sf(vla, wkt="off_geometry")
 vla$off_geometry <- st_set_crs(vla$off_geometry, 31370)
 #st_write(vla, "C:/temp/logs/vla.geojson", driver = "GeoJSON")
 
-
+# status message
+download_time<-Sys.time()
+downloading_time <- round(as.numeric(difftime(download_time, start_time, units = "secs")), 2)
+print(paste0("Downloaded VLA data (took ",downloading_time," seconds), now joining to OSM data"))
 
 
 
@@ -1443,6 +1564,10 @@ join$distance <- mapply(calculate_eucl_distance, join$osm_geometry_wkt, join$off
 #join_all <- join
 #join<-join_all
 
+# status message
+join_time<-Sys.time()
+joining_time <- round(as.numeric(difftime(join_time, download_time, units = "secs")), 2)
+print(paste0("Joined VLA data to OSM (took ",joining_time," seconds), now preparing choosing which links to keep"))
 
 
 # keep only the records with a link to an OSM geometry
@@ -1669,22 +1794,25 @@ join$type_kindergarten <- as.numeric(sapply(join$properties, extract_json_value,
 join$type_primary <- as.numeric(sapply(join$properties, extract_json_value, key = "type_primary"))
 join$type_secondary <- as.numeric(sapply(join$properties, extract_json_value, key = "type_secondary"))
 join$type_tertiary <- as.numeric(sapply(join$properties, extract_json_value, key = "type_higher_education"))
+join$type_special_needs <- as.numeric(sapply(join$properties, extract_json_value, key = "type_special_needs"))
 
 join$off_kindergarten <- ifelse(grepl("kleuteronderwijs", join$poitype), 1, 0)
 join$off_primary <- ifelse(grepl("lager onderwijs", join$poitype), 1, 0)
 join$off_secondary <- ifelse(join$categorie == "Secundair onderwijs", 1, 0)
 join$off_tertiary <- ifelse(join$categorie == "Hoger onderwijs", 1, 0)
+join$off_special_needs <- ifelse(grepl("Buitengewoon", join$poitype), 1, 0)
 
 
 # if any combination of type is both 1, set same_school_type to 1
 join$same_school_type <- ifelse(join$off_kindergarten == 1 & join$type_kindergarten == "1", 1, 0) +
   ifelse(join$off_primary == 1 & join$type_primary == "1", 1, 0) +
   ifelse(join$off_secondary == 1 & join$type_secondary == "1", 1, 0) +
-  ifelse(join$off_tertiary == 1 & join$type_tertiary == "1", 1, 0)
+  ifelse(join$off_tertiary == 1 & join$type_tertiary == "1", 1, 0) +
+  ifelse(join$off_special_needs == 1 & join$type_special_needs == "1", 1, 0)
 
 
 join <- join %>%
-  select(-name_1,-name_2,-other_names,-house_number_1, -house_number_2, -street_1, -street_2, -type_kindergarten, -type_primary, -type_secondary, -type_tertiary, -off_kindergarten, -off_primary, -off_secondary, -off_tertiary)
+  select(-name_1,-name_2,-other_names,-house_number_1, -house_number_2, -street_1, -street_2, -type_kindergarten, -type_primary, -type_secondary, -type_tertiary, -off_kindergarten, -off_primary, -off_secondary, -off_tertiary, -off_special_needs, -type_special_needs)
 
 ## combine choice elements
 
@@ -1699,6 +1827,10 @@ join<- join %>%
     TRUE ~ 0
   ))
 
+# status message
+choice_prep_time<-Sys.time()
+choice_prepping_time <- round(as.numeric(difftime(choice_prep_time, join_time, units = "secs")), 2)
+print(paste0("Prepared for choosing which links to keep (took ",choice_prepping_time," seconds), now making choices"))
 
 
 
@@ -1788,6 +1920,10 @@ vla_joined <- left_join(vla_joined, as.data.frame(osm_cleaned_orig), by = c("osm
 
 
 
+# status message
+choice_time<-Sys.time()
+choosing_time <- round(as.numeric(difftime(choice_time, choice_prep_time, units = "secs")), 2)
+print(paste0("Choices made (took ",choosing_time," seconds), now summarizing data"))
 
 # create the school types again
 
@@ -1795,6 +1931,7 @@ vla_joined$type_kindergarten <- ifelse(grepl("kleuteronderwijs", vla_joined$poit
 vla_joined$type_primary <- ifelse(grepl("lager onderwijs", vla_joined$poitype), 1, 0)
 vla_joined$type_secondary <- ifelse(vla_joined$categorie == "Secundair onderwijs", 1, 0)
 vla_joined$type_tertiary <- ifelse(vla_joined$categorie == "Hoger onderwijs", 1, 0)
+vla_joined$type_special_needs <- ifelse(vla_joined$categorie == "Buitengewoon", 1, 0)
 
 # prepare addresses
 # Step 1: Prepare Address Data (prep_add0)
@@ -1832,16 +1969,29 @@ vla_summarized <- vla_joined %>%
     email=paste(unique(email), collapse = '; '),
     poitype=paste(unique(poitype), collapse = '; '),
     link1=paste(unique(link1), collapse = '; '),
-    link2=paste(unique(link2), collapse = '; '),
+    link2=paste(na.omit(unique(link2)), collapse = '; '),
     type_kindergarten = max(type_kindergarten),
     type_primary = max(type_primary),
     type_secondary = max(type_secondary),
     type_tertiary = max(type_tertiary),
+    type_special_needs = max(type_special_needs),
     osm_id=first(osm_id),
     name=first(name),
     properties_osm=first(properties),
     geometry_point=first(off_geometry),
     geometry_osm=first(osm_geometry_wkt))
+
+# set telefoon, email, link1, link2 to NA if they are empty
+vla_summarized$telefoon[vla_summarized$telefoon == " "] <- NA
+vla_summarized$email[vla_summarized$email == " "] <- NA
+vla_summarized$link1[vla_summarized$link1 == " "] <- NA
+vla_summarized$link2[vla_summarized$link2 == " "] <- NA
+vla_summarized$telefoon[vla_summarized$telefoon == ""] <- NA
+vla_summarized$email[vla_summarized$email == ""] <- NA
+vla_summarized$link1[vla_summarized$link1 == ""] <- NA
+vla_summarized$link2[vla_summarized$link2 == ""] <- NA
+
+
 
 
 # create vla properties
@@ -1851,20 +2001,22 @@ vla_summarized <- vla_summarized %>%
   mutate(off_properties = jsonlite::toJSON(
     purrr::discard(list(
       official_id = original_id,
-      address = address,
-      postcode = postcode,
-      municipality = municipality,
-      link_fiche = link1,
-      link_school = link2,
+      address = paste0(
+        address, ", ",
+        postcode, " ",
+        municipality
+      ),
+      website_administrative = link1,
+      website = link2,
       phone = telefoon,
       email = email,
       school_types = poitype,
       type_kindergarten = type_kindergarten,
       type_primary = type_primary,
       type_secondary = type_secondary,
-      type_tertiary = type_tertiary
+      type_tertiary = type_tertiary,
+      type_special_needs = type_special_needs
     ), is.na), auto_unbox = TRUE))
-
 
 
 vla_summarized <- as.data.frame(vla_summarized)
@@ -1902,15 +2054,37 @@ st_crs(vla_summarized) <- 4326
 
 
 
-
-vla_summarized <- vla_summarized %>%
+# Save the results beyond the function
+vla_summarized <<- vla_summarized %>%
   select(original_id,name,properties_osm, off_properties, name_source)
+
+
+
+}, 
+error = function(e) {
+  print(paste("Error transforming VLA data:", e))
+})
+
+# status message
+finish<-Sys.time()
+total_time <- round(as.numeric(difftime(finish, start_time, units = "secs")), 2)
+print(paste0("Transformation of VLA is done (took ",total_time," seconds)"))
+}
+
+
+
+
 
 
 
 
 # GER transformation ----
 
+TransformGER <- function(){ 
+  tryCatch({
+    print("Start transformation of GER data")
+    start_time <- Sys.time()
+    
 
 con_pg <- get_con()
 ger <- dbGetQuery(con_pg, "SELECT 
@@ -1928,9 +2102,16 @@ FROM raw_data.ger_dgov_email_schools_g;")
 dbDisconnect(con_pg)
 
 
+
+
 # create ger as sf with the original geometry
 ger <- st_as_sf(ger, wkt="off_geometry")
 ger$off_geometry <- st_set_crs(ger$off_geometry, 31370)
+
+# status message
+download_time<-Sys.time()
+downloading_time <- round(as.numeric(difftime(download_time, start_time, units = "secs")), 2)
+print(paste0("Downloaded GER data (took ",downloading_time," seconds), now joining to OSM data"))
 
 
 
@@ -1949,8 +2130,13 @@ join <- left_join(join, osm_cleaned_geo, by = "original_id")
 join$distance <- mapply(calculate_eucl_distance, join$osm_geometry_wkt, join$off_geometry)
 
 # keep a backup with all records, including the ones that do not have a link to an OSM geometry
-join_all <- join
-join<-join_all
+#join_all <- join
+#join<-join_all
+
+# status message
+join_time<-Sys.time()
+joining_time <- round(as.numeric(difftime(join_time, download_time, units = "secs")), 2)
+print(paste0("Joined GER data to OSM (took ",joining_time," seconds), now preparing choosing which links to keep"))
 
 
 # keep only the records with a link to an OSM geometry
@@ -2179,6 +2365,7 @@ join$type_kindergarten <- as.numeric(sapply(join$properties, extract_json_value,
 join$type_primary <- as.numeric(sapply(join$properties, extract_json_value, key = "type_primary"))
 join$type_secondary <- as.numeric(sapply(join$properties, extract_json_value, key = "type_secondary"))
 join$type_tertiary <- as.numeric(sapply(join$properties, extract_json_value, key = "type_higher_education"))
+# NOTE: no special education defined in GER schools
 
 join$ger_kindergarten <- ifelse(join$type == "grundschule", 1, 0)
 join$ger_primary <- ifelse(join$type == "grundschule", 1, 0)
@@ -2211,6 +2398,10 @@ join<- join %>%
   ))
 
 
+# status message
+choice_prep_time<-Sys.time()
+choice_prepping_time <- round(as.numeric(difftime(choice_prep_time, join_time, units = "secs")), 2)
+print(paste0("Prepared for choosing which links to keep (took ",choice_prepping_time," seconds), now making choices"))
 
 
 ### Make choices ----
@@ -2277,6 +2468,12 @@ join <- join %>%
 
 
 
+# status message
+choice_time<-Sys.time()
+choosing_time <- round(as.numeric(difftime(choice_time, choice_prep_time, units = "secs")), 2)
+print(paste0("Choices made (took ",choosing_time," seconds), now summarizing data"))
+
+
 # simplify data
 
 join_simplified <- join %>%
@@ -2304,6 +2501,10 @@ ger_joined$type_kindergarten <- ifelse(ger_joined$type == "grundschule", 1, 0)
 ger_joined$type_primary <- ifelse(ger_joined$type == "grundschule", 1, 0)
 ger_joined$type_secondary <- ifelse(ger_joined$type == "sekundarschule", 1, 0)
 ger_joined$type_tertiary <- ifelse(ger_joined$type == "hochschule" | ger_joined$type == "förderschule" , 1, 0)
+
+
+
+
 
 # prepare addresses
 # Step 1: Prepare Address Data (prep_add0)
@@ -2336,9 +2537,10 @@ ger_summarized <- ger_summarized %>%
   rowwise() %>%
   mutate(off_properties = jsonlite::toJSON(
     purrr::discard(list(
-      address = address,
-      postcode = postcode,
-      municipality = municipality,
+      address = paste0(
+        address, ", ",
+        postcode
+      ),
       email = email,
       school_types = type,
       contact_person = contact_person,
@@ -2387,13 +2589,30 @@ st_crs(ger_summarized) <- 4326
 invalid_geometries <- ger_summarized %>%
   filter(!st_is_valid(geometry))
 
-ger_summarized <- ger_summarized %>%
+ger_summarized <<- ger_summarized %>%
   select(original_id,name,properties_osm, off_properties, name_source)
+
+  }, 
+error = function(e) {
+  print(paste("Error transforming GER data:", e))
+})
+  
+  # status message
+  finish<-Sys.time()
+  total_time <- round(as.numeric(difftime(finish, start_time, units = "secs")), 2)
+  print(paste0("Transformation of GER is done (took ",total_time," seconds)"))
+}
 
 
 
 
 # Merge the regions ----
+
+MergeRegions <- function(){ 
+  tryCatch({
+    print("Merge the regions & upload to ingestion")
+    start_time <- Sys.time()
+    
 
 all_regions <- rbind(ger_summarized, brwa_summarized, vla_summarized)
 
@@ -2422,7 +2641,7 @@ all_regions <- rbind(all_regions, osm_add)
 
 
 # add all OSM points outside of Belgium
-
+# TODO: outside of Belgium, this reintroduces schools that were already merged to a polygon
 con_pg <- get_con()
 osm_school_point <- dbGetQuery(con_pg, "SELECT 
   original_id, name, name_source, properties AS properties_osm, NULL as off_properties, created_at, ST_AsText(geometry) as geometry
@@ -2453,7 +2672,7 @@ all_regions <- all_regions %>%
     name_source = ifelse(count==2, "OpenStreetMap + Fédération Wallonie-Bruxelles + Departement Onderwijs en Vorming", name_source))
 
 # to better handle JSON
-library(jqr)
+suppressPackageStartupMessages(library(jqr))
 
 # Define the jq expression
 jq_expression_fwb <- '. | {"8be50971-8cc9-4eee-8a3d-538098301926": .}'
@@ -2468,7 +2687,7 @@ doubles <-doubles %>%
   summarize(off_properties_merged=paste(unique(off_properties), collapse = '; '))
 
 # deactivating jqr as it affects general R behavior
-detach("package:jqr", unload = TRUE)
+suppressPackageStartupMessages(detach("package:jqr", unload = TRUE))
 
 # add the result to the all_regions
 all_regions <- all_regions %>%
@@ -2509,7 +2728,7 @@ all_regions <- all_regions %>%
 
 # add properties_secondary
 
-library(jqr)
+suppressPackageStartupMessages(library(jqr))
 # Define jq expressions
 jq_expression_fwb <- '. | {"8be50971-8cc9-4eee-8a3d-538098301926": .}'
 jq_expression_dov <- '. | {"7dcbb7cc-434a-4c65-b59b-fc554b844310": .}'
@@ -2538,7 +2757,7 @@ all_regions <- all_regions %>%
     "OpenStreetMap + Fédération Wallonie-Bruxelles + Departement Onderwijs en Vorming"==name_source ~ off_properties
   ))
 # deactivating jqr as it affects general R behavior
-detach("package:jqr", unload = TRUE)
+suppressPackageStartupMessages(detach("package:jqr", unload = TRUE))
 
 # set risk_level
 all_regions <- all_regions %>%
@@ -2548,18 +2767,20 @@ all_regions <- all_regions %>%
     type_kindergarten_osm = extract_json_value(properties_osm, "type_kindergarten"),
     type_primary_off = extract_json_value(off_properties, "type_primary"),
     type_primary_osm = extract_json_value(properties_osm, "type_primary"),
+    type_special_needs_off = extract_json_value(off_properties, "type_special_needs"),
+    type_special_needs_osm = extract_json_value(properties_osm, "type_special_needs"),
     risk_level = case_when(
-      type_kindergarten_off == 1 | type_kindergarten_osm == 1 ~ 3,
+      type_kindergarten_off == 1 | type_kindergarten_osm == 1 | type_special_needs_off==1 | type_special_needs_osm==1 ~ 3,
       type_primary_off == 1 | type_primary_osm == 1 ~ 2,
       TRUE ~ 1
     )
   ) %>%
-  select(-type_kindergarten_off, -type_kindergarten_osm, -type_primary_off, -type_primary_osm)  # Remove intermediate columns
+  select(-type_kindergarten_off, -type_kindergarten_osm, -type_primary_off, -type_primary_osm, -type_special_needs_off, -type_special_needs_osm)  # Remove intermediate columns
 
 # check for invalid, missing, empty geometries and geometrycollections
 test_raw <- all_regions %>%
   filter(is.na(geometry) |  !st_is_valid(geometry) | st_is(geometry, "GEOMETRYCOLLECTION") | st_is_empty(geometry))
-
+print(paste0("The number of invalid, missing, empty geometries and geometrycollections is: ", nrow(test_raw)))
 
 # generate UUID & keep only relevant columns
 all_regions <- all_regions %>%
@@ -2645,6 +2866,19 @@ dbExecute(con_pg, sql_update_table)
 dbDisconnect(con_pg)
 
 
+  }, 
+error = function(e) {
+  print(paste("Error merging regions & uploading to ingestion:", e))
+})
+  
+  # status message
+  finish<-Sys.time()
+  total_time <- round(as.numeric(difftime(finish, start_time, units = "secs")), 2)
+  print(paste0("Done merging the regions & uploading to ingestion (took ",total_time," seconds)"))
+}
+
+
+
 # Update transformation
 
 
@@ -2687,57 +2921,24 @@ GRANT ALL ON TABLE fdw.fdw_schools TO paragon;
 
 ### Execute the SQL commands ----
 
-TransformOSMpoints <- function() {
-  con_pg <- get_con()
-  tryCatch(
-    {
-      for (sql_command in sql_commands_osm_points) {
-        dbExecute(con_pg, sql_command)
-      }
-      print("The SQL functions for OSMpoints ran without error")
-    },
-    error = function(err) {
-      print("The SQL functions for OSMpoints failed")
-      print(err)
-    }
-  )
-  dbDisconnect(con_pg)
-}
 
-TransformOSMpolygons <-function() {
-  con_pg <- get_con()
-  tryCatch(
-    {
-      for (sql_command in sql_commands_osm_polygons) {
-        dbExecute(con_pg, sql_command)
-      }
-      print("The SQL functions for OSMpolygons ran without error")
-    },
-    error = function(err) {
-      print("The SQL functions for OSMpolygons failed")
-      print(err)
-    }
-  )
-  dbDisconnect(con_pg)
-}
+TransformOSMpoints <- function() {execute_sql_commands(sql_commands_osm_points, "OSM points transformation")}
+TransformOSMpolygons <- function() {execute_sql_commands(sql_commands_osm_polygons, "OSM polygons transformation")}
+create_fdw_views <- function() {execute_sql_commands(fdw_views_sql, "FDW view")}
+
+### Run the update ----
+# set update_even_if_checks_fail to TRUE if you want to update the transformation table even if the checks fail. 
+update_even_if_checks_fail <- FALSE
+# set do_name_comparison or remove to not use name distance
+
+# During the name comparison these words are removed because they have little meaning. Otherwise "gemeentelijke basisschool sint-jan" and "gemeentelijke basisschool sint-pieter" would be considered a pretty close match
+
+to_ignore_in_name <- c("college","instituts","institut","communale","fondamentale","fondamental","enseignement","provinciale", "provincial","specialize", "ecole","athenee","secondair","secondaire","instituut","gemeentelijke","gemeentelijk","basisschool","vrije ","lagere school","kleuterschool","onderwijs", "atheneum","middenschool","school","stedelijke","campus","college","basisonderwijs", "provinciaal","gemeindegrundschule","gemeindeschule","schule")
 
 
 
-create_fdw_views <- function() {
-  con_pg <- get_con()
-  tryCatch(
-    {
-      for (sql_command in fdw_views_sql) {
-        dbExecute(con_pg, sql_command)
-      }
-      print("The SQL functions for the FDW views ran without error")
-    },
-    error = function(err) {
-      print("The SQL functions for the FDW views failed")
-      print(err)  # Print the error message for more details
-    }
-  )
-  dbDisconnect(con_pg)
+run_smart_update = function() {
+  smart_update_process("schools", 50, 200, 100, format(Sys.Date(), "%Y-%m-%d"), update_even_if_checks_fail, do_name_comparison=TRUE, ignore_in_name=to_ignore_in_name)
 }
 
 
@@ -2745,13 +2946,14 @@ create_fdw_views <- function() {
 # Main function -----------------------------------------------------------
 # """"""""""""""""""""----
 
+
+
+
 main_function = function() {
   geojson_vl<-DownloadFlanders()
   geojson_brwa<-DownloadBRWA()
   ger<-DownloadGER()
-  #osm_data<-DownloadOSMdata()
-  #osm_points<-FilterOSMpoints(osm_data)
-  #osm_polygon_data_to_import<-FilterOSMpolygons(osm_data)
+  DownloadOSM()
   CreateImportTableVL(dataset = geojson_vl, schema = "raw_data", table_name = "vla_depov_poiservice_schools")  
   CreateImportTableBRWA(dataset = geojson_brwa, schema = "raw_data", table_name = "brwa_cfwb_odata_schools")  
   CreateImportTableGER(dataset = ger, schema = "raw_data", table_name = "ger_dgov_email_schools")  
@@ -2761,12 +2963,17 @@ main_function = function() {
   GeocodeAndUploadGer()
   TransformOSMpoints()
   TransformOSMpolygons()
-  #TransfromVL()
-  #TransformBRWA()
-  #TransformGer()
-  #TransformMergeAllData()
+  DownloadProcessedOSMpoly()
+  TransformBRWA()
+  TransformVL()
+  TransformGER()
+  MergeRegions()
+  run_smart_update()
   #create_fdw_views()
 }
+
+
+
 
 
 if(F){

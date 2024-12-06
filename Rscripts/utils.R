@@ -124,11 +124,34 @@ fuzzyStringMatch<-function(table1, table2=NULL, name_column1, name_column2, id_c
   return(fuzzy_match)
 }
 
+# Run a list of SQL commands with error reporting based on the task name ------------
+
+execute_sql_commands <- function(sql_commands, task_name) {
+  con_pg <- get_con()
+  tryCatch(
+    {
+      for (sql_command in sql_commands) {
+        dbExecute(con_pg, sql_command)
+      }
+      print(paste(task_name, "SQL ran without error"))
+    },
+    error = function(err) {
+      message(paste("The SQL functions for", task_name, "failed"))
+      message(err)  # Print the error message for more details
+    }
+  )
+  dbDisconnect(con_pg)
+}
+
+
+
 
 # Upload a table to a PostgreSQL database -------------------------------
 
 CreateImportTable<-function(dataset, schema, table_name){
-  if(exists("dataset")){
+  if (!exists("dataset")) {
+    print(paste0("Error, the dataset you wanted to import into ", table_id_t, "does not exist, try again"))
+  }else{
     con_pg<-get_con()
     table_id <- DBI::Id(
       schema  = schema,
@@ -152,9 +175,6 @@ CreateImportTable<-function(dataset, schema, table_name){
     dbDisconnect(con_pg)
     print(paste0("End :",format(Sys.time(), "%a %b %d %X %Y")))
     print(Sys.time()-start)
-    
-  }else{
-    print(paste0("Error, the geojson you wanted to import into ", table_id_t, "does not exist, try again"))
   }
 }
 
@@ -240,19 +260,235 @@ string_replacement <- function(df, columns, replacements) {
 #keep_region <- TRUE
 # required if you want to use the feature_tag_list
 ## feature_tag_list<-TRUE
+# optional key to use the postgres database
+# postgres <- TRUE
 
+# TODO: deal with bbox or Belgian buffer if the OSM db grows beyond the Belgian buffer
+
+# actual OSM download function
 download_osm_process <- function(
     features_list, 
     datatypes, 
     extra_columns, 
-    alternative_overpass_server,
+    alternative_overpass_server=FALSE,
     bbox = c(2.15,49.15,7.07,51.7),
     keep_region=FALSE,
-    feature_tag_list=FALSE)
+    feature_tag_list=FALSE,
+    postgres=FALSE)
 {
+
+  default_columns <- c("osm_id", "name", "name:nl", "name:fr", "name:de", "operator:wikidata",
+                       "operator", "operator:type",
+                       "addr:city", "addr:housenumber", "addr:street", "addr:postcode", "nohousenumber",
+                       "short_name", "old_name", "alt_name", "official_name", 
+                       "contact:email", "email", "website", "contact:website", "phone", "contact:phone", "opening_hours",  "phone:2", "mobile", "contact:mobile", "alt_website", "operator:email", "operator:website",
+                       "check_date", "image", "wikidata")  
   
-  ## (external) code
+
+  if (postgres == TRUE) {
+    print("Downloading data from Postgres DB")
+
+    ### Prepare connection ----
+    osm_host_name <- Sys.getenv("POSTGRES_HOST_NAME_OSM")
+    osm_user <- Sys.getenv("POSTGRES_USER_OSM")
+    osm_password <- Sys.getenv("POSTGRES_PASSWORD_OSM")
+    osm_db_name <- Sys.getenv("POSTGRES_DB_NAME_OSM")
+    
+    get_con_osm<-function(){
+      con_pg <- dbConnect(Postgres(),
+                          user=osm_user, 
+                          password=osm_password,
+                          host=osm_host_name,
+                          dbname=osm_db_name,
+                          port=5432, 
+                          sslmode = 'prefer')
+      return(con_pg)
+    }
+
+    # Prepare the WHERE clause
+    # TODO: take in account the various special cases (AND, NOT clauses)
+    where_clauses <- paste(
+      sprintf("\"%s\"='%s'", names(features_list), unlist(features_list)),
+      collapse = " OR "
+    )
+    where_clauses_tags <- paste(
+      sprintf("tags @> '\"%s\"=>\"%s\"'", names(features_list), unlist(features_list)),
+      collapse = " OR "
+    )
+    
+    # Download the data
+    con_pg <- get_con_osm()
+    if ("points" %in% datatypes) {
+      # Define your queries
+      column_query <- paste0("SELECT * ,ST_AsText(ST_Transform(way, 4326)) as geometry FROM public.planet_osm_point WHERE ",where_clauses)
+      tags_query <- paste0("SELECT * ,ST_AsText(ST_Transform(way, 4326)) as geometry FROM public.planet_osm_point WHERE ",where_clauses_tags)
+      
+      # Attempt the first query, if it fails, run the second query
+      points <- tryCatch(
+        {
+          dbGetQuery(con_pg, column_query) # Attempt the first query
+        },
+        error = function(e) {
+          # If the first query fails, run the second query
+          dbGetQuery(con_pg, tags_query)
+        }
+      )
+    }
+    if ("lines" %in% datatypes) {
+      column_query <- paste0("SELECT * ,ST_AsText(ST_Transform(way, 4326)) as geometry FROM public.planet_osm_line WHERE ",where_clauses)
+      tags_query <- paste0("SELECT * ,ST_AsText(ST_Transform(way, 4326)) as geometry FROM public.planet_osm_line WHERE ",where_clauses_tags)
+      
+      lines <- tryCatch(
+        {
+          dbGetQuery(con_pg, column_query) # Attempt the first query
+        },
+        error = function(e) {
+          # If the first query fails, run the second query
+          dbGetQuery(con_pg, tags_query)
+        }
+      )
+      
+    }
+    if ("mpolygon" %in% datatypes) {
+      column_query <- paste0("SELECT * ,ST_AsText(ST_Transform(way, 4326)) as geometry FROM public.planet_osm_polygon WHERE ",where_clauses)
+      tags_query <- paste0("SELECT * ,ST_AsText(ST_Transform(way, 4326)) as geometry FROM public.planet_osm_polygon WHERE ",where_clauses_tags)
+      mpolygon <- tryCatch(
+        {
+          dbGetQuery(con_pg, column_query) # Attempt the first query
+        },
+        error = function(e) {
+          # If the first query fails, run the second query
+          dbGetQuery(con_pg, tags_query)
+        }
+      )
+    }
+    dbDisconnect(con_pg)
+    
+    
+    # Make readable OSM ids and set as SF objects
+    if ("points" %in% datatypes) { points <- points %>% mutate(osm_id = paste0("node/", osm_id))
+    # prepare the geometry
+    points<-st_as_sf(points, wkt="geometry")
+    points$geometry <- st_set_crs(points$geometry, 4326)
+    }
+    if ("lines" %in% datatypes) { lines <- lines %>% mutate(osm_id = paste0("way/", osm_id))
+    lines<-st_as_sf(lines, wkt="geometry")
+    lines$geometry <- st_set_crs(lines$geometry, 4326)
+    }
+    if ("mpolygon" %in% datatypes) { mpolygon <- mpolygon %>%
+      mutate(osm_id = ifelse(osm_id < 0, 
+                             paste0("relation/", abs(osm_id)),  # Make it positive and prefix with "relation/"
+                             paste0("way/", osm_id))) # Prefix with "way/"
+    mpolygon<-st_as_sf(mpolygon, wkt="geometry")
+    mpolygon$geometry <- st_set_crs(mpolygon$geometry, 4326)
+    # Set all polygons as multipolygons
+    mpolygon <- mpolygon %>%
+      mutate(geometry = if_else(
+        st_geometry_type(geometry) == "POLYGON",
+        st_cast(geometry, "MULTIPOLYGON"),
+        geometry
+      ))
+    
+    }          
+
+    
+    
+    # Merge all OSM data to a single dataset
+    # Datatypes provided by the user
+    # if datatypes variable has more than one value, bind_rows:
+    osm_all <- try({
+      if (length(datatypes) > 1) {
+        osm_all <- bind_rows(mget(datatypes))
+      } else {
+        osm_all <- get(datatypes)
+      }
+    })
+        
+
+    # flag failed OSM data download
+    if (inherits(osm_all, "try-error")) {
+      osm_download_failed <- TRUE
+      print("OSM data download failed")
+    } else { print("Postgres OSM data download successful")}
+
+    
+    # multipolygons that are discontinous are returned as "islands" with the same ID. Here we merge them again
+    ## select just the duplicate osm_id's
+    osm_all_dup <- osm_all %>% filter(duplicated(osm_id) | duplicated(osm_id, fromLast = TRUE))
+    osm_all_dup <- osm_all_dup %>%
+      group_by(osm_id) %>%  # Group by osm_id
+      summarise(
+        geometry = st_union(geometry),  # Combine geometries into a single geometry
+        across(everything(), first),    # Take the first value for other attributes
+        .groups = 'drop'                  # Ungroup the result
+      )
+    
+    dup_ids <- as.data.frame(osm_all_dup) %>% select(osm_id)
+    
+    # remove the duplicates from osm_all
+    osm_all <- osm_all %>% anti_join(dup_ids, by = "osm_id")
+    
+    # add the merged objects
+    osm_all <- bind_rows(osm_all, osm_all_dup)
+
+
+    
+    ### Harmonize columns ----
+    # Find missing columns compared to user request
+    ## Function to compare requested keys with existing dataframe columns
+    get_missing_keys <- function(requested_keys, data) {
+      # Get the existing column names from the dataframe
+      existing_keys <- names(data)
+      
+      # Find missing keys that are in requested_keys but not in existing_keys
+      keys_to_extract <- requested_keys[!requested_keys %in% existing_keys]
+      
+      return(keys_to_extract)
+    }
+    
+    ## Merge the default and extra columns
+    expected_columns <- c(default_columns, extra_columns)
+    ## Get missing keys
+    keys_to_extract <- get_missing_keys(expected_columns, osm_all)
+    
+    # Get the missing columns based on the tag column
+    ## Function to extract multiple key-value pairs from tags into new columns
+    add_columns <- function(data, keys) {
+      for (key in keys) {
+        # Create the regex pattern for the current key
+        pattern <- paste0("\"", key, "\"=>\"([^\"]+)\"")
+        
+        # Check if the column does not already exist
+        if (!key %in% names(data)) {
+          data <- data %>%
+            mutate(!!sym(key) := str_extract(tags, pattern) %>%
+                     str_replace(paste0("\"", key, "\"=>\""), "") %>%
+                     str_replace("\"", ""))
+        }
+      }
+      return(data)
+    }
+    
+    
+    osm_all <- add_columns(osm_all, keys_to_extract)
+    
+    
+    # keep only columns listed in default_columns or extra_columns
+    osm_all <- osm_all %>% select(all_of(expected_columns))
+    
+    #standardize column names: replace : with _
+    osm_all <- osm_all %>%
+      rename_with(~ gsub("\\:", "_", .), contains(":"))
+    
+        
+    
+### END POSTGRES SPECIFIC PART ----
+  } else {
+### START OVERPASS SPECIFIC PART ----
+    print("Downloading data using Overpass API")
+
   
+
   ## set custom server (only needed if the main instance is giving trouble; see https://wiki.openstreetmap.org/wiki/Overpass_API#Public_Overpass_API_instances doe more options)
   if (alternative_overpass_server == TRUE) {
     custom_server_url <- "https://maps.mail.ru/osm/tools/overpass/api/interpreter"
@@ -320,7 +556,7 @@ download_osm_process <- function(
   } else { print("OSM data download successful")}
   
   
-  # we split the OSM data blob up by data type. We do this for polygons (whcih we assume to always exist) and points, lines and multipolygons. Even if we don't need them! At the end, we merge all the data back together, but only of the type requested by the user.
+  # we split the OSM data blob up by data type. We do this for polygons (which we assume to always exist) and points, lines and multipolygons. Even if we don't need them! At the end, we merge all the data back together, but only of the type requested by the user.
   
   osm_polygons <- osm_data$osm_polygons %>% mutate(osm_id = paste0("way/", osm_id))
   
@@ -354,7 +590,7 @@ download_osm_process <- function(
     }
   })  
   
-  
+   
 
   
   
@@ -367,12 +603,7 @@ download_osm_process <- function(
   ## select only the columns that interest us, then make sure the dataframe always has these columns
   ## "extra_columns" are provided by the user
   
-  default_columns <- c("osm_id", "name", "name:nl", "name:fr", "name:de", "operator:wikidata",
-                       "operator", "operator:type",
-                       "addr:city", "addr:housenumber", "addr:street", "addr:postcode", "nohousenumber",
-                       "short_name", "old_name", "alt_name", "official_name", 
-                       "contact:email", "email", "website", "contact:website", "phone", "contact:phone", "opening_hours",  "phone:2", "mobile", "contact:mobile", "alt_website", "operator:email", "operator:website",
-                       "check_date", "image", "wikidata")
+ 
   
   columns_to_select <- c(default_columns, extra_columns)
   
@@ -429,6 +660,10 @@ download_osm_process <- function(
   } else {
     osm_all <- get(datatypes)
   }
+  
+  
+} 
+### END OVERPASS SPECIFIC PART----
   
   
   #standardize column names: replace . with _

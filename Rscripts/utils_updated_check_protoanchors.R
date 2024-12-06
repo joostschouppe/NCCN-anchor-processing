@@ -11,6 +11,13 @@ library(tidyr)
 library(uuid)
 
 
+# to remove the é etc special characters
+library(stringi)
+
+# to find the longest common string
+library(PTXQC)
+
+
 # Assumed information ----
 
 get_con<-function(){
@@ -57,6 +64,13 @@ calculate_distance_integrated <- function(geometry1, geometry2) {
   return(distance)
 }
 
+# Function to calculate the percentage of overlap between two bounding boxes
+bbox_overlap <- function(bbox1, bbox2) {
+  intersect_area <- max(0, min(bbox1["xmax"], bbox2["xmax"]) - max(bbox1["xmin"], bbox2["xmin"])) *
+    max(0, min(bbox1["ymax"], bbox2["ymax"]) - max(bbox1["ymin"], bbox2["ymin"]))
+  bbox1_area <- (bbox1["xmax"] - bbox1["xmin"]) * (bbox1["ymax"] - bbox1["ymin"])
+  intersect_area / bbox1_area
+}
 
 
 # Dataset check function ----
@@ -114,27 +128,38 @@ perform_check <- function(dataset, name, geom, check_results, result_column_name
 # put all of this in a function, so we can run the same code more than once
 
 
-
-
-
 # Smart update parameters (with examples):
 # Name of the table in Postgres
-#pgsql_table_name<-"seveso"
+#pgsql_table_name<-"bus_tram_metro_routes"
 # Max allowed distance for objects with the same ID to be considered the same object
-#same_id_distance_threshold<-300
+#same_id_distance_threshold<-100
 # Max distance to be allowed to be taken in account for "nearby" features (multiple can be left over)
-#different_id_distance_raw_threshold<-5
+#different_id_distance_raw_threshold<-200
 # Threshold distance to decide a new feature is the same if there is only one nearby existing feature
-#different_id_distance_unique_threshold<-5
+#different_id_distance_unique_threshold<-100
 
 # Identifying name for the version of the dataset that was used for this process
 #source_identifier<-date_part
 #source_identifier<-format(Sys.Date(), "%Y-%m-%d")
 # If TRUE, the transformation table will be updated, even if the tests fail. Do this if you have verified that the changes in the data are understandable and acceptable.
 #allow_update_even_if_checks_fail <- FALSE
-# By default, the function will actually update the table. If you want to generate the geojson outputs without updating the transformation table, set this to TRUE.
+# By default, the function will actually update the table. If you want to generate the geopackages for visual inspection of the output without updating the transformation table, set this to TRUE.
 #dry_run<-TRUE
 
+#By default, replacement polygons should overlap at least 90% (when comparing to either the old or the new geometry), even when their Hausdorff distance is more than the same_id_distance_threshold.
+#same_id_overlap_threshold<-0.9
+# Same for different ID polygons
+#different_id_overlap_threshold<-0.9
+
+# Do name comparison to help find best match
+#do_name_comparison <- FALSE
+
+# Optional parameter: during the name comparison these words are removed because they have little meaning. Otherwise "gemeentelijke basisschool sint-jan" and "gemeentelijke basisschool sint-pieter" would be considered a pretty close match.
+
+#ignore_in_name <- c("college","instituts","institut","communale","fondamentale","fondamental","enseignement","provinciale", "provincial","specialize", "ecole","athenee","secondair","secondaire","instituut","gemeentelijke","gemeentelijk","basisschool","vrije ","lagere school","kleuterschool","onderwijs", "atheneum","middenschool","school","stedelijke","campus","college","basisonderwijs", "provinciaal","gemeindegrundschule","gemeindeschule","schule")
+
+# Optional parameter: if TRUE, the function will generate a gpkg file with the changes that were made. This can be useful for debugging.
+#visualise_changes<-FALSE
 
 # BEGIN SMART UPDATE FUNCTION ----
 ### Note: this assumes you have a table ready for use in ingestion, which has the exact same name as the transformation table
@@ -145,7 +170,12 @@ smart_update_process <- function(
     different_id_distance_unique_threshold,
     source_identifier,
     allow_update_even_if_checks_fail,
-    dry_run=FALSE)
+    same_id_overlap_threshold = 0.9,
+    different_id_overlap_threshold = 0.9,
+    do_name_comparison = FALSE,
+    ignore_in_name = NULL,
+    dry_run=FALSE,
+    visualise_changes=FALSE)
 {
   
   # avoid scientific notation
@@ -179,10 +209,11 @@ smart_update_process <- function(
 
 
   print("Downloaded data from Postgres")
-
-#st_write(old_transformation, paste0(log_folder,"old_school_data.geojson"))
+  print(paste("The old data contained", nrow(old_transformation[is.na(old_transformation$deleted_at),]), "records (that weren't previously deleted)"))
+  print(paste("The new data contains", nrow(new_ingestion), "records"))
   
-    
+#st_write(old_transformation, paste0(log_folder,"old_data.geojson"))
+  
   bbox_old_transformation <- as.numeric(st_area(st_transform(st_as_sfc(st_bbox(old_transformation)), 31370)) / 1e6)
   
   
@@ -246,8 +277,8 @@ smart_update_process <- function(
   print(paste0("Start calculating distances between objects with same original_ID: ",format(Sys.time(), "%a %b %d %X %Y")))
   start_time <- Sys.time()
   unchanged$distance <- mapply(calculate_distance_integrated, unchanged$geometry_l, unchanged$geometry_l_old)
-  time_elapsed <- Sys.time() - start_time
-  print(paste0("End calculating distances, time elapsed: ", time_elapsed))
+  time_elapsed <- round(as.numeric(difftime(Sys.time(), start_time, units = "secs")),2)
+  print(paste0("End calculating distances, time elapsed: ", time_elapsed, " seconds"))
   
   
 # Visualize a special case:
@@ -277,10 +308,64 @@ smart_update_process <- function(
   ## since this is relatively rare, the script is not adapted to this situation, and we will just throw out the duplicates
   ## and in fact, if the distance is greater, it will still be merged in the next step
   
+
+  # calculate the overlap between the two geometries when needed
+  unchanged <- unchanged %>%
+    rowwise() %>%
+    mutate(
+      # Check if geometry is either POLYGON or MULTIPOLYGON, then calculate intersection
+      intersection = if (st_geometry_type(geometry_l) %in% c("POLYGON", "MULTIPOLYGON") && 
+                         st_geometry_type(geometry_l_old) %in% c("POLYGON", "MULTIPOLYGON") && distance>0) {
+        if (st_is_empty(st_intersection(geometry_l, geometry_l_old))) {
+          NA
+        } else {
+          st_area(st_union(st_intersection(geometry_l, geometry_l_old)))
+        }
+      } else {
+        NA  # If not polygon types, return NA
+      }
+    ) %>%
+    ungroup()
+
+  unchanged <- unchanged %>%
+    rowwise() %>%
+    mutate(
+      intersection = 
+        # only try for an intersection if both are (multi)polygons
+        if (st_geometry_type(geometry_l) %in% c("POLYGON", "MULTIPOLYGON") &&
+            st_geometry_type(geometry_l_old) %in% c("POLYGON", "MULTIPOLYGON") && distance > 0) 
+        { # only calculate an intersection if there is actually one
+          if (lengths(st_intersects(geometry_l, geometry_l_old))>0) {
+            st_area(st_union(st_intersection(geometry_l, geometry_l_old)))
+          } else {
+            NA } # here there is no intersection between the polygons
+        } else {
+          NA  # here the preconditions for an intersection were not met
+        }) %>%
+    ungroup()
+  
+  
+    
+  # calculate area
+  unchanged <- unchanged %>%
+    mutate(
+      area_new = if_else(!is.na(intersection), st_area(geometry_l), NA),
+      area_old = if_else(!is.na(intersection), st_area(geometry_l_old), NA)
+    )
+  
+  # intersection %s
+  unchanged <- unchanged %>%
+    mutate(
+      p_inter_new = units::drop_units(intersection / area_new),
+      p_inter_old = units::drop_units(intersection / area_old)
+    )
+  unchanged <- unchanged %>%
+    mutate(max_p=if_else(p_inter_new>p_inter_old, p_inter_new, p_inter_old))
+  
   
   # throw out objects that have moved beyond the threshold for objects with the same ID
   unchanged <- unchanged %>%
-    filter(distance <= same_id_distance_threshold)
+    filter(distance <= same_id_distance_threshold | max_p >= same_id_overlap_threshold)
   
   # count number of times new objects were used
   unchanged <- unchanged %>%
@@ -303,6 +388,8 @@ smart_update_process <- function(
     select(id)
   success_match_new <- success_match %>%
     select(new_rownumber)
+  
+  unchanged_for_visualisation <- unchanged
   
   # remove unneeded columns
   unchanged <- unchanged %>%
@@ -334,7 +421,7 @@ smart_update_process <- function(
   old_transformation <- anti_join(old_transformation, success_match_old, by = "id")
   new_ingestion <- anti_join(new_ingestion, success_match_new, by = "new_rownumber")
   
-  
+  print(paste0("There are ", nrow(old_transformation), " existing records that may be deleted or might get matched to the ", nrow(new_ingestion), " new records"))
   
   
   # IF OLD TRANSFORMATION AND NEW INGESTION BOTH HAVE 0 cases, there is a lot of code we can skip
@@ -370,11 +457,60 @@ smart_update_process <- function(
     old_transformation$geometry <- st_set_crs(old_transformation$geometry, 4326)
     old_transformation <- st_transform(old_transformation, crs = st_crs(31370))
     
+    #add row number
+    old_transformation <- old_transformation %>%
+      mutate(rownumber_old = row_number())
     
-    
-    # Execute spatial join: adjust distance as necessary
-    join <- st_join(new_ingestion_nogeo, old_transformation, join = st_is_within_distance, dist = different_id_distance_raw_threshold)
+
+    # Spatial join adapted for joining lines
+    if (all(st_geometry_type(old_transformation) %in% c("LINESTRING", "MULTILINESTRING"))
+           && all(st_geometry_type(new_ingestion_nogeo) %in% c("LINESTRING", "MULTILINESTRING")))
+    {
+      print("All geometries are LINESTRING or MULTILINESTRING, so using the BBOX-filtered spatial join")
+      
+      # Pre-calculate bounding boxes
+      old_transformation <- old_transformation %>%
+        mutate(bbox_old = purrr::map(geometry, st_bbox)) # Calculate bbox for each record
+      
+      # Initialize results
+      results <- list()
+      
+      # Loop through each record in test_new
+      for (i in seq_len(nrow(new_ingestion_nogeo))) {
+        # Get the bounding box for the current record
+        bbox_new <- st_bbox(new_ingestion_nogeo[i, ])
+        
+        # Pre-filter test_old based on bbox overlap
+        old_filtered <- old_transformation %>%
+          filter(map_dbl(bbox_old, ~ bbox_overlap(bbox_new, .)) >= 0.9) # Use map_dbl for vectorized computation
+        
+        # Perform the spatial join on the filtered data
+        if (nrow(old_filtered) > 0) {
+          joined <- st_join(new_ingestion_nogeo[i, ], old_filtered, join = st_is_within_distance, dist = different_id_distance_raw_threshold)
+          results[[i]] <- joined
+        }
+      }
+      
+      # Combine results into a single sf object
+      join <- do.call(rbind, results)
+      
+      print(paste0("Number of initial new/old objects possible pairs: ", nrow(join)))
+      
+      
+      
+      } else 
+           
+      
+      {
+        print("Not all geometries are lines, so using the normal spatial join")
+        # Execute spatial join: adjust distance based on different_id_distance_raw_threshold
+        join <- st_join(new_ingestion_nogeo, test_old, join = st_is_within_distance, dist = different_id_distance_raw_threshold)
+        print(paste0("Number of initial new/old objects possible pairs: ", nrow(join)))
+        }
+
     join <- as.data.frame(join)
+    
+    
     
     old_transformation_geo <- as.data.frame(old_transformation)
     
@@ -387,24 +523,420 @@ smart_update_process <- function(
     # Calculate distance between potential matches
     join$distance <- mapply(calculate_distance_integrated, join$geometry_new, join$geometry)
     
+    # Remove cases without an alternative geometry
+    join <- join %>%
+      filter(!is.na(distance))
+  
+               
+    # Calculate overlap between potential matches
+    if (nrow(join)>0) { 
+      print(paste0("Calculating overlap between potential matches"))
+    # if we are dealing with lines, turn them into polygons  
+      join <- join %>%
+        rowwise() %>%
+        mutate(
+          # Create a 5 meter buffer for lines, keeping original geometry for polygons
+          geometry_new = if (st_geometry_type(geometry_new) %in% c("LINESTRING", "MULTILINESTRING")) {
+            st_buffer(geometry_new, 5)
+          } else {
+            geometry_new
+          },
+          geometry = if (st_geometry_type(geometry) %in% c("LINESTRING", "MULTILINESTRING")) {
+            st_buffer(geometry, 5)
+          } else {
+            geometry
+          }
+        ) %>%
+        ungroup() 
+      
+      
+    join <- join %>%
+      rowwise() %>%
+      mutate(
+        intersection = 
+          # only try for an intersection if both are (multi)polygons
+          if (st_geometry_type(geometry_new) %in% c("POLYGON", "MULTIPOLYGON") &&
+              st_geometry_type(geometry) %in% c("POLYGON", "MULTIPOLYGON") && distance > 0) 
+          { # only calculate an intersection if there is actually one
+            if (lengths(st_intersects(geometry_new, geometry))>0) {
+              st_area(st_union(st_intersection(geometry_new, geometry)))
+              #st_intersection(geometry_new, geometry)
+            } else {
+              NA } # here there is no intersection between the polygons
+          } else {
+            NA  # here the preconditions for an intersection were not met
+          }) %>%
+      ungroup()
+    
+    # calculate area
+    join <- join %>%
+      mutate(
+        area_new = if_else(!is.na(intersection), st_area(geometry_new), NA),
+        area_old = if_else(!is.na(intersection), st_area(geometry), NA)
+      )
+    
+    # intersection %s
+    join <- join %>%
+      mutate(
+        p_inter_new = units::drop_units(intersection / area_new),
+        p_inter_old = units::drop_units(intersection / area_old)
+      )
+    join <- join %>%
+      mutate(max_p=if_else(p_inter_new>p_inter_old, p_inter_new, p_inter_old))
+    
+    join <- join %>%
+      select(-intersection, -area_new, -area_old, -p_inter_new, -p_inter_old)
+    
+    }
+    # OPTIONAL MODULE: calculate "distance" based on name text distance and take in account when trying to match new and old ----
+    if (do_name_comparison & nrow(join)>0) { 
+      print("Name comparison requested (running)") 
+      #    
+    
+    ### name similarity ----
+    
+
+    
+    name_pairs <- list(
+      c("name_new_fre", "name_old_fre"),
+      c("name_new_eng", "name_old_eng"),
+      c("name_new_dut", "name_old_dut"),
+      c("name_new_und", "name_old_und"),
+      c("name_new_ger", "name_old_ger")
+    )
+    
+    
+    #extract name from languaged name + extract other_names from properties
+    join$name_new_fre<-tolower(mapply(extract_json_value, join$name_new, "fre"))
+    join$name_new_eng<-tolower(mapply(extract_json_value, join$name_new, "eng"))
+    join$name_new_dut<-tolower(mapply(extract_json_value, join$name_new, "dut"))
+    join$name_new_und<-tolower(mapply(extract_json_value, join$name_new, "und"))
+    join$name_new_ger<-tolower(mapply(extract_json_value, join$name_new, "ger"))
+    join$name_old_fre<-tolower(mapply(extract_json_value, join$name, "fre"))
+    join$name_old_eng<-tolower(mapply(extract_json_value, join$name, "eng"))
+    join$name_old_dut<-tolower(mapply(extract_json_value, join$name, "dut"))
+    join$name_old_und<-tolower(mapply(extract_json_value, join$name, "und"))
+    join$name_old_ger<-tolower(mapply(extract_json_value, join$name, "ger"))
+    
+
+    # remove accents
+    join <- join %>%
+      mutate(across(starts_with("name_new_"), ~ stri_trans_general(., "Latin-ASCII")),
+             across(starts_with("name_old_"), ~ stri_trans_general(., "Latin-ASCII")))
+    
+    
+    # check for identical names
+    join <- join %>%
+      rowwise() %>%
+      mutate(
+        identical_name = ifelse(
+          any(sapply(name_pairs, function(pair) get(pair[1]) == get(pair[2]))), 
+          1, 
+          0
+        )
+      ) %>%
+      ungroup()
+
+    # apply to these columns:
+    columns_to_clean <- unique(unlist(name_pairs))
+    
+    # default removals
+    patterns_to_remove <- c("\"", "”", "“", "´")
+    join <- string_removal(join, columns_to_clean, patterns_to_remove)
+    # string_removal is a function defined in utils.R
+    
+    # remove words specific to the context (optional)
+    if (!is.null(ignore_in_name)) {
+      join <- string_removal(join, columns_to_clean, ignore_in_name)
+    }
+
+    
+    
+    # remove leading and trailing whitespaces
+    join <- join %>%
+      mutate(across(all_of(columns_to_clean), trimws))
+    
+    # find the longest common substring
+    join <- join %>%
+      rowwise() %>%
+      mutate(
+        lcs = {
+          lcs_list <- sapply(name_pairs, function(pair) {
+            name_1 <- tolower(get(pair[1]))
+            name_2 <- tolower(get(pair[2]))
+            if (!is.na(name_1) && !is.na(name_2)) {
+              LCSn(c(name_1, name_2))
+            } else {
+              NA_character_  # Return NA if either name is missing
+            }
+          })
+          # Remove NAs and find the longest LCS, or return NA if all entries are NA
+          lcs_list <- lcs_list[!is.na(lcs_list)]  # Remove NAs
+          if (length(lcs_list) > 0) {
+            lcs_list[which.max(nchar(lcs_list))]  # Select the longest one
+          } else {
+            NA_character_  # Assign NA if no valid LCS is found
+          }
+        }
+      ) %>%
+      mutate(longest_common_str_length=nchar(lcs)) %>%
+      ungroup()
+    
+    
+  
+    # shorten name before calculating length
+    #patterns_to_remove <- c("maternelle", "libre", "primaire", "specialisee", "specialise", "anexee")
+    #columns_to_clean <- c("name_1", "name_2")
+    #join <- string_removal(join, columns_to_clean, patterns_to_remove)
+    join$length_name<-max(nchar(join$name_new_fre), nchar(join$name_new_eng), nchar(join$name_new_dut), nchar(join$name_new_und), nchar(join$name_new_ger))
+    
+    
+    # Decide when we consider the names to be the same (length should de significant)
+      join <- join %>%
+        mutate(
+          same_name = ifelse(
+            (
+              # Longest common substring length condition
+              (longest_common_str_length > 10 | 
+                 (longest_common_str_length > 4 & longest_common_str_length <= 10 & 
+                    longest_common_str_length > length_name / 2)) |
+                # Exact match on name pairs
+                  (name_new_fre == name_old_fre & !is.na(name_new_fre) & !is.na(name_old_fre)) |
+                  (name_new_eng == name_old_eng & !is.na(name_new_eng) & !is.na(name_old_eng)) |
+                  (name_new_dut == name_old_dut & !is.na(name_new_dut) & !is.na(name_old_dut)) |
+                  (name_new_und == name_old_und & !is.na(name_new_und) & !is.na(name_old_und)) |
+                  (name_new_ger == name_old_ger & !is.na(name_new_ger) & !is.na(name_old_ger)) |
+                identical_name == 1  # Existing same_name flag
+            ),
+            1,  # Assign 1 if any condition is met
+            0   # Otherwise, assign 0
+          )
+        )
+
+            
+    
+    
+    join <- join %>%
+      select(-all_of(columns_to_clean), -lcs, -longest_common_str_length, -length_name, -identical_name)
+    
+    # TODO 2. Some attributes the same
+    # 
+    # properties_to_compare<-c("type_kindergarten", "type_primary", "type_secondary", "type_tertiary", "type_special_needs")
+    # NOTES
+    ## if the attribute is boolean, only consider the same if both are TRUE (not if both are FALSE)
+    ## in other cases, simply consider the same if they are identical
+    
+    # 2. Filter based on distance, same name, number of candidates
+
+    # SELECT only if certain distance thresholds met
+    join <- join %>%
+      filter(distance < different_id_distance_raw_threshold | max_p>=different_id_overlap_threshold)
+    
+    # if the overlap is great, set distance to 0
+    join <- join %>%
+      mutate(distance = ifelse(max_p>=different_id_overlap_threshold & !is.na(max_p), 0, distance))
+    
+    # order by distance
+    join <- join %>%
+      group_by(new_rownumber_new) %>% 
+      arrange(distance) %>%
+      mutate(distance_id = row_number()) %>%
+      ungroup()
+    
+    # GOALS
+    ## if there is a unique match, accept it
+    join <- join %>% 
+      group_by(new_rownumber_new) %>% 
+      mutate(
+        match_reason = ifelse(n() == 1, 'unique', NA)
+      ) %>% 
+      ungroup()
+    
+    
+    # if it's the closest candidate and the name is the same, accept it. Set the other records with the same id to 'remove'
+    join <- join %>% 
+      mutate(
+        match_reason = ifelse(distance_id==1 & same_name ==1 & is.na(match_reason), 'close_same_name', match_reason)
+      )
+    join <- join %>%
+      # Group by `new_rownumber_new` to check for presence of 'close_same_name' in each group
+      group_by(new_rownumber_new) %>%
+      mutate(
+        # Check if any record in the group has 'close_same_name'
+        has_close_same_name = any(match_reason == 'close_same_name')
+      ) %>%
+      ungroup() %>%
+      # If 'has_close_same_name' is TRUE and `match_reason` is not 'close_same_name', set to 'remove'
+      mutate(match_reason = ifelse(has_close_same_name & is.na(match_reason), 'remove', match_reason)) %>%
+      # Remove temporary column
+      select(-has_close_same_name)
+    
+    join <- join %>%
+      filter(match_reason != 'remove' | is.na(match_reason))
+
+    # if it's the only candidate with the same name within the treshold, assign it
+    join <- join %>%
+      # Group by `new_rownumber_new` to check for presence of 'same_name' in each group
+      group_by(new_rownumber_new) %>%
+      mutate(
+        # Check if any record in the group has 'close_same_name'
+        same_name_count = sum(same_name, na.rm = TRUE)
+      ) %>%
+      ungroup() %>%
+      # If it's the only one (same_name_count=1) with same_name=1, and match_reason is still NA, set to 'only_same_name_in_group'
+      mutate(match_reason = ifelse(same_name_count==1 & same_name==1 & is.na(match_reason), 'only_same_name_in_group', match_reason)) %>%
+      # Remove temporary column
+      select(-same_name_count)
+    
+    join <- join %>%
+      group_by(new_rownumber_new) %>%
+      mutate(
+        only_same_name_in_group = any(match_reason == 'only_same_name_in_group')
+      ) %>%
+      ungroup() %>%
+      # If 'has_close_same_name' is TRUE and `match_reason` is not 'close_same_name', set to 'remove'
+      mutate(match_reason = ifelse(only_same_name_in_group & is.na(match_reason), 'remove', match_reason)) %>%
+      # Remove temporary column
+      select(-only_same_name_in_group)
+    
+    join <- join %>%
+      filter(match_reason != 'remove' | is.na(match_reason))
+    
+    
+    
+    # if it's the only candidate at distance <1 meter, assign it
+      ## first, select the matched and all candidates that have a very close distance
+      join <- join %>%
+        filter(!is.na(match_reason) | distance <1)
+    
+      ## then, count the number of candidates (which can only be >1 if unassigned & all candidates very nearby)
+      join <- join %>%
+      group_by(new_rownumber_new) %>% # one could also use original_id_new here instead of new_rownumber_new. The difference is when dealing with cases where you have two "new" objects with the same ID that are pretty far away, and both have one decent match from the old data. With rownumber, these duos will be correctly matched, with original_id, they would still be considered as too hard to match.
+      mutate(count = n()) %>%
+      ungroup()
+    
+      join <- join %>%
+      mutate(match_reason=ifelse(count==1 & is.na(match_reason), 'only_one_close_match', match_reason))
+     
+    # finalize new object selection
+    join <- join %>%
+      filter(!is.na(match_reason))
+    
+    # make sure OLD objects are used only once
+    join <- join %>%
+      group_by(rownumber_old) %>%
+      mutate(
+        count_old = n()
+      ) %>%
+      ungroup()
+    
+    # if the old object is used only once, accept the match
+    join <- join %>% 
+      mutate(
+        match_reason_old = ifelse(count_old==1, 'unique_match', NA)
+      )
+    
+    # order by distance
+    join <- join %>%
+      group_by(rownumber_old) %>% 
+      arrange(distance) %>%
+      mutate(distance_id_old = row_number()) %>%
+      ungroup()
+    
+    # if it's the closest candidate and the name is the same, accept it. Set the other records with the same id to 'remove'
+    join <- join %>% 
+      mutate(
+        match_reason_old = ifelse(distance_id_old==1 & same_name ==1 & is.na(match_reason_old), 'close_same_name', match_reason_old)
+      )
+    join <- join %>%
+      # Group by `new_rownumber_new` to check for presence of 'close_same_name' in each group
+      group_by(rownumber_old) %>%
+      mutate(
+        # Check if any record in the group has 'close_same_name'
+        has_close_same_name = any(match_reason_old == 'close_same_name')
+      ) %>%
+      ungroup() %>%
+      # If 'has_close_same_name' is TRUE and `match_reason` is not 'close_same_name', set to 'remove'
+      mutate(match_reason_old = ifelse(has_close_same_name & is.na(match_reason_old), 'remove', match_reason_old)) %>%
+      # Remove temporary column
+      select(-has_close_same_name)
+    join <- join %>%
+      filter(match_reason_old != 'remove' | is.na(match_reason_old))
+ 
+    # if it's the only candidate with the same name within the treshold, assign it
+    join <- join %>%
+      # Group by `new_rownumber_new` to check for presence of 'same_name' in each group
+      group_by(rownumber_old) %>%
+      mutate(
+        # Check if any record in the group has 'close_same_name'
+        same_name_count = sum(same_name, na.rm = TRUE)
+      ) %>%
+      ungroup() %>%
+      # If it's the only one (same_name_count=1) with same_name=1, and match_reason is still NA, set to 'only_same_name_in_group'
+      mutate(match_reason_old = ifelse(same_name_count==1 & same_name==1 & is.na(match_reason_old), 'only_same_name_in_group', match_reason_old)) %>%
+      # Remove temporary column
+      select(-same_name_count)
+    
+    join <- join %>%
+      group_by(rownumber_old) %>%
+      mutate(
+        only_same_name_in_group = any(match_reason_old == 'only_same_name_in_group')
+      ) %>%
+      ungroup() %>%
+      # If 'has_close_same_name' is TRUE and `match_reason` is not 'close_same_name', set to 'remove'
+      mutate(match_reason_old = ifelse(only_same_name_in_group & is.na(match_reason_old), 'remove', match_reason_old)) %>%
+      # Remove temporary column
+      select(-only_same_name_in_group)
+    
+    join <- join %>%
+      filter(match_reason_old != 'remove' | is.na(match_reason_old))
+   
+    # if it's the only candidate at distance <1 meter, assign it
+    ## first, select the matched and all candidates that have a very close distance
+    join <- join %>%
+      filter(!is.na(match_reason_old) | distance <1)
+    
+    ## then, count the number of candidates (which can only be >1 if unassigned & all candidates very nearby)
+    join <- join %>%
+      group_by(rownumber_old) %>% 
+      mutate(count = n()) %>%
+      ungroup()
+    
+    join <- join %>%
+      mutate(match_reason_old=ifelse(count==1 & is.na(match_reason_old), 'only_one_close_match', match_reason_old))
+    
+    # finalize new object selection
+    join <- join %>%
+      filter(!is.na(match_reason_old))
+    
+        
+   print("Reasons for linking new to old objects:")
+   table(join$match_reason, useNA = "always")
+   print("Reasons for accepting the link to the old object (avoid more than one candidate for an old object):")
+   table(join$match_reason_old, useNA = "always")
+    
+    # END NEW MODULE
+
+    } else if (nrow(join)>0) { print("Standard linking of new/deleted objects (no name comparison) ongoing") 
+       
+    # DEFAULT FILTERING ----
     
     ### filter the likely updated ----
-    # first remove the unlikely candidates (further away then the threshold to be taken in account)
+    # first remove the unlikely candidates (further away than the threshold to be taken in account)
+    # unless there is a good overlap
     join <- join %>%
-      filter(distance < different_id_distance_raw_threshold)
+      filter(distance < different_id_distance_raw_threshold | max_p>=different_id_overlap_threshold)
     
     # only then count number of matches
     join <- join %>%
       group_by(new_rownumber_new) %>% # one could also use original_id_new here instead of new_rownumber_new. The difference is when dealing with cases where you have two "new" objects with the same ID that are pretty far away, and both have one decent match from the old data. With rownumber, these duos will be correctly matched, with original_id, they would still be considered as too hard to match.
       mutate(count = n())
     
-    ## TODO: do we really want to break the ID if only the name changed?
-    ## TODO: add minimal thresholds on top of distance to decide to keep the same object ID
-    ## TODO: if there's more than one candidate, make a considered guess instead of just throwing all of it out
-    ## NOTE: consider including name distance here, to avoid considering things that changed name as the same object (which makes sense for restaurants, but maybe not for firestations?) (mind that default name replaced by real name should not break the link). For lines, the line length could be considered. For polygons the overlap area
-    # minimum improvement: if there is more than one candidate, first select the ones with distance=0, and then count again
+    ## TODO: add (optional) minimal thresholds on top of distance to decide to keep the same object ID
+    ## NOTE: For lines, the line length could be considered.
+    # if there is more than one candidate, first select the ones with distance almost 0, and then count again
     join <- join %>%
-      filter(count==1 | (count>1 & distance==0))
+      filter(count==1 | (count>1 & distance<1))
     
     join <- join %>%
       group_by(new_rownumber_new) %>%
@@ -425,6 +957,11 @@ smart_update_process <- function(
     join <- join %>%
       filter(rownumber==1)
     
+    # END DEFAULT FILTERING ----
+    print("Default linking applied")
+    }  
+    
+    updated_for_visualization <- join
     
     updated <- as.data.frame(join)
     updated <- updated %>%
@@ -627,12 +1164,117 @@ smart_update_process <- function(
   cat("# If there is a large number of new, deleted or updated cases, the check fails (as we want to do a manual review to check if this is realistic) \n\n", file = filename, append = TRUE)
   print(paste0("Report about the transformation table update for ", pgsql_table_name, " written to ", filename))
 
-#write to geojson for inspection (note that "unchanged" and updated cases will only show the new version)
-st_write(table_without_jsonb_test, paste0(log_folder,pgsql_table_name,"_new_transf_",format(Sys.time(), "%Y%m%d_%H%M%S"),".geojson"))
-  
-  
-  
-  
+#write to gpkg for inspection (note that "unchanged" and updated cases will only show the new version)
+st_write(table_without_jsonb_test, paste0(log_folder, pgsql_table_name, "_new_transf_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".gpkg"))
+
+
+# OPTIONAL: line dataset to visualize the changes ----
+if (visualise_changes == TRUE) {
+
+# CASES WITH UNCHANGED ID NUMBER
+#create centroid for geometry in anchor_enriched
+unchanged_for_visualisation$centr_geometry_old <- st_point_on_surface(unchanged_for_visualisation$geometry_l_old)
+unchanged_for_visualisation$centr_geometry_new <- st_point_on_surface(unchanged_for_visualisation$geometry_l)
+
+unchanged_for_visualisation<-as.data.frame(unchanged_for_visualisation)
+
+unchanged_for_visualisation$centr_geometry_old <- st_as_sf(unchanged_for_visualisation$centr_geometry_old)
+unchanged_for_visualisation$centr_geometry_new <- st_as_sf(unchanged_for_visualisation$centr_geometry_new)
+
+
+# Create line geometries connecting old and new centroids, only where distance > 0
+unchanged_for_visualisation$line_geometry <- st_sfc(lapply(1:nrow(unchanged_for_visualisation), function(i) {
+  if (unchanged_for_visualisation$distance[i] > 1) {
+    st_linestring(rbind(
+      st_coordinates(unchanged_for_visualisation$centr_geometry_old[i, ]),
+      st_coordinates(unchanged_for_visualisation$centr_geometry_new[i, ])
+    ))
+  } else {
+    # Return an empty geometry for distance = 0
+    st_geometrycollection()
+  }
+}), crs = st_crs(unchanged_for_visualisation))
+
+# select where distance>1
+unchanged_for_visualisation<-unchanged_for_visualisation %>%
+  filter(distance>1)
+
+
+
+# select only relevant columns
+unchanged_for_visualisation<-as.data.frame(unchanged_for_visualisation)
+unchanged_for_visualisation<-unchanged_for_visualisation %>%
+  select(original_id, name, risk_level, properties, properties_secondary, distance, line_geometry)
+
+# Convert to an sf object if not already
+unchanged_for_visualisation <- st_as_sf(unchanged_for_visualisation)
+# set crs lambert 72
+unchanged_for_visualisation <- st_set_crs(unchanged_for_visualisation, 31370)
+
+# save as gpkg
+st_write(updated_for_visualization, paste0(log_folder, pgsql_table_name, "_unchanged_lines_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".gpkg"))
+
+
+
+#  CASES WITH UPDATED ID
+
+
+updated_for_visualization_oldversion<-as.data.frame(updated_for_visualization) %>%
+  select(original_id, original_id_new, name, name_new, properties, properties_new, properties_secondary, properties_secondary_new, geometry)
+# Convert to an sf object if not already
+updated_for_visualization_oldversion <- st_as_sf(updated_for_visualization_oldversion)
+# set crs lambert 72
+updated_for_visualization_oldversion <- st_set_crs(updated_for_visualization_oldversion, 31370)
+
+# save as gpkg
+st_write(updated_for_visualization_oldversion, paste0(log_folder, pgsql_table_name, "_old_geo_updated_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".gpkg"))
+
+
+#create centroid for geometry in anchor_enriched
+updated_for_visualization$centr_geometry_old <- st_point_on_surface(updated_for_visualization$geometry)
+updated_for_visualization$centr_geometry_new <- st_point_on_surface(updated_for_visualization$geometry_new)
+
+updated_for_visualization<-as.data.frame(updated_for_visualization)
+
+updated_for_visualization$centr_geometry_old <- st_as_sf(updated_for_visualization$centr_geometry_old)
+updated_for_visualization$centr_geometry_new <- st_as_sf(updated_for_visualization$centr_geometry_new)
+
+
+# Create line geometries connecting old and new centroids, only where distance > 0
+updated_for_visualization$line_geometry <- st_sfc(lapply(1:nrow(updated_for_visualization), function(i) {
+  if (updated_for_visualization$distance[i] > 1) {
+    st_linestring(rbind(
+      st_coordinates(updated_for_visualization$centr_geometry_old[i, ]),
+      st_coordinates(updated_for_visualization$centr_geometry_new[i, ])
+    ))
+  } else {
+    # Return an empty geometry for distance = 0
+    st_geometrycollection()
+  }
+}), crs = st_crs(updated_for_visualization))
+
+# select where distance>0
+updated_for_visualization<-updated_for_visualization %>%
+  filter(distance>1)
+
+
+
+# select only relevant columns
+updated_for_visualization<-as.data.frame(updated_for_visualization)
+updated_for_visualization<-updated_for_visualization %>%
+  select(original_id, original_id_new, name, name_new, properties, properties_new, properties_secondary, properties_secondary_new, distance, line_geometry)
+
+# Convert to an sf object if not already
+updated_for_visualization <- st_as_sf(updated_for_visualization)
+# set crs lambert 72
+updated_for_visualization <- st_set_crs(updated_for_visualization, 31370)
+
+# save as gpkg
+filename_visualization<-paste0(log_folder, pgsql_table_name, "_updated_lines_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".gpkg")
+st_write(updated_for_visualization, filename_visualization)
+print(paste0("Visualisation datasets created at ", filename_visualization))
+# END OF OPTIONAL VISUALISATION DATSET  
+}  
   
   # prepare the actual update ----
   ### existing id's get an update of all EXCLUDED fields (because they have been updated or deleted); new id's get inserted
@@ -765,12 +1407,15 @@ END $$;"))
 # create a list of the data_list_id's in table_without_jsonb with their most recent updated_at, created_at and deleted_at date
 data_list_id <- as.data.frame(table_without_jsonb) %>%
   group_by(data_list_id) %>%
-  summarise(updated_at = max(updated_at, na.rm = TRUE),
-            created_at = max(created_at, na.rm = TRUE),
-            deleted_at = max(deleted_at, na.rm = TRUE)
+  summarise(
+    updated_at = ifelse(suppressWarnings(max(updated_at, na.rm = TRUE)) == -Inf, NA, max(updated_at, na.rm = TRUE)),
+    created_at = ifelse(suppressWarnings(max(created_at, na.rm = TRUE)) == -Inf, NA, max(created_at, na.rm = TRUE)),
+    deleted_at = ifelse(suppressWarnings(max(deleted_at, na.rm = TRUE)) == -Inf, NA, max(deleted_at, na.rm = TRUE))
   )
+
+
 # set updated_at to the most recent date of the three created
-data_list_id$updated_at <- pmax(data_list_id$updated_at, data_list_id$created_at, data_list_id$deleted_at, na.rm = TRUE)
+data_list_id$updated_at <- as.POSIXct(pmax(data_list_id$updated_at, data_list_id$created_at, data_list_id$deleted_at, na.rm = TRUE), origin = "1970-01-01", tz = "UTC")
 data_list_id <- data_list_id %>% select(data_list_id, updated_at)
 
 # send to postgres
@@ -786,11 +1431,11 @@ dbDisconnect(con_pg)
 
 # write the update sql
 UpdateDataList <- c(
-  paste0("UPDATE parameterization.data_list p
+  "UPDATE parameterization.data_list p
   SET update_at = d.updated_at
   FROM tst.data_list_update d
   WHERE p.id = d.data_list_id::uuid;",
-  "DROP TABLE tst.data_list_update;"))
+  "DROP TABLE tst.data_list_update;")
   
   
 # Main update function ----  
