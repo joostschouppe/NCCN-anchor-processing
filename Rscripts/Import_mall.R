@@ -1,40 +1,63 @@
 ## ---------------------------
 ##
-## Script name: Import cultural centers
+## Script name: Import shopping malls
 ##
-## Purpose of script: Load OSM cultural centers & transform into proto-anchors for Paragon
+## Purpose of script: Load OSM shopping malls & transform into proto-anchors for Paragon
 ##
 ## Author: Joost Schouppe
 ##
-## Date Created: 2024-07-02
+## Date Created: 2025-03-20
 ##
 ##
 ## ---------------------------
 
-
-
 # Load variables -----------------------------------------------------------
 #  """""""""""""""""" ----------------------
 
-readRenviron("C:/projects/pgn-data-airflow/.Renviron")
+#readRenviron("C:/projects/pgn-data-airflow/.Renviron")
 
 db_host_name <- Sys.getenv("POSTGRES_HOST_NAME")
 postgres_user <- Sys.getenv("POSTGRES_USER")
 postgres_password <- Sys.getenv("POSTGRES_PASSWORD")
 db_name<- Sys.getenv("POSTGRES_DB_NAME_CURATED")
 
-data_list_id<-"b8fca5e6-fa2b-465e-b124-bb3b81fefff6"
-log_folder <- "C:/temp/logs/"
 
-### Load external functions ------
+# run status
+run_status<-Sys.getenv("RUN_STATUS")
+## this is set to false and prevents any accidental changes to the database by switching off the main_function(). On Airflow, this is set to true.
+run_status<-ifelse(tolower(run_status) == "true", TRUE, FALSE)
 
-rscript_folder <- "C:/projects/pgn-data-airflow/rscripts/"
-source(paste0(rscript_folder,"utils_updated_check_protoanchors.R"))
-source(paste0(rscript_folder,"utils.R"))
+# overrule the checks
+overrule_checks<-Sys.getenv("OVERRULE_CHECKS")
+## Set to FALSE by default. That means we do not update the anchors if some tests fail. Those tests include "the data has grown or shrunk by a lot of objects". If, after review of the log, you decide that nothing is wrong, set this manually to TRUE.
+# If the input is not correctly understood as boolean, this will force it to it.
+overrule_checks<-ifelse(tolower(overrule_checks) == "true", TRUE, FALSE)
+
+# Do not run the main part of the processing, but just do an update based on the ingestion table already in the dbase
+reuse_ingestion_data<-Sys.getenv("REUSE_INGESTION_DATA")
+reuse_ingestion_data<-ifelse(tolower(reuse_ingestion_data) == "true", TRUE, FALSE)
+
+# Only run the comparison script & update the ingestion table, but do not attempt to update the transformation table
+do_dry_run<-Sys.getenv("DO_DRY_RUN")
+do_dry_run<-ifelse(tolower(do_dry_run) == "true", TRUE, FALSE)
+
+
+data_list_id<-"236626f3-af57-42f9-8113-2d7c383bdfa2"
+
+temporary_folder <-Sys.getenv("TEMPORARY_STORAGE")
+log_folder <- Sys.getenv("RSCRIPT_LOG_FOLDER")
+
 
 # Libraries -------------------------------
 # """""""""""""""""" ----------------------
-# all are loaded via the utils
+
+# no extra libraries needed
+
+### Load external functions ------
+
+rscript_folder <- Sys.getenv("LOCAL_RSCRIPT_PATH")
+source(paste0(rscript_folder,"/utils_updated_check_protoanchors.R"))
+source(paste0(rscript_folder,"/utils.R"))
 
 
 
@@ -42,22 +65,20 @@ source(paste0(rscript_folder,"utils.R"))
 # EXTRACT ----
 # """""""""""""""""" ----
 
+=======
+DownloadOSM <- function(){
+  tryCatch({
 
 # Download OSM data ----
 ### OSM DOWNLOAD PARAMETERS ----
 
 # Define the list of features
-#features_list <- list("amenity" = "theatre", "amenity" = "community_centre", "amenity" = "arts_centre" )
-features_list_1 <- list("amenity" = "theatre")
-features_list_2 <- list("amenity" = "community_centre")
-features_list_3 <- list("amenity" = "arts_centre")
-features_list_4 <- list("amenity" = "concert_hall")
-features_list_5 <- list("amenity" = "cinema")
-features_list_6 <- list("amenity" = "music_venue")
-# If default server fails, set to TRUE to use mail.ru server (older data)
-alternative_overpass_server<-FALSE
+features_list_1 <- list("shop" = "mall")
+features_list_2 <- list("shop" = "department_store")
+
 # Define extra tags to use as columns for properties
-extra_columns <- c("amenity", "community_centre", "community_centre:for", "capacity:persons", "capacity:seats", "operator", "theatre:genre", "theatre:type", "training")
+extra_columns <- c("shop", "max_level", "min_level", "brand:wikidata")
+
 # Choose which datatypes are needed, as a list of datatypes, using any of "points", "lines", "mpolygons" (this is polygons+multipolygons together)
 datatypes <- c("points", "mpolygon")
 
@@ -65,10 +86,9 @@ datatypes <- c("points", "mpolygon")
 ### Actual OSM download & transformation ----
 
 
-
 tryCatch({
   # Call the large function
-  osm_1<-download_osm_process(features_list_1, datatypes, extra_columns, alternative_overpass_server, keep_region=TRUE )
+  osm_mall<-download_osm_process(features_list_1, datatypes, extra_columns, postgres=TRUE)
   print("OSM data downloaded & processes succesfully")
 }, error = function(e) {
   # Print error message
@@ -77,83 +97,29 @@ tryCatch({
 
 tryCatch({
   # Call the large function
-  osm_2<-download_osm_process(features_list_2, datatypes, extra_columns, alternative_overpass_server, keep_region=TRUE)
+  osm_dept<-download_osm_process(features_list_2, datatypes, extra_columns, postgres=TRUE)
   print("OSM data downloaded & processes succesfully")
 }, error = function(e) {
   # Print error message
   print(paste("Something went wrong:", e$message))
 })
 
-tryCatch({
-  # Call the large function
-  osm_3<-download_osm_process(features_list_3, datatypes, extra_columns, alternative_overpass_server, keep_region=TRUE)
-  print("OSM data downloaded & processes succesfully")
-}, error = function(e) {
-  # Print error message
-  print(paste("Something went wrong:", e$message))
-})
+# remove if no name and remove artefacts from download
+osm_dept<-osm_dept %>%
+  filter(shop=="department_store" & !is.na(name))
+
+# only keep relevant department stores:
+## INNO Q300632, La Fayette Q3094686 , Galeria (Karstadt of Kaufhof) Q80220059 (brand:wikidata), De Bijenkorf Q2063937
+osm_dept<-osm_dept %>%
+  filter(grepl("Q300632|Q3094686|Q80220059|Q2063937", `brand_wikidata`))
 
 
-tryCatch({
-  # Call the large function
-  osm_4<-download_osm_process(features_list_4, datatypes, extra_columns, alternative_overpass_server, keep_region=TRUE)
-  print("OSM data downloaded & processes succesfully")
-}, error = function(e) {
-  # Print error message
-  print(paste("Something went wrong:", e$message))
-})
+# remove if no name and remove artefacts from download
+osm_mall<-osm_mall %>%
+  filter(shop=="mall" & !is.na(name))
 
-tryCatch({
-  # Call the large function
-  osm_5<-download_osm_process(features_list_5, datatypes, extra_columns, alternative_overpass_server, keep_region=TRUE)
-  print("OSM data downloaded & processes succesfully")
-}, error = function(e) {
-  # Print error message
-  print(paste("Something went wrong:", e$message))
-})
-
-tryCatch({
-  # Call the large function
-  osm_6<-download_osm_process(features_list_6, datatypes, extra_columns, alternative_overpass_server, keep_region=TRUE)
-  print("OSM data downloaded & processes succesfully")
-}, error = function(e) {
-  # Print error message
-  print(paste("Something went wrong:", e$message))
-})
-
-
-# from osm_1, throw away if theatre_type=open_air
-osm_1<-osm_1 %>%
-  filter(is.na(theatre_type) | (theatre_type!="open_air" & theatre_type!="amphi"))
-
-# from osm_2, keep only if community_centre=cultural_centre
-osm_2<-osm_2 %>%
-  filter(community_centre=="cultural_centre")
-
-# from osm_3 keep if training not arts
-osm_3<-osm_3 %>%
-  filter(is.na(training) | training!="art")
-
-# merge all
-osm_all<-rbind(osm_1,osm_2,osm_3,osm_4,osm_5,osm_6)
-
-# remove if no name
-osm_all<-osm_all %>%
-  filter(!is.na(name) & is.na(training))
-
-# add object type
-osm_all<-osm_all %>%
-  mutate(object_type=case_when(
-    (amenity=='theatre' & theatre_type=='concert_hall') | amenity=='concert_hall' ~ 'concert_hall',
-    amenity=='theatre' ~ 'theatre',
-    community_centre=='cultural_centre' | amenity=='arts_centre' ~ 'cultural_centre',
-    amenity=='cinema' ~ 'cinema',
-    TRUE  ~ 'other'
-  ))
-
-# remove other
-osm_all<-osm_all %>%
-  filter(object_type!='other')
+# merge both sets
+osm_all<-rbind(osm_mall, osm_dept)
 
 
 # detect objects on top of other objects in the dataset
@@ -163,7 +129,6 @@ osm_outers<-osm_all %>%
   filter(!st_is(geometry, "POINT"))
 ## then join them to the objects
 join <- st_join(osm_all, osm_outers, join = st_within)
-
 
 # count the number of times an inner is used (to later find objects that are linked to itself and something else too, or to more than one outer)
 join<-join %>%
@@ -197,7 +162,6 @@ join<-join %>%
 # create aggregated variables
 join <- join %>%
   group_by(outer_id) %>%
-  mutate(object_type_agg = ifelse(count > 1, paste(unique(object_type), collapse = "; "), object_type)) %>%
   mutate(operator= ifelse(count > 1, paste(unique(na.omit(operator)), collapse = "; "), operator)) %>%
   mutate(addr_city= ifelse(count > 1, paste(unique(na.omit(addr_city)), collapse = "; "), addr_city)) %>%
   mutate(addr_housenumber= ifelse(count > 1, paste(unique(na.omit(addr_housenumber)), collapse = "; "), addr_housenumber)) %>%
@@ -214,15 +178,14 @@ join <- join %>%
   mutate(contact_mobile= ifelse(count > 1, paste(unique(na.omit(contact_mobile)), collapse = "; "), contact_mobile)) %>%
   mutate(check_date= ifelse(count > 1, paste(unique(na.omit(check_date)), collapse = "; "), check_date)) %>%
   mutate(wikidata= ifelse(count > 1, paste(unique(na.omit(wikidata)), collapse = "; "), wikidata)) %>%
-  mutate(capacity_persons= ifelse(count > 1, paste(unique(na.omit(capacity_persons)), collapse = "; "), capacity_persons)) %>%
-  mutate(capacity_seats= ifelse(count > 1, paste(unique(na.omit(capacity_seats)), collapse = "; "), capacity_seats)) %>%
-  mutate(theatre_type= ifelse(count > 1, paste(unique(na.omit(theatre_type)), collapse = "; "), theatre_type)) %>%
-  mutate(theatre_genre= ifelse(count > 1, paste(unique(na.omit(theatre_genre)), collapse = "; "), theatre_genre)) %>%
   mutate(operator_wikidata= ifelse(count > 1, paste(unique(na.omit(operator_wikidata)), collapse = "; "), operator_wikidata)) %>%
   mutate(phone_2= ifelse(count > 1, paste(unique(na.omit(phone_2)), collapse = "; "), phone_2)) %>%
   mutate(alt_website= ifelse(count > 1, paste(unique(na.omit(alt_website)), collapse = "; "), alt_website)) %>%
   mutate(operator_website= ifelse(count > 1, paste(unique(na.omit(operator_website)), collapse = "; "), operator_website)) %>%
-  mutate(community_centre_for= ifelse(count > 1, paste(unique(na.omit(community_centre_for)), collapse = "; "), community_centre_for))
+  mutate(shop= ifelse(count > 1, paste(unique(na.omit(shop)), collapse = "; "), shop)) %>%
+  mutate(min_level= ifelse(count > 1, paste(unique(na.omit(min_level)), collapse = "; "), min_level)) %>%
+  mutate(max_level= ifelse(count > 1, paste(unique(na.omit(max_level)), collapse = "; "), max_level))
+
   
   
 # aggregate names
@@ -239,7 +202,7 @@ aggregate_names <- function(df, names_to_aggregate) {
         ), .))
       ) %>%
       ungroup() %>%
-      select(-primary_name, -other_names)  # Remove temporary columns
+      select(-primary_name, -other_names)  # Remove temporary columns if not needed
   }
   
   return(df)
@@ -256,15 +219,29 @@ join <- aggregate_names(join, names_to_aggregate)
 
 # Filter records based on the count and outer_id conditions
 join_filtered <- join %>%
-  filter(count == 1 | (count > 1 & outer_id == osm_id))
+  filter(count == 1 | (count > 1 & outer_id == osm_id)) %>%
+  select(-count,-outer_id)
 
-#if count>1 & object_type_agg!=object_type then object_type:cultural_centre
+# confirm as SF dataset
+join_filtered <- st_as_sf(join_filtered, "geometry")
+
+# set all empty values in strings to missing
+replace_empty_with_null <- function(x) {
+  ifelse(x == "", NA_character_, x)
+}
+string_columns <- names(join_filtered)[sapply(join_filtered, is.character) & names(join_filtered) != "geometry"]
 join_filtered <- join_filtered %>%
-  mutate(object_type = ifelse(count > 1 & object_type_agg != object_type, "cultural_centre", object_type))
+  mutate_at(vars(all_of(string_columns)), ~ replace_empty_with_null(.))
 
 
-# save as geojson
-#st_write(join_filtered, paste0(log_folder,"cultural_centre.geojson"))
+return(join_filtered)  
+  }, 
+error = function(e) {
+  print(paste("Error downloading OSM:", e))
+  return(NULL)  # Return NULL on failure
+})
+}
+
 
 # Upload to raw data ----
 
@@ -278,9 +255,9 @@ join_filtered <- join_filtered %>%
 
 ### Create SQL for proper ingestion table ----
 
-ingestion_table_sql <- c("DROP TABLE IF EXISTS ingestion.cultural_centre CASCADE;
-","
-CREATE TABLE IF NOT EXISTS ingestion.cultural_centre
+ingestion_table_sql <- c("DROP TABLE IF EXISTS ingestion.mall CASCADE;
+",paste0("
+CREATE TABLE IF NOT EXISTS ingestion.mall
 (
   id uuid NOT NULL DEFAULT gen_random_uuid(),
   original_id text,  
@@ -298,26 +275,25 @@ CREATE TABLE IF NOT EXISTS ingestion.cultural_centre
   created_by uuid,
   updated_by uuid,
   geometry geometry(geometry, 4326),
-  CONSTRAINT cultural_centre_pkey PRIMARY KEY (id)
-);",paste0("WITH 
+  CONSTRAINT mall_pkey PRIMARY KEY (id)
+);"),
+paste0("WITH 
 cleaned as (SELECT
-            'https://osm.org/' || osm_id as original_id,
+'https://osm.org/' || osm_id as original_id,
             jsonb_strip_nulls(jsonb_build_object(
-              'und', CASE WHEN name IS NULL THEN object_type
-                          ELSE name END,
+              'und', name,
               'fre', name_fr,
               'ger', name_de::text,
               'dut', name_nl)) as name,
             jsonb_build_object(
-              'dut', CASE WHEN object_type='concert_hall' THEN 'concertzaal' WHEN object_type='theatre' THEN 'theater' WHEN object_type='cinema' THEN 'bioscoop' ELSE 'cultureel centrum' END,
-              'fre', CASE WHEN object_type='concert_hall' THEN 'salle de concert' WHEN object_type='theatre' THEN 'théâtre' WHEN object_type='cinema' THEN 'cinéma' ELSE 'centre culturel' END,
-              'ger', CASE WHEN object_type='concert_hall' THEN 'Konzertsaal' WHEN object_type='theatre' THEN 'Theater' WHEN object_type='cinema' THEN 'Kino' ELSE 'Kulturzentrum' END,
-              'eng', CASE WHEN object_type='concert_hall' THEN 'concert hall' WHEN object_type='theatre' THEN 'theatre' WHEN object_type='cinema' THEN 'cinema' ELSE 'cultural centre' END) 
-              as legend_item,
-           CASE WHEN short_name IS NULL AND official_name IS NULL AND alt_name IS NULL AND old_name IS NULL THEN NULL 
+              'dut', 'winkelcentrum',
+              'fre', 'centre commercial',
+              'ger', 'Einkaufszentrum',
+              'eng', 'shopping mall') as legend_item,
+            CASE WHEN short_name IS NULL AND official_name IS NULL AND alt_name IS NULL AND old_name IS NULL THEN NULL 
 	ELSE CONCAT_WS('; ',short_name, official_name, alt_name, old_name) END AS other_names,
 CASE WHEN addr_street IS NULL THEN NULL 
-	ELSE LTRIM(CONCAT(addr_street, ' ' || CASE WHEN nohousenumber='yes' THEN 'w/n' ELSE addr_housenumber END, ', ' || addr_postcode, ' ' || addr_city),', ') END
+	ELSE LTRIM(CONCAT(addr_street, ' ' || CASE WHEN nohousenumber='yes' THEN 'w/n' ELSE addr_housenumber END, ', ' || CONCAT((addr_postcode || ' '), addr_city))) END
 	AS address,
 CASE WHEN contact_email IS NULL AND email IS NULL THEN NULL
 	ELSE CONCAT_WS('; ',contact_email, email) END AS local_email,
@@ -326,15 +302,10 @@ CASE WHEN contact_mobile IS NULL AND mobile IS NULL AND contact_phone IS NULL AN
 	ELSE CONCAT_WS('; ',contact_mobile, mobile, contact_phone, phone, phone_2) END AS local_phone,
 CASE WHEN website IS NULL AND contact_website IS NULL THEN NULL
 	ELSE CONCAT_WS('; ',website, contact_website) END AS local_website,
-	operator_website,
-	operator,
-	community_centre_for,
-	CASE WHEN capacity_persons IS NULL AND capacity_seats IS NULL THEN NULL
-	ELSE CONCAT_WS('; ',capacity_persons, capacity_seats) END AS capacity,
-	theatre_genre,
-	theatre_type,
-	geometry FROM raw_data.osm_cultural_centre)
-INSERT INTO ingestion.cultural_centre 
+operator_website,operator_wikidata,operator,
+min_level,max_level,
+	geometry FROM raw_data.osm_mall)
+INSERT INTO ingestion.mall 
 (original_id, name, legend_item, data_list_id, risk_level, properties, geometry, created_at)
 SELECT
 original_id,
@@ -346,26 +317,30 @@ JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
   'other_names', other_names,
   'address', address,
 	'local_email',local_email,
-	'phone',local_phone,
+	'local_phone',local_phone,
 	'local_website',local_website,
 	'operator_email',operator_email,
 	'operator_website',operator_website,
 	'operator',operator,
-	'community_centre_for',community_centre_for,
-	'capacity',capacity,
-	'theatre_genre',theatre_genre,
-	'theatre_type',theatre_type
+	'building_lowest_level',min_level,
+	'building_highest_level',max_level
 )),
 geometry,
 CURRENT_DATE as created_at
 FROM cleaned;
-"))
+"),"
+ALTER TABLE IF EXISTS ingestion.mall
+    OWNER to pgn_group_data_team_w;
+","
+GRANT ALL ON TABLE ingestion.mall TO pgn_group_data_team_w;
+","
+GRANT ALL ON TABLE ingestion.mall TO pgn_user_airflow;")
                             
 ### Create transformation table ----
 transformation_table_sql <- c("
-DROP TABLE IF EXISTS transformation.cultural_centre CASCADE;
+DROP TABLE IF EXISTS transformation.mall CASCADE;
 ","
-CREATE TABLE IF NOT EXISTS transformation.cultural_centre
+CREATE TABLE IF NOT EXISTS transformation.mall
   (
     id uuid NOT NULL DEFAULT gen_random_uuid(),
     original_id text,    
@@ -383,17 +358,20 @@ CREATE TABLE IF NOT EXISTS transformation.cultural_centre
 	created_by uuid,
 	updated_by uuid,
     geometry geometry(geometry, 4326),
-    CONSTRAINT cultural_centre_pkey PRIMARY KEY (id)
+    CONSTRAINT mall_pkey PRIMARY KEY (id)
   );
 ","
-INSERT INTO transformation.cultural_centre
+INSERT INTO transformation.mall
 (id, original_id, name, legend_item, data_list_id, properties, geometry, created_at)
-SELECT id, original_id, name, legend_item, data_list_id::uuid, properties, geometry, created_at FROM ingestion.cultural_centre;
+SELECT id, original_id, name, legend_item, data_list_id::uuid, properties, geometry, created_at FROM ingestion.mall;
+","
+ALTER TABLE IF EXISTS transformation.mall
+    OWNER to pgn_group_data_team_w;
+","
+GRANT ALL ON TABLE transformation.mall TO pgn_group_data_team_w;
+","
+GRANT ALL ON TABLE transformation.mall TO pgn_user_airflow;
 ")
-
-
-
-
 
 
 
@@ -404,14 +382,8 @@ SELECT id, original_id, name, legend_item, data_list_id::uuid, properties, geome
 create_ingestion_table <- function() {execute_sql_commands(ingestion_table_sql, "Ingestion table")}
 create_transformation_table <- function() {execute_sql_commands(transformation_table_sql, "Transformation table")}
 
-
-
-# set to TRUE if you want to update the transformation table even if the checks fail. 
-update_even_if_checks_fail<-FALSE
-# Don't forget to also set checks_failed<-0 if there were already some issues in the base data
-
 run_smart_update = function() {
-  smart_update_process("cultural_centre", 50, 100, 50, format(Sys.Date(), "%Y-%m-%d"), update_even_if_checks_fail)
+  smart_update_process("mall", 50, 100, 50, format(Sys.Date(), "%Y-%m-%d"), allow_update_even_if_checks_fail=overrule_checks, dry_run=do_dry_run,reuse_ingestion_data=reuse_ingestion_data)
 }
 
 
@@ -420,43 +392,17 @@ run_smart_update = function() {
 # """"""""""""""""""""----
 
 main_function = function() {
-  CreateImportTable(dataset = join_filtered, schema = "raw_data", table_name = "osm_cultural_centre") 
-  create_ingestion_table()
-  run_smart_update()
+  if (!reuse_ingestion_data) {
+    join_filtered<-DownloadOSM()
+    CreateImportTable(dataset = join_filtered, schema = "raw_data", table_name = "osm_mall")
+    create_ingestion_table()
+  }
   #create_transformation_table()
+  run_smart_update()
 }
 
-if(F){
+
+if(run_status){
   main_function()
 }
-
-
-# OSM fixup
-## 1. Not in OSM, only in official data
-# download CC from Wallonia
-cc_wallonia <- st_read(httr::GET("https://www.odwb.be/api/explore/v2.1/catalog/datasets/centre-culturels-en-communaute-francaise/exports/geojson?lang=nl&timezone=Europe%2FBrussels"))
-
-osm_selected<-join_filtered %>%
-  select(osm_id,name)
-
-check_osm <- st_join(cc_wallonia, osm_selected, join = st_is_within_distance, dist = 50)
-check_osm <- check_osm %>% 
-  filter(is.na(osm_id)) %>%
-  select(-osm_id,-name,-enjeux)
-
-# save as geojson
-st_write(check_osm, paste0(log_folder,"official_cc_not_in_osm.geojson"))
-
-
-## 2. No name in OSM
-osm_all<-rbind(osm_1,osm_2,osm_3,osm_4,osm_5)
-osm_all<-osm_all %>% 
-  filter(is.na(name) & !is.na(amenity) & !is.na(language)) %>%
-  select(osm_id,amenity)
-# save as geojson
-st_write(osm_all, paste0(log_folder,"cc_no_name_osm.geojson"))
-
-
-
-
 

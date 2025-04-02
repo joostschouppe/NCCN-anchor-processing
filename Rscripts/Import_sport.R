@@ -35,17 +35,7 @@ source(paste0(rscript_folder,"utils.R"))
 
 # Libraries -------------------------------
 # """""""""""""""""" ----------------------
-
-library(sf)
-library(RPostgres)
-library(DBI)
-
-## Data processing libraries
-library(dplyr)
-
-
-## OSM library
-library(osmdata)
+# all are loaded via the utils
 
 
 
@@ -365,6 +355,11 @@ table(join_filtered$object_type)
 join_filtered <- join_filtered %>%
   filter(object_type != "incomplete sports_centre")
 
+# extract a dataset for use in MapRoulette with incomplete swimming pools
+maproulette <- join_filtered %>%
+  filter(leisure == "swimming_pool" & !is.na(language)) %>%
+  select(osm_id,name)
+#st_write(maproulette, paste0(log_folder,"maproulette_swimming_pools.geojson"))
 
 
 # Upload to raw data ----
@@ -494,50 +489,11 @@ SELECT id, original_id, name, legend_item, data_list_id::uuid, properties, geome
 
 
 
-### Create fdw views ----
-fdw_views_sql <- c("
-DROP VIEW IF EXISTS fdw.fdw_sports CASCADE;
-","
-CREATE OR REPLACE VIEW fdw.fdw_sports
-AS
-SELECT id,
-original_id,
-name,
-legend_item,
-NULL::uuid as best_address_id,
-NULL::uuid as capakey_id,
-data_list_id,
-risk_level,
-properties,
-properties_secondary,
-imported_at,
-tags,
-deleted_at,
-updated_at,
-created_at,
-created_by,
-updated_by,
-st_reduceprecision(geometry, 0.000001::double precision) AS geometry,
-st_reduceprecision(st_pointonsurface(geometry), 0.000001::double precision) AS geometry_pt,
-CASE
-  WHEN st_geometrytype(geometry) = ANY (ARRAY['ST_Point'::text, 'ST_LineString'::text]) THEN st_reduceprecision(st_transform(st_buffer(st_transform(geometry, 31370), 20::double precision), 4326), 0.000001::double precision)
-  ELSE geometry
-  END AS geometry_pg
-FROM transformation.sports;
-","
-GRANT ALL ON TABLE fdw.fdw_sports TO paragon;
-")
-
-
-
-
-
 ### Execute the SQL commands ----
 
 
 create_ingestion_table <- function() {execute_sql_commands(ingestion_table_sql, "Ingestion table")}
 create_transformation_table <- function() {execute_sql_commands(transformation_table_sql, "Transformation table")}
-create_fdw_views <- function() {execute_sql_commands(fdw_views_sql, "FDW view")}
 
 
 
@@ -547,7 +503,7 @@ update_even_if_checks_fail<-FALSE
 # Don't forget to also set checks_failed<-0 if there were already some issues in the base data
 
 run_smart_update = function() {
-  smart_update_process("museum", 50, 100, 50, format(Sys.Date(), "%Y-%m-%d"), update_even_if_checks_fail)
+  smart_update_process("sports", 50, 100, 50, format(Sys.Date(), "%Y-%m-%d"), update_even_if_checks_fail)
 }
 
 
@@ -560,7 +516,6 @@ main_function = function() {
   create_ingestion_table()
   run_smart_update()
   #create_transformation_table()
-  #create_fdw_views()
 }
 
 if(F){

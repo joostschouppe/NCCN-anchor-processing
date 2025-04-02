@@ -130,13 +130,13 @@ perform_check <- function(dataset, name, geom, check_results, result_column_name
 
 # Smart update parameters (with examples):
 # Name of the table in Postgres
-#pgsql_table_name<-"bus_tram_metro_routes"
+#pgsql_table_name<-"nuclear_block"
 # Max allowed distance for objects with the same ID to be considered the same object
-#same_id_distance_threshold<-100
+#same_id_distance_threshold<-50
 # Max distance to be allowed to be taken in account for "nearby" features (multiple can be left over)
-#different_id_distance_raw_threshold<-200
+#different_id_distance_raw_threshold<-100
 # Threshold distance to decide a new feature is the same if there is only one nearby existing feature
-#different_id_distance_unique_threshold<-100
+#different_id_distance_unique_threshold<-50
 
 # Identifying name for the version of the dataset that was used for this process
 #source_identifier<-date_part
@@ -175,8 +175,12 @@ smart_update_process <- function(
     do_name_comparison = FALSE,
     ignore_in_name = NULL,
     dry_run=FALSE,
-    visualise_changes=FALSE)
+    visualise_changes=FALSE,
+    reuse_ingestion_data=FALSE)
 {
+
+if (reuse_ingestion_data==FALSE) {
+    # Start the normal processing
   
   # avoid scientific notation
   options(scipen = 999)
@@ -212,7 +216,7 @@ smart_update_process <- function(
   print(paste("The old data contained", nrow(old_transformation[is.na(old_transformation$deleted_at),]), "records (that weren't previously deleted)"))
   print(paste("The new data contains", nrow(new_ingestion), "records"))
   
-#st_write(old_transformation, paste0(log_folder,"old_data.geojson"))
+#st_write(old_transformation, paste0(log_folder,"/old_data.geojson"))
   
   bbox_old_transformation <- as.numeric(st_area(st_transform(st_as_sfc(st_bbox(old_transformation)), 31370)) / 1e6)
   
@@ -309,40 +313,28 @@ smart_update_process <- function(
   ## and in fact, if the distance is greater, it will still be merged in the next step
   
 
+  if (nrow(unchanged) == 0) {
+    unchanged$intersection <- numeric(0)
+  } else {
   # calculate the overlap between the two geometries when needed
   unchanged <- unchanged %>%
     rowwise() %>%
     mutate(
       # Check if geometry is either POLYGON or MULTIPOLYGON, then calculate intersection
-      intersection = if (st_geometry_type(geometry_l) %in% c("POLYGON", "MULTIPOLYGON") && 
-                         st_geometry_type(geometry_l_old) %in% c("POLYGON", "MULTIPOLYGON") && distance>0) {
-        if (st_is_empty(st_intersection(geometry_l, geometry_l_old))) {
-          NA
-        } else {
-          st_area(st_union(st_intersection(geometry_l, geometry_l_old)))
-        }
-      } else {
-        NA  # If not polygon types, return NA
-      }
+      intersection = 
+        if (st_geometry_type(geometry_l) %in% c("POLYGON", "MULTIPOLYGON") && 
+            st_geometry_type(geometry_l_old) %in% c("POLYGON", "MULTIPOLYGON") && distance>0) 
+          { # only calculate an intersection if there is actually one
+          if (length(st_intersection(geometry_l, geometry_l_old)) != 0) {
+            if (lengths(st_intersects(geometry_l, geometry_l_old))>0) {
+              st_area(st_union(st_intersection(geometry_l, geometry_l_old)))
+            } else {NA}}
+          else {NA}}
+      else {NA}
     ) %>%
     ungroup()
+  }
 
-  unchanged <- unchanged %>%
-    rowwise() %>%
-    mutate(
-      intersection = 
-        # only try for an intersection if both are (multi)polygons
-        if (st_geometry_type(geometry_l) %in% c("POLYGON", "MULTIPOLYGON") &&
-            st_geometry_type(geometry_l_old) %in% c("POLYGON", "MULTIPOLYGON") && distance > 0) 
-        { # only calculate an intersection if there is actually one
-          if (lengths(st_intersects(geometry_l, geometry_l_old))>0) {
-            st_area(st_union(st_intersection(geometry_l, geometry_l_old)))
-          } else {
-            NA } # here there is no intersection between the polygons
-        } else {
-          NA  # here the preconditions for an intersection were not met
-        }) %>%
-    ungroup()
   
   
     
@@ -382,6 +374,7 @@ smart_update_process <- function(
   unchanged <- unchanged %>%
     filter(count_new == 1, count_old == 1)
   
+  
   # isolate the successfully matched unique identifiers for later filtering
   success_match <- as.data.frame(unchanged)
   success_match_old <- success_match %>%
@@ -405,6 +398,7 @@ smart_update_process <- function(
   # merge the old metadata to the new data
   unchanged <- left_join(unchanged, old_metadata, by = "id")
   # NOTE: for now, we will NOT change updated_at here, even though some objects might have minor updates. We could compare column by column to define things that were updated
+  
   
   # add the unchanged objects to the table to be pushed to postgres
   table_to_push_to_sql <- unchanged
@@ -474,13 +468,14 @@ smart_update_process <- function(
       
       # Initialize results
       results <- list()
-      
-      # Loop through each record in test_new
+
+
+      # Loop through each record in the new data
       for (i in seq_len(nrow(new_ingestion_nogeo))) {
         # Get the bounding box for the current record
         bbox_new <- st_bbox(new_ingestion_nogeo[i, ])
         
-        # Pre-filter test_old based on bbox overlap
+        # Pre-filter old data based on bbox overlap
         old_filtered <- old_transformation %>%
           filter(map_dbl(bbox_old, ~ bbox_overlap(bbox_new, .)) >= 0.9) # Use map_dbl for vectorized computation
         
@@ -504,7 +499,7 @@ smart_update_process <- function(
       {
         print("Not all geometries are lines, so using the normal spatial join")
         # Execute spatial join: adjust distance based on different_id_distance_raw_threshold
-        join <- st_join(new_ingestion_nogeo, test_old, join = st_is_within_distance, dist = different_id_distance_raw_threshold)
+        join <- st_join(new_ingestion_nogeo, old_transformation, join = st_is_within_distance, dist = different_id_distance_raw_threshold)
         print(paste0("Number of initial new/old objects possible pairs: ", nrow(join)))
         }
 
@@ -1064,6 +1059,9 @@ smart_update_process <- function(
   table_id_t <- paste0("tst.",pgsql_table_name)
   print(paste0("Import temporary transformation table to postgres at ", table_id_t))
   dbWriteTable(con_pg, table_id, table_without_jsonb, overwrite = TRUE, row.names = FALSE )
+  dbExecute(con_pg,paste0("ALTER TABLE IF EXISTS ",table_id_t," OWNER to pgn_group_data_team_w;"))
+  dbExecute(con_pg,paste0("GRANT ALL ON TABLE ",table_id_t," TO pgn_group_data_team_w;"))
+  dbExecute(con_pg,paste0("GRANT ALL ON TABLE ",table_id_t," TO pgn_user_airflow;"))
   dbDisconnect(con_pg)
   
   
@@ -1156,16 +1154,19 @@ smart_update_process <- function(
 
   
   # Write a report ----
-  filename <- paste0(log_folder,format(Sys.time(), "%Y%m%d_%H%M%S"),"_smartupdate_",pgsql_table_name,"_",source_identifier,".txt")
+  filename <- paste0(log_folder,"/",format(Sys.time(), "%Y%m%d_%H%M%S"),"_smartupdate_",pgsql_table_name,"_",source_identifier)
   
   
   # Add transformation check
-  write.table(t(check_smart_update), filename, sep = "\t", quote = FALSE, row.names=TRUE, append = TRUE)
-  cat("# If there is a large number of new, deleted or updated cases, the check fails (as we want to do a manual review to check if this is realistic) \n\n", file = filename, append = TRUE)
-  print(paste0("Report about the transformation table update for ", pgsql_table_name, " written to ", filename))
+  cat("Summary of the proposed update:
+      ")
+  print(t(check_smart_update), row.names=FALSE)
+  #write.table(t(check_smart_update), paste0(filename,".txt"), sep = "\t", quote = FALSE, row.names=TRUE, append = TRUE)
+  #cat("# If there is a large number of new, deleted or updated cases, the check fails (as we want to do a manual review to check if this is realistic) \n\n", file = filename, append = TRUE)
+  #print(paste0("Report about the transformation table update for ", pgsql_table_name, " written to ", filename))
 
 #write to gpkg for inspection (note that "unchanged" and updated cases will only show the new version)
-st_write(table_without_jsonb_test, paste0(log_folder, pgsql_table_name, "_new_transf_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".gpkg"))
+st_write(table_without_jsonb_test, paste0(filename , ".gpkg"))
 
 
 # OPTIONAL: line dataset to visualize the changes ----
@@ -1212,7 +1213,7 @@ unchanged_for_visualisation <- st_as_sf(unchanged_for_visualisation)
 unchanged_for_visualisation <- st_set_crs(unchanged_for_visualisation, 31370)
 
 # save as gpkg
-st_write(updated_for_visualization, paste0(log_folder, pgsql_table_name, "_unchanged_lines_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".gpkg"))
+st_write(updated_for_visualization, paste0(log_folder,"/", pgsql_table_name, "_unchanged_lines_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".gpkg"))
 
 
 
@@ -1227,7 +1228,7 @@ updated_for_visualization_oldversion <- st_as_sf(updated_for_visualization_oldve
 updated_for_visualization_oldversion <- st_set_crs(updated_for_visualization_oldversion, 31370)
 
 # save as gpkg
-st_write(updated_for_visualization_oldversion, paste0(log_folder, pgsql_table_name, "_old_geo_updated_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".gpkg"))
+st_write(updated_for_visualization_oldversion, paste0(log_folder,"/", pgsql_table_name, "_old_geo_updated_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".gpkg"))
 
 
 #create centroid for geometry in anchor_enriched
@@ -1270,18 +1271,23 @@ updated_for_visualization <- st_as_sf(updated_for_visualization)
 updated_for_visualization <- st_set_crs(updated_for_visualization, 31370)
 
 # save as gpkg
-filename_visualization<-paste0(log_folder, pgsql_table_name, "_updated_lines_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".gpkg")
+filename_visualization<-paste0(log_folder,"/", pgsql_table_name, "_updated_lines_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".gpkg")
 st_write(updated_for_visualization, filename_visualization)
 print(paste0("Visualisation datasets created at ", filename_visualization))
 # END OF OPTIONAL VISUALISATION DATSET  
 }  
+
+# END OF LARGE IF about reuse_ingestion_data
+} else {
+  # continue with the rest of the script, at which point ingestion data was already processed
+}
   
   # prepare the actual update ----
   ### existing id's get an update of all EXCLUDED fields (because they have been updated or deleted); new id's get inserted
   # the query changes depending on the available geometries
   UpdateTransformationsSQL <- character()
   
-  if (!is.null(new_ingestion_extra_geom)) {
+  if (exists("new_ingestion_extra_geom") && !is.null(new_ingestion_extra_geom)) {
     # query if three geometry fields are available
     UpdateTransformationsSQL <- c(
       paste0("INSERT INTO transformation.",pgsql_table_name,"
@@ -1403,6 +1409,8 @@ BEGIN
 END $$;"))     
   
 ### Update the data list with the most recent updated_at date ----
+
+if (reuse_ingestion_data==FALSE) {
 # Note: if there is no change in the data, the updated_at date will not be updated
 # create a list of the data_list_id's in table_without_jsonb with their most recent updated_at, created_at and deleted_at date
 data_list_id <- as.data.frame(table_without_jsonb) %>%
@@ -1419,35 +1427,53 @@ data_list_id$updated_at <- as.POSIXct(pmax(data_list_id$updated_at, data_list_id
 data_list_id <- data_list_id %>% select(data_list_id, updated_at)
 
 # send to postgres
+UploadDataList <- function() {
 con_pg<-get_con()
 table_id <- DBI::Id(
   schema  = "tst",
-  table   = "data_list_update")
-table_id_t <- "tst.data_list_update"
+  table   = paste0("data_list_update_", pgsql_table_name))
+table_id_t <- paste0("tst.data_list_update_", pgsql_table_name)
 dbWriteTable(con_pg, table_id, data_list_id, overwrite = TRUE, row.names = FALSE )
-
 print(paste0("Imported data_list_update to postgres at ", table_id_t))
-dbDisconnect(con_pg)  
+dbExecute(con_pg,paste0("ALTER TABLE IF EXISTS ",table_id_t," OWNER to pgn_group_data_team_w;"))
+dbExecute(con_pg,paste0("GRANT ALL ON TABLE ",table_id_t," TO pgn_group_data_team_w;"))
+dbExecute(con_pg,paste0("GRANT ALL ON TABLE ",table_id_t," TO pgn_user_airflow;"))
+dbDisconnect(con_pg) 
+
+
+print(paste0("Dataset to visualize the (proposed) changes available at ",paste0(log_folder,"/", filename , ".gpkg")))  
+}
+
+} else {
+  # no upload needed
+}
 
 # write the update sql
 UpdateDataList <- c(
-  "UPDATE parameterization.data_list p
+  paste0("UPDATE parameterization.data_list p
   SET update_at = d.updated_at
-  FROM tst.data_list_update d
-  WHERE p.id = d.data_list_id::uuid;",
-  "DROP TABLE tst.data_list_update;")
-  
+  FROM tst.data_list_update_",pgsql_table_name," d
+  WHERE p.id = d.data_list_id::uuid;")
+  )
+
   
 # Main update function ----  
+
+# we always prepare the table to update the data list with, becuase if it's a dry run or or the checks fail, we still need it available if the user then later does a reuse_ingestion_data run
+if (reuse_ingestion_data==FALSE) {
+con_pg <- get_con()
+UploadDataList()
+dbDisconnect(con_pg)
+}
   # only run the update if the checks are passed and dry run is false. That means the tst table is kept if the checks fail
-  if (smart_update_checks_failed == 0 & !dry_run) {
+  if (exists("smart_update_checks_failed") && smart_update_checks_failed == 0 && !dry_run && !reuse_ingestion_data) {
     con_pg <- get_con()
     tryCatch(
       {
         for (sql_command in BackupTransformationsSQL) {
           dbExecute(con_pg, sql_command)
         }
-        print(paste0("Transformation table ", pgsql_table_name, " backed up without error"))
+        print(paste0("Transformation table ", pgsql_table_name, " backed up succesfully"))
         
         # Now, proceed with the update only if backup was successful
         tryCatch(
@@ -1455,41 +1481,71 @@ UpdateDataList <- c(
             for (sql_command in UpdateTransformationsSQL) {
               dbExecute(con_pg, sql_command)
             }
-            print(paste0("Transformation table ", pgsql_table_name, " updated without error"))
+            print(paste0("SUCCESS! Transformation table ", pgsql_table_name, " updated succesfully"))
             # update the data_list table if the transformation table was updated
             tryCatch(
               {
                 for (sql_command in UpdateDataList) {
                   dbExecute(con_pg, sql_command)
                 }
-                print(paste0("Data list updated without error"))
+                print(paste0("Data list updated succesfully"))
               }, 
               error = function(err) {
-                print(paste0("The SQL function to update the data list failed."))
                 print(err)
-              })
+                stop(paste0("The SQL function to update the data list failed."))
+                })
           },
           error = function(err) {
-            print(paste0("The SQL function to update the transformation table ", pgsql_table_name, " failed"))
             print(err)  # Print the error message for more details
+            stop(paste0("The SQL function to update the transformation table ", pgsql_table_name, " failed"))
           }
         )
       },
       error = function(err) {
-        print(paste0("The SQL function to backup the transformation table ", pgsql_table_name, " failed, so we did NOT run the table update."))
         print(err)  # Print the error message for more details
+        stop(paste0("The SQL function to backup the transformation table ", pgsql_table_name, " failed, so we did NOT run the table update."))
       }
     )
     dbDisconnect(con_pg)
   } else {
+    if (reuse_ingestion_data==TRUE) {
+     con_pg <- get_con()
+     # do ONLY transformation table update & do data list update
+      tryCatch(
+        {
+          for (sql_command in UpdateTransformationsSQL) {
+            dbExecute(con_pg, sql_command)
+          }
+          print(paste0("SUCCESS! Transformation table ", pgsql_table_name, " updated succesfully based on ingestion table of the previous run"))
+          # update the data_list table if the transformation table was updated
+          tryCatch(
+            {
+              for (sql_command in UpdateDataList) {
+                dbExecute(con_pg, sql_command)
+              }
+              print(paste0("Data list updated succesfully"))
+            }, 
+            error = function(err) {
+              print(err)
+              stop(paste0("The SQL function to update the data list failed."))
+            })
+        },
+        error = function(err) {
+          print(err)  # Print the error message for more details
+          stop(paste0("The SQL function to update the transformation table ", pgsql_table_name, " failed"))
+        }
+      )
+      dbDisconnect(con_pg)
+  } else {
     if (!dry_run) {
-      stop(paste0(pgsql_table_name," transformation table not updated due to failed checks. Please check the report at ",filename," for details."))
+      stop(paste0(pgsql_table_name," transformation table not updated due to failed checks."))
     } else {
-      print(paste0("Transformation table not updated because this is just a dry run. Data comparison report available at ",filename))
+      print(paste0("Transformation table not updated because this is just a dry run. Data comparison report available at ",filename,".gpkg"))
     }
   }
   
 }
 
+}
 # END SMART UPDATE FUNCTION ----
 
