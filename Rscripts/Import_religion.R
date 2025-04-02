@@ -11,60 +11,74 @@
 ##
 ## ---------------------------
 
+# Docs: https://dev.azure.com/NCCN-Paragon/Paragon/_wiki/wikis/Paragon.wiki/581/Religious-buildings
+
 # Load variables -----------------------------------------------------------
 #  """""""""""""""""" ----------------------
 
-readRenviron("C:/projects/pgn-data-airflow/.Renviron")
+#readRenviron("C:/projects/pgn-data-airflow/.Renviron")
 
+# connection details
 db_host_name <- Sys.getenv("POSTGRES_HOST_NAME")
 postgres_user <- Sys.getenv("POSTGRES_USER")
 postgres_password <- Sys.getenv("POSTGRES_PASSWORD")
 db_name<- Sys.getenv("POSTGRES_DB_NAME_CURATED")
 
+# run status
+run_status<-Sys.getenv("RUN_STATUS")
+## this is set to false and prevents any accidental changes to the database by switching off the main_function(). On Airflow, this is set to true.
+run_status<-ifelse(tolower(run_status) == "true", TRUE, FALSE)
+
+# overrule the checks
+overrule_checks<-Sys.getenv("OVERRULE_CHECKS")
+## Set to FALSE by default. That means we do not update the anchors if some tests fail. Those tests include "the data has grown or shrunk by a lot of objects". If, after review of the log, you decide that nothing is wrong, set this manually to TRUE.
+# If the input is not correctly understood as boolean, this will force it to it.
+overrule_checks<-ifelse(tolower(overrule_checks) == "true", TRUE, FALSE)
+
+
+# Do not run the main part of the processing, but just do an update based on the ingestion table already in the dbase
+reuse_ingestion_data<-Sys.getenv("REUSE_INGESTION_DATA")
+reuse_ingestion_data<-ifelse(tolower(reuse_ingestion_data) == "true", TRUE, FALSE)
+
+# Only run the comparison script & update the ingestion table, but do not attempt to update the transformation table
+do_dry_run<-Sys.getenv("DO_DRY_RUN")
+do_dry_run<-ifelse(tolower(do_dry_run) == "true", TRUE, FALSE)
+
 data_list_id<-"45f9f964-4fe7-4966-8140-b622cb69d224"
-log_folder <- "C:/temp/logs/"
+
+log_folder <- Sys.getenv("RSCRIPT_LOG_FOLDER")
 
 ### Load external functions ------
 
-rscript_folder <- "C:/projects/pgn-data-airflow/rscripts/"
-source(paste0(rscript_folder,"utils_updated_check_protoanchors.R"))
-source(paste0(rscript_folder,"utils.R"))
+rscript_folder <- Sys.getenv("LOCAL_RSCRIPT_PATH")
+source(paste0(rscript_folder,"/utils_updated_check_protoanchors.R"))
+source(paste0(rscript_folder,"/utils.R"))
 
 # Libraries -------------------------------
 # """""""""""""""""" ----------------------
 
-library(sf)
-library(RPostgres)
-library(DBI)
-
-## Data processing libraries
-library(dplyr)
-
-
-## OSM library
-library(osmdata)
-
-
-
+# everything loaded via utils
 
 
 
 # EXTRACT ----
 # """""""""""""""""" ----
 
+# Function to download fresh data ----
+process_fresh_data <- function(){
+  # Default: download fresh data
+  if (reuse_ingestion_data==FALSE) {
 
 # Download OSM data ----
 ### OSM DOWNLOAD PARAMETERS ----
 
 # Define the list of features
 features_list <- list("amenity" = "place_of_worship")
-# If default server fails, set to TRUE to use mail.ru server (older data)
-alternative_overpass_server<-FALSE
 # Define extra tags to use as columns for properties
 extra_columns <- c("building","place_of_worship","place_of_worship:type",
                    "religion","denomination",
                    "services","service_times",
-                   "basilica","deanery","diocese","parish","historic")
+                   "basilica","deanery","diocese","parish","historic", "building:part")
 # Choose which datatypes are needed, as a list of datatypes, using any of "points", "lines", "mpolygons" (this is polygons+multipolygons together)
 datatypes <- c("points", "mpolygon")
 
@@ -73,7 +87,7 @@ datatypes <- c("points", "mpolygon")
 
 tryCatch({
   # Call the large function
-  osm_all<-download_osm_process(features_list, datatypes, extra_columns, alternative_overpass_server)
+  osm_all<-download_osm_process(features_list, datatypes, extra_columns, postgres=TRUE)
   print("OSM data downloaded & processes succesfully")
 }, error = function(e) {
   # Print error message
@@ -81,7 +95,10 @@ tryCatch({
 })
 
 
-
+  } else {
+    print("No fresh data downloaded because user requested to re-use existing data")
+  }
+} # end process_fresh_data function
 
 
 
@@ -157,10 +174,11 @@ CASE WHEN services IS NULL AND service_times IS NULL THEN NULL
             FROM raw_data.osm_religion
 			WHERE 
 	(building IS NULL OR (building != 'wayside_chapel' AND building != 'wayside_cross' AND building != 'wayside_shrine' AND building != 'chapel'))
+	AND (building_part IS NULL OR (building_part != 'wayside_chapel' AND building_part != 'wayside_cross' AND building_part != 'wayside_shrine' AND building_part != 'chapel'))
 	AND NOT (name IS NULL and religion IS NULL)
-	AND (place_of_worship IS NULL OR (place_of_worship!= 'wayside_chapel' AND place_of_worship!='wayside_shrine'))
+	AND (place_of_worship IS NULL OR (place_of_worship!= 'wayside_chapel' AND place_of_worship!='wayside_shrine' AND place_of_worship!='lourdes_grotto'))
 	AND (place_of_worship_type IS NULL OR (place_of_worship_type != 'wayside_chapel' AND place_of_worship_type!= 'wayside_shrine' AND place_of_worship_type!= 'wayside_cross'))
-	AND (historic IS NULL OR (historic != 'wayside_shrine' AND historic != 'wayside_cross'))
+	AND (historic IS NULL OR (historic != 'wayside_shrine' AND historic != 'wayside_cross' AND historic != 'wayside_chapel'))
 			)
 
 INSERT INTO ingestion.place_of_worship 
@@ -225,40 +243,6 @@ SELECT id, original_id, name, legend_item, data_list_id::uuid, risk_level, prope
 ")
 
 
-### Create fdw views ----
-fdw_views_sql <- c("
-DROP VIEW IF EXISTS fdw.fdw_place_of_worship CASCADE;
-","
-CREATE OR REPLACE VIEW fdw.fdw_place_of_worship
-AS
-SELECT id,
-original_id,
-name,
-legend_item,
-NULL::uuid as best_address_id,
-NULL::uuid as capakey_id,
-data_list_id,
-risk_level,
-properties,
-properties_secondary,
-imported_at,
-tags,
-deleted_at,
-updated_at,
-created_at,
-created_by,
-updated_by,
-geometry,
-st_pointonsurface(geometry) AS geometry_pt
-FROM transformation.place_of_worship;
-","
-ALTER TABLE fdw.fdw_place_of_worship
-OWNER TO paragon;
-","
-GRANT SELECT ON TABLE fdw.fdw_place_of_worship TO fdw4dev;
-","
-GRANT ALL ON TABLE fdw.fdw_place_of_worship TO paragon;
-")
 
 
 
@@ -267,15 +251,14 @@ GRANT ALL ON TABLE fdw.fdw_place_of_worship TO paragon;
 
 create_ingestion_table <- function() {execute_sql_commands(ingestion_table_sql, "Ingestion table")}
 create_transformation_table <- function() {execute_sql_commands(transformation_table_sql, "Transformation table")}
-create_fdw_views <- function() {execute_sql_commands(fdw_views_sql, "FDW view")}
 
 
 
 
 
 # set to TRUE if you want to update the transformation table even if the checks fail. 
-update_even_if_checks_fail<-FALSE
-# Don't forget to also set checks_failed<-0 if there were already some issues in the base data
+update_even_if_checks_fail<-overrule_checks
+
 
 run_smart_update = function() {
   smart_update_process("place_of_worship", 50, 100, 50, format(Sys.Date(), "%Y-%m-%d"), update_even_if_checks_fail)
@@ -287,15 +270,17 @@ run_smart_update = function() {
 # """"""""""""""""""""----
 
 main_function = function() {
-  CreateImportTable(dataset = osm_all, schema = "raw_data", table_name = "osm_religion")  
-  create_ingestion_table()
+  if (!reuse_ingestion_data) {
+    process_fresh_data()
+    CreateImportTable(dataset = osm_all, schema = "raw_data", table_name = "osm_religion")  
+    create_ingestion_table()
+  }
   run_smart_update()
   #create_transformation_table()
-  #create_fdw_views()
 }
 
 
-if(F){
+if(run_status){
   main_function()
 }
 
