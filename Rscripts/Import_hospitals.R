@@ -13,40 +13,57 @@
 
 
 
+
 # Load variables -----------------------------------------------------------
 #  """""""""""""""""" ----------------------
 
-readRenviron("C:/projects/pgn-data-airflow/.Renviron")
 
+#readRenviron("C:/projects/pgn-data-airflow/.Renviron")
+
+# connection details
 db_host_name <- Sys.getenv("POSTGRES_HOST_NAME")
 postgres_user <- Sys.getenv("POSTGRES_USER")
 postgres_password <- Sys.getenv("POSTGRES_PASSWORD")
 db_name<- Sys.getenv("POSTGRES_DB_NAME_CURATED")
 
+# run status
+run_status<-Sys.getenv("RUN_STATUS")
+## this is set to false and prevents any accidental changes to the database by switching off the main_function(). On Airflow, this is set to true.
+run_status<-ifelse(tolower(run_status) == "true", TRUE, FALSE)
+
+# overrule the checks
+overrule_checks<-Sys.getenv("OVERRULE_CHECKS")
+## Set to FALSE by default. That means we do not update the anchors if some tests fail. Those tests include "the data has grown or shrunk by a lot of objects". If, after review of the log, you decide that nothing is wrong, set this manually to TRUE.
+# If the input is not correctly understood as boolean, this will force it to it.
+overrule_checks<-ifelse(tolower(overrule_checks) == "true", TRUE, FALSE)
+
+# Do not run the main part of the processing, but just do an update based on the ingestion table already in the dbase
+reuse_ingestion_data<-Sys.getenv("REUSE_INGESTION_DATA")
+reuse_ingestion_data<-ifelse(tolower(reuse_ingestion_data) == "true", TRUE, FALSE)
+
+# Only run the comparison script & update the ingestion table, but do not attempt to update the transformation table
+do_dry_run<-Sys.getenv("DO_DRY_RUN")
+do_dry_run<-ifelse(tolower(do_dry_run) == "true", TRUE, FALSE)
+
+# Data list IDs
 data_list_id_osm<-"bd623971-34e3-4518-a220-eb8d26d757ad"
 data_list_id_helipad<-"14d5bc60-ffb0-4565-b132-fc4bd9dd156d"
 data_list_id_emergency_entrance<-"6f0fbe5c-7731-40e7-b50b-33c4aecd16a5"
-log_folder <- "C:/temp/logs/"
+
+
+# Set log folder
+log_folder <- Sys.getenv("RSCRIPT_LOG_FOLDER")
 
 ### Load external functions ------
+rscript_folder <- Sys.getenv("LOCAL_RSCRIPT_PATH")
+source(paste0(rscript_folder,"/utils_updated_check_protoanchors.R"))
+source(paste0(rscript_folder,"/utils.R"))
 
-rscript_folder <- "C:/projects/pgn-data-airflow/rscripts/"
-source(paste0(rscript_folder,"utils_updated_check_protoanchors.R"))
-source(paste0(rscript_folder,"utils.R"))
-
-# Libraries -------------------------------
+# Extra libraries -------------------------------
 # """""""""""""""""" ----------------------
+# all are loaded via the utils
 
-library(sf)
-library(RPostgres)
-library(DBI)
 
-## Data processing libraries
-library(dplyr)
-library(stringr)
-
-## OSM library
-library(osmdata)
 
 
 
@@ -60,14 +77,17 @@ library(osmdata)
 # EXTRACT ----
 # """""""""""""""""" ----
 
+# Function to download fresh data ----
+process_fresh_data <- function(){
+  # Default: download fresh data
+  if (reuse_ingestion_data==FALSE) {
+
 # Load & transform hospital data ----
 
 ### OSM DOWNLOAD PARAMETERS ----
 
 # Define the list of features
 features_list <- list("amenity"="hospital")
-# If default server fails, set to TRUE to use mail.ru server (older data)
-alternative_overpass_server<-FALSE
 # Define extra tags to use as columns for properties
 extra_columns <- c("amenity","description","email","emergency","emergency:phone","fax","full_name","healthcare", "healthcare:speciality","loc_name","opening_hours:visitors","start_date", "ref:fps_health:recognition", "ref:fps_health:campus","emergency_ward")
 # Choose which datatypes are needed, as a list of datatypes, using any of "points", "lines", "mpolygons" (this is polygons+multipolygons together)
@@ -96,16 +116,35 @@ osm_all <- osm_all %>%
 joined_all <- st_join(osm_all, osm_all, join = st_within)
 
 # there is now a row for every hospital where it intersects with itself, and a row for every time it intersects with another one.
-# Filter out just the ones that are within another one
+# Filter out just the ones that are within another one, in Belgium
 joined_all <- joined_all %>%
-  filter(osm_id.x != osm_id.y)
+  filter(osm_id.x != osm_id.y & !is.na(language.x))
+
+# this list was reviewed at the start of the processing for Paragon. We accept that there may be hospitals within hospitals, but they should have a name in this case. Otherwise they are likely to be errors.
+# stop if in Belgium there are any hospitals within hospitals without a name
+if (any(is.na(joined_all$name.x))) {
+  test <- joined_all %>%
+    filter(is.na(name.x))
+  stop(paste("There are hospitals within hospitals without a name:", test$osm_id.x))
+}
+
 # possible st_within makes more sense
 #write.csv(st_drop_geometry(joined_all), file = "c:/temp/joined_data_poly.csv")
 # reviewed 17/5/2024: quite a few sites had duplicate geometries, with info spread out over them; these were remapped with most info on the outer and deletion of the inner if it wasn't a "subhospital"
 
-# if healthcare_speciality contains psychiatry, child_psychiatry or neuropsychiatry, set risk_level=3, else riks_level=2
+# if healthcare_speciality contains psychiatry, child_psychiatry or neuropsychiatry, set risk_level=3, else risk_level=2
 osm_all <- osm_all %>%
-  mutate(risk_level=ifelse(grepl("psychiatry|child_psychiatry|neuropsychiatry",healthcare_speciality),3,2))
+  mutate(risk_level = case_when(
+    grepl("psychiatry|child_psychiatry|neuropsychiatry", healthcare_speciality) ~ 3,
+    str_detect(name, "universit") |
+      str_detect(name_nl, "universit") |
+      str_detect(name_fr, "universit") |
+      str_detect(name_de, "universit") | operator_type == "university" ~ 3,
+    TRUE ~ 2  # Keep other values as 2
+  ))
+
+# make available outside the function
+osm_all <<- osm_all
 
 
 # Load & transform helipads ----
@@ -132,7 +171,9 @@ tryCatch({
 osm_helipad <- osm_helipad %>%
   filter(aeroway=="helipad" | aeroway=="heliport")
 
-# report inconsistency if icoa is empty & no:network is not empty and when not:network is not empty but icoa is also not empty
+# report inconsistency if 
+## a helipad that did not get an ICOA code and also wasn't flagged as being outside of the network (i.e. unreviewed): icoa is empty & no:network is not empty
+## or when it has an ICAO code but also has a tag saying it doesn't have a network (not:network is not empty but icoa is also not empty)
 helipad_test <- osm_helipad %>%
   filter((is.na(icao) & (is.na(no_network) & is.na(not_network))) | 
          (!is.na(icao) & (!is.na(no_network) | !is.na(no_network))))
@@ -143,8 +184,8 @@ cat(paste("Inconsistencies in helipad data: ",nrow(helipad_test),"\n"))
 ## select heliports
 osm_heliport <- osm_helipad %>%
   filter(aeroway=="heliport")
-## calculate bbox for each row
 
+## calculate bbox for each row
 osm_heliport_bbox <- osm_helipad %>%
   filter(aeroway == "heliport") %>%
   rowwise() %>%
@@ -156,28 +197,31 @@ osm_heliport_bbox <- osm_helipad %>%
   ) %>%
   ungroup()
 
-# Create a numeric vector from the four columns in each row
+### Create a numeric vector from the four columns in each row
 osm_heliport_bbox <- osm_heliport_bbox %>%
   mutate(bbox = pmap(list(minx, miny, maxx, maxy), ~ c(...)))
-
-
 bbox_numeric <- unlist(osm_heliport_bbox$bbox[1])
 
-# add a stop if this is more than one row
+## add a stop if this is more than one row
 if (nrow(osm_heliport_bbox) > 1) {
   stop("More than one row in osm_heliport_bbox - please adapt script to deal with this")
 }
 
-
+## download any helipad within the bbox
+### do NOT set postgres to TRUE, becuase we're using a very small BBOX here - and that gets overruled by utils.R for now
 features_list <-list("aeroway"="helipad")
 tryCatch({
   # Call the large function
-  osm_helipad_within<-download_osm_process(features_list, datatypes, extra_columns, alternative_overpass_server, bbox=bbox_numeric, keep_region=TRUE)
+  osm_helipad_within<-download_osm_process(features_list, datatypes, extra_columns, bbox=bbox_numeric, keep_region=TRUE, postgres=FALSE)
   print("OSM data downloaded & processes succesfully")
 }, error = function(e) {
   # Print error message
   print(paste("Something went wrong:", e$message))
 })
+
+if (nrow(osm_helipad_within) > 1) {
+  stop("More than one row in osm_helipad_within - please adapt script to deal with this")
+}
 
 # replace the geometry
 # Assuming both datasets are in sf format and each contains only one record
@@ -193,7 +237,8 @@ osm_helipad <- osm_helipad %>%
 osm_helipad <- rbind(osm_helipad, osm_heliport)
 
 
-
+# make available outside the function
+osm_helipad <<- osm_helipad
 
 # Load & transform emergency ward entrance data ----
 
@@ -228,11 +273,30 @@ hospitals <- osm_all %>%
 osm_emergency_entrance <- osm_emergency_entrance %>%
   st_join(hospitals, join = st_within)
 
+# keep only the first record if there are now several records for a single entrance
+osm_emergency_entrance <- osm_emergency_entrance %>%
+  group_by(osm_id) %>%
+  slice(1) %>%
+  ungroup()
+
 # If there are emergency ward entrances that are not in a hospital, then they should be reviewed. There's only one case within Belgium though (18/10/2024); it's case we can throw out
-# select only wards within hopsitals
+# stop if there is more than one case with language not NA and hospital_osm_id is NA
+if (nrow(osm_emergency_entrance %>% filter(!is.na(language) & is.na(hospital_osm_id))) > 1) {
+  stop("More than one case in Belgium (language not NA) and hospital_osm_id is NA - please review OSM data at this point manually, we only want emergency entrances within hospitals")
+}
+
+
+# select only wards within hospitals
 osm_emergency_entrance <- osm_emergency_entrance %>%
   filter(!is.na(hospital_osm_id))
-  
+
+# make available outside the function
+osm_emergency_entrance <<- osm_emergency_entrance
+
+  } else {
+    print("No fresh data downloaded because user requested to re-use existing data")
+  }
+} # end process_fresh_data function  
 
 ### Create SQL for proper ingestion table ----
 
@@ -319,8 +383,8 @@ JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
   'fps_health_recognition', fps_health_recognition,
   'fps_health_campus', fps_health_campus,
   'healthcare speciality', healthcare_speciality,
-  'image url', image_url,
-  'opening hours', opening_hours,
+  'image', image_url,
+  'opening_hours', opening_hours,
   'operator', operator,
   'website', website,
   'wikidata', wikidata,
@@ -368,7 +432,7 @@ WITH simplified as (
   ELSE CONCAT_WS('; ',contact_email, email,operator_email) END AS email,
   operator_email,
   CASE WHEN contact_mobile IS NULL AND mobile IS NULL AND contact_phone IS NULL AND phone IS NULL AND phone_2 IS NULL THEN NULL
-  ELSE CONCAT_WS('; ',contact_mobile, mobile, contact_phone, phone, phone_2) END AS local_phone,
+  ELSE CONCAT_WS('; ',contact_mobile, mobile, contact_phone, phone, phone_2) END AS phone,
   opening_hours,
   operator,
   CASE WHEN website IS NULL AND contact_website IS NULL THEN NULL
@@ -401,7 +465,7 @@ JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
   'email', email,
   'operator email', operator_email,
   'phone', phone,
-  'opening hours', opening_hours,
+  'opening_hours', opening_hours,
   'operator', operator,
   'website', website,
   'wikidata', wikidata,
@@ -411,8 +475,7 @@ JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
   'surface', surface,
   'description', description,
   'aeroway',aeroway,
-  'diameter',diameter,
-  'network',network
+  'diameter',diameter
   )) as properties,
 geometry,
 CURRENT_DATE as created_at
@@ -488,7 +551,7 @@ JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
   'email', email,
   'operator email', operator_email,
   'phone', phone,
-  'opening hours', opening_hours,
+  'opening_hours', opening_hours,
   'operator', operator,
   'website', website,
   'wikidata', wikidata
@@ -588,107 +651,6 @@ SELECT id, original_id, name, legend_item, data_list_id, properties, geometry, c
 ")
 
 
-### Create fdw views ----
-fdw_views_hospitals_sql <- c("
-DROP VIEW IF EXISTS fdw.fdw_hospitals CASCADE;
-","
-CREATE OR REPLACE VIEW fdw.fdw_hospitals
-AS
-SELECT id,
-row_number() OVER () AS gid,
-original_id,
-name,
-legend_item,
-NULL::uuid as best_address_id,
-NULL::uuid as capakey_id,
-data_list_id,
-risk_level,
-properties,
-properties_secondary,
-imported_at,
-tags,
-deleted_at,
-updated_at,
-created_at,
-created_by,
-updated_by,
-st_reduceprecision(geometry, 0.000001::double precision) AS geometry,
-st_reduceprecision(st_pointonsurface(geometry), 0.000001::double precision) AS geometry_pt,
-CASE
-  WHEN st_geometrytype(geometry) = ANY (ARRAY['ST_Point'::text, 'ST_LineString'::text]) THEN st_reduceprecision(st_transform(st_buffer(st_transform(geometry, 31370), 20::double precision), 4326), 0.000001::double precision)
-  ELSE geometry
-  END AS geometry_pg
-FROM transformation.hospitals;
-","
-GRANT ALL ON TABLE fdw.fdw_hospitals TO paragon;
-")
-
-fdw_views_hospital_helipads_sql <- c("
-DROP VIEW IF EXISTS fdw.fdw_hospital_helipads CASCADE;
-","
-CREATE OR REPLACE VIEW fdw.fdw_hospital_helipads
-AS
-SELECT id,
-row_number() OVER () AS gid,
-original_id,
-name,
-legend_item,
-NULL::uuid as best_address_id,
-NULL::uuid as capakey_id,
-data_list_id,
-risk_level,
-properties,
-properties_secondary,
-imported_at,
-tags,
-deleted_at,
-updated_at,
-created_at,
-created_by,
-updated_by,
-st_reduceprecision(geometry, 0.000001::double precision) AS geometry,
-st_reduceprecision(st_pointonsurface(geometry), 0.000001::double precision) AS geometry_pt,
-CASE
-  WHEN st_geometrytype(geometry) = ANY (ARRAY['ST_Point'::text, 'ST_LineString'::text]) THEN st_reduceprecision(st_transform(st_buffer(st_transform(geometry, 31370), 20::double precision), 4326), 0.000001::double precision)
-  ELSE geometry
-  END AS geometry_pg
-FROM transformation.hospital_helipads;
-","
-GRANT ALL ON TABLE fdw.fdw_hospital_helipads TO paragon;")
-
-
-fdw_views_emergency_sql <- c("
-DROP VIEW IF EXISTS fdw.fdw_hospital_emergency CASCADE;
-","
-CREATE OR REPLACE VIEW fdw.fdw_hospital_emergency
-AS
-SELECT id,
-row_number() OVER () AS gid,
-original_id,
-name,
-legend_item,
-NULL::uuid as best_address_id,
-NULL::uuid as capakey_id,
-data_list_id,
-risk_level,
-properties,
-properties_secondary,
-imported_at,
-tags,
-deleted_at,
-updated_at,
-created_at,
-created_by,
-updated_by,
-st_reduceprecision(geometry, 0.000001::double precision) AS geometry,
-st_reduceprecision(st_pointonsurface(geometry), 0.000001::double precision) AS geometry_pt,
-CASE
-  WHEN st_geometrytype(geometry) = ANY (ARRAY['ST_Point'::text, 'ST_LineString'::text]) THEN st_reduceprecision(st_transform(st_buffer(st_transform(geometry, 31370), 20::double precision), 4326), 0.000001::double precision)
-  ELSE geometry
-  END AS geometry_pg
-FROM transformation.hospital_emergency;
-","
-GRANT ALL ON TABLE fdw.fdw_hospital_emergency TO paragon;")
 
 
 # LOAD ----
@@ -703,19 +665,16 @@ create_ingestion_table_emergencies <- function() {execute_sql_commands(ingestion
 create_transformation_table_hospitals <- function() {execute_sql_commands(transformation_table_hospitals_sql, "Hospital Transformation table")}
 create_transformation_table_helipads <- function() {execute_sql_commands(transformation_table_helipads_sql, "Helipad Transformation table")}
 create_transformation_table_emergencies <- function() {execute_sql_commands(transformation_table_emergency_sql, "Emergency Transformation table")}
-create_fdw_views_hospitals <- function() {execute_sql_commands(fdw_views_hospitals_sql, "Hospital FDW view")}
-create_fdw_views_helipads <- function() {execute_sql_commands(fdw_views_hospital_helipads_sql, "Helipad FDW view")}
-create_fdw_views_emergencies <- function() {execute_sql_commands(fdw_views_emergency_sql, "Emergency FDW view")}
 
-# set to TRUE if you want to update the transformation table even if the checks fail. 
-update_even_if_checks_fail<-FALSE
-# Don't forget to also set checks_failed<-0 if there were already some issues in the base data
 
+
+# Main function -----------------------------------------------------------
+# """"""""""""""""""""----
 
 run_smart_update = function() {
-  smart_update_process("hospitals", 50, 200, 100, format(Sys.Date(), "%Y-%m-%d"), update_even_if_checks_fail)
-  smart_update_process("hospital_helipads", 50, 100, 50, format(Sys.Date(), "%Y-%m-%d"), update_even_if_checks_fail)
-  smart_update_process("hospital_emergency", 50, 100, 50, format(Sys.Date(), "%Y-%m-%d"), update_even_if_checks_fail)
+  smart_update_process("hospitals", 50, 200, 100, format(Sys.Date(), "%Y-%m-%d"), allow_update_even_if_checks_fail=overrule_checks, dry_run=do_dry_run,reuse_ingestion_data=reuse_ingestion_data)
+  smart_update_process("hospital_helipads", 50, 100, 50, format(Sys.Date(), "%Y-%m-%d"), allow_update_even_if_checks_fail=overrule_checks, dry_run=do_dry_run,reuse_ingestion_data=reuse_ingestion_data)
+  smart_update_process("hospital_emergency", 50, 100, 50, format(Sys.Date(), "%Y-%m-%d"), allow_update_even_if_checks_fail=overrule_checks, dry_run=do_dry_run,reuse_ingestion_data=reuse_ingestion_data)
 }
 
 
@@ -724,28 +683,22 @@ run_smart_update = function() {
 # """"""""""""""""""""----
 
 main_function = function() {
-  CreateImportTable(dataset = osm_all, schema = "raw_data", table_name = "osm_hospitals")
-  CreateImportTable(dataset = osm_helipad, schema = "raw_data", table_name = "osm_helipad")
-  CreateImportTable(dataset = osm_emergency_entrance, schema = "raw_data", table_name = "osm_emergency_entrance")
-  create_ingestion_table_hospitals()
-  create_ingestion_table_helipads()
-  create_ingestion_table_emergencies()
+  if (!reuse_ingestion_data) {
+    process_fresh_data()
+    CreateImportTable(dataset = osm_all, schema = "raw_data", table_name = "osm_hospitals")
+    CreateImportTable(dataset = osm_helipad, schema = "raw_data", table_name = "osm_helipad")
+    CreateImportTable(dataset = osm_emergency_entrance, schema = "raw_data", table_name = "osm_emergency_entrance")
+    create_ingestion_table_hospitals()
+    create_ingestion_table_helipads()
+    create_ingestion_table_emergencies()
+  }
   run_smart_update()
-  #create_transformation_table_hospitals()
-  #create_transformation_table_helipads()
-  #create_transformation_table_emergencies()
-  #create_fdw_views_hospitals()
-  #create_fdw_views_helipads()
-  #create_fdw_views_emergencies()
 }
 
 
-if(F){
+if(run_status){
   main_function()
 }
-
-
-
 
 
 

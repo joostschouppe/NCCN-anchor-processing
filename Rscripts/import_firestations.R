@@ -123,15 +123,38 @@ datatypes <- c("points", "mpolygon")
 
 ### Actual OSM download & transformation ----
 
+
 tryCatch({
   # Call the large function
-  osm_all<-download_osm_process(features_list, datatypes, extra_columns, alternative_overpass_server)
+  osm_all<-download_osm_process(features_list, datatypes, extra_columns, alternative_overpass_server, keep_region=TRUE)
   print("OSM data downloaded & processes succesfully")
 }, error = function(e) {
   # Print error message
   print(paste("Something went wrong:", e$message))
 })
 
+
+# Test the quality: if it is in Belgium, it should have an operator_type, and if it is emergency_zone it should have an operator_wikidata tag
+# mapping guidelines at https://wiki.openstreetmap.org/wiki/WikiProject_Belgium/Firestations
+
+osm_all_problems <- osm_all %>% filter(
+  (is.na(operator_type) & !is.na(language)) |
+    (is.na(operator_wikidata) & operator_type=='emergency_zone' & !is.na(language))
+)
+
+# if osm_all_problems has records, save them to log as geojson
+if (nrow(osm_all_problems)>0){
+  filename_visualization<-paste0(log_folder,"fire_station_problems", format(Sys.time(), "%Y%m%d_%H%M%S"), ".geojson")
+  st_write(osm_all_problems, filename_visualization, driver = "GeoJSON")
+  print(paste0("OSM data issues need to be fixed first, check them at ", filename_visualization))
+} else {
+  print("OSM data quality check passed")
+}
+
+# add a stop if there are problems
+if (nrow(osm_all_problems)>0){
+  stop("OSM data quality check failed")
+}
 
 
 
@@ -216,25 +239,17 @@ jsonb_build_object(
 	ELSE 'caserne de pompiers (pas d''une zone de secours)' END,
 	'ger', CASE WHEN operator_type='emergency_zone' THEN 'Feuerwachen'
 	ELSE 'Feuerwachen (nicht von Hilfeleistungszone)' END) as legend_item,
-CASE WHEN short_name IS NULL AND official_name IS NULL AND alt_name IS NULL AND old_name IS NULL THEN NULL 
-	ELSE CONCAT_WS('; ',short_name, official_name, alt_name, old_name) END AS other_names,
+NULLIF(CONCAT_WS('; ',short_name, official_name, alt_name, old_name), '') AS other_names,
 CASE WHEN addr_street IS NULL THEN NULL 
 	ELSE LTRIM(CONCAT(addr_street, ' ' || CASE WHEN nohousenumber='yes' THEN 'w/n' ELSE addr_housenumber END, ', ' || CONCAT((addr_postcode || ' '), addr_city))) END
 	AS address,
-CASE WHEN fire_station_type IS NULL AND mergewiki.fire_station_type_fr IS NULL THEN NULL
-	ELSE CONCAT_WS('; ',fire_station_type, mergewiki.fire_station_type_fr) END AS firestation_type,
-CASE WHEN contact_email IS NULL AND email IS NULL THEN NULL
-	ELSE CONCAT_WS('; ',contact_email, email) END AS local_email,
-CASE WHEN operator_email IS NULL AND w_email IS NULL THEN NULL 
-  ELSE CONCAT_WS('; ',operator_email, w_email) END AS operator_email,
-CASE WHEN contact_mobile IS NULL AND mobile IS NULL AND contact_phone IS NULL AND phone IS NULL AND phone_2 IS NULL THEN NULL
-	ELSE CONCAT_WS('; ',contact_mobile, mobile, contact_phone, phone, phone_2) END AS local_phone,
-CASE WHEN operator_phone IS NULL AND w_phone IS NULL THEN NULL
-  ELSE CONCAT_WS('; ',operator_phone, w_phone) END AS operator_phone,
-CASE WHEN website IS NULL AND contact_website IS NULL THEN NULL
-	ELSE CONCAT_WS('; ',website, contact_website) END AS local_website,
-CASE WHEN operator_website IS NULL AND w_website IS NULL THEN NULL
-	ELSE CONCAT_WS('; ',operator_website, w_website) END AS operator_website,
+NULLIF(CONCAT_WS('; ',fire_station_type, mergewiki.fire_station_type_fr), '') AS firestation_type,
+NULLIF(CONCAT_WS('; ',contact_email, email), '') AS email,
+NULLIF(CONCAT_WS('; ',operator_email, w_email), '') AS operator_email,
+NULLIF(CONCAT_WS('; ',contact_mobile, mobile, contact_phone, phone, phone_2), '') AS phone,
+NULLIF(CONCAT_WS('; ',operator_phone, w_phone), '') AS operator_phone,
+NULLIF(CONCAT_WS('; ',website, contact_website), '') AS website,
+NULLIF(CONCAT_WS('; ',operator_website, w_website), '') AS operator_website,
 operator_wikidata, operator, operator_type, emergency, image, geometry
 FROM mergewiki)
 
@@ -251,10 +266,10 @@ JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
 	'other_names', other_names,
 	'address', address,
 	'firestation_type', firestation_type,
-	'local_email',local_email,
-	'local_phone',local_phone,
+	'email',email,
+	'phone',phone,
 	'operator_phone',operator_phone,
-	'local_website',local_website,
+	'website',website,
 	'operator_website',operator_website,
 	'operator_wikidata',operator_wikidata,
 	'operator',operator,
@@ -306,40 +321,6 @@ SELECT original_id, name, legend_item, data_list_id::uuid, risk_level, propertie
 ")
 
 
-### Create fdw views ----
-fdw_views_sql <- c("
-CREATE OR REPLACE VIEW fdw.fdw_firestations
-AS
-SELECT id,
-original_id,
-name,
-legend_item,
-NULL::uuid as best_address_id,
-NULL::uuid as capakey_id,
-data_list_id,
-risk_level,
-properties,
-properties_secondary,
-imported_at,
-tags,
-deleted_at,
-updated_at,
-created_at,
-created_by,
-updated_by,
-geometry,
-st_pointonsurface(geometry) AS geometry_pt
-FROM transformation.firestations;
-","
-ALTER TABLE fdw.fdw_firestations
-OWNER TO paragon;
-","
-GRANT SELECT ON TABLE fdw.fdw_firestations TO fdw4dev;
-","
-GRANT ALL ON TABLE fdw.fdw_firestations TO paragon;
-")
-
-
 
 
 
@@ -350,7 +331,6 @@ GRANT ALL ON TABLE fdw.fdw_firestations TO paragon;
 
 create_ingestion_table <- function() {execute_sql_commands(ingestion_table_sql, "Ingestion table")}
 create_transformation_table <- function() {execute_sql_commands(transformation_table_sql, "Transformation table")}
-create_fdw_views <- function() {execute_sql_commands(fdw_views_sql, "FDW view")}
 
 
 
@@ -361,11 +341,11 @@ create_fdw_views <- function() {execute_sql_commands(fdw_views_sql, "FDW view")}
 
 
 # set to TRUE if you want to update the transformation table even if the checks fail. 
-update_even_if_checks_fail<-FALSE
+update_even_if_checks_fail<-TRUE
 # Don't forget to also set checks_failed<-0 if there were already some issues in the base data
 
 run_smart_update = function() {
-  smart_update_process("firestations", 50, 250, 50, format(Sys.Date(), "%Y-%m-%d"), update_even_if_checks_fail)
+  smart_update_process("firestations", 75, 250, 50, format(Sys.Date(), "%Y-%m-%d"), update_even_if_checks_fail)
 }
 
 

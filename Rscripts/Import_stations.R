@@ -61,7 +61,7 @@ library(osmdata)
 ### OSM DOWNLOAD PARAMETERS ----
 
 # Define the list of features
-features_list <- list("railway" = "station")
+features_list <- list("railway" = "station", "railway"="halt")
 # If default server fails, set to TRUE to use mail.ru server (older data)
 alternative_overpass_server<-FALSE
 # Define extra tags to use as columns for properties
@@ -75,14 +75,12 @@ datatypes <- c("points", "mpolygon")
 ### Actual OSM download & transformation ----
 tryCatch({
   # Call the large function
-  osm_all<-download_osm_process(features_list, datatypes, extra_columns, alternative_overpass_server)
+  osm_all<-download_osm_process(features_list, datatypes, extra_columns, alternative_overpass_server,postgres=TRUE)
   print("OSM data downloaded & processes succesfully")
 }, error = function(e) {
   # Print error message
   print(paste("Something went wrong:", e$message))
 })
-
-
 
 
 
@@ -231,50 +229,13 @@ SELECT id, original_id, name, legend_item, data_list_id::uuid, properties, geome
 ")
                             
 
-### Create fdw views ----
-fdw_views_sql <- c("
-DROP VIEW IF EXISTS fdw.fdw_stations CASCADE;
-","
-CREATE OR REPLACE VIEW fdw.fdw_stations
-AS
-SELECT id,
-original_id,
-name,
-legend_item,
-NULL::uuid as best_address_id,
-NULL::uuid as capakey_id,
-data_list_id,
-risk_level,
-properties,
-properties_secondary,
-imported_at,
-tags,
-deleted_at,
-updated_at,
-created_at,
-created_by,
-updated_by,
-geometry,
-st_pointonsurface(geometry) AS geometry_pt
-FROM transformation.stations;
-","
-ALTER TABLE fdw.fdw_stations
-OWNER TO paragon;
-","
-GRANT SELECT ON TABLE fdw.fdw_stations TO fdw4dev;
-","
-GRANT ALL ON TABLE fdw.fdw_stations TO paragon;
-")
 
 
                 
                             
 ### Execute the SQL commands ----
-
-
 create_ingestion_table <- function() {execute_sql_commands(ingestion_table_sql, "Ingestion table")}
 create_transformation_table <- function() {execute_sql_commands(transformation_table_sql, "Transformation table")}
-create_fdw_views <- function() {execute_sql_commands(fdw_views_sql, "FDW view")}
 
 
 
