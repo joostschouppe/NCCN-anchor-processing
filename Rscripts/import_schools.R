@@ -11,42 +11,44 @@
 ##
 ## ---------------------------
 
-# DONE
-## add status reports in the SQL commands
-## take in account landuse=education!
-## expand Flemish data to not-quite-schools
-## integrate more OSM attributes
-## add risk level
-## add school type
-## take names in account when assigning official schools to osm geometries
-## added name_1==name_2 | name_1==as.character(other_names) (to be added in VLA and BRWA?)except where name was empty
-## added clean_string in VLA and BRWA
-## add official id to properties if the original_id is an osm_id
-## upload ingestion
-
-# TODO: 
-## integrate update transformation
-
-
 
 # Load variables -----------------------------------------------------------
 #  """""""""""""""""" ----------------------
 
-readRenviron("C:/projects/pgn-data-airflow/.Renviron")
+
+#readRenviron("C:/projects/pgn-data-airflow/.Renviron")
 
 db_host_name <- Sys.getenv("POSTGRES_HOST_NAME")
 postgres_user <- Sys.getenv("POSTGRES_USER")
 postgres_password <- Sys.getenv("POSTGRES_PASSWORD")
 db_name<- Sys.getenv("POSTGRES_DB_NAME_CURATED")
 
-#data_list_id<-"cannot be added centrally, since several items are processed"
-log_folder <- "C:/temp/logs/"
 
-### Load external functions ------
+# run status
+run_status<-Sys.getenv("RUN_STATUS")
+## this is set to false and prevents any accidental changes to the database by switching off the main_function(). On Airflow, this is set to true.
+run_status<-ifelse(tolower(run_status) == "true", TRUE, FALSE)
 
-rscript_folder <- "C:/projects/pgn-data-airflow/rscripts/"
-source(paste0(rscript_folder,"utils_updated_check_protoanchors.R"))
-source(paste0(rscript_folder,"utils.R"))
+# overrule the checks
+overrule_checks<-Sys.getenv("OVERRULE_CHECKS")
+## Set to FALSE by default. That means we do not update the anchors if some tests fail. Those tests include "the data has grown or shrunk by a lot of objects". If, after review of the log, you decide that nothing is wrong, set this manually to TRUE.
+# If the input is not correctly understood as boolean, this will force it to it.
+overrule_checks<-ifelse(tolower(overrule_checks) == "true", TRUE, FALSE)
+
+# Do not run the main part of the processing, but just do an update based on the ingestion table already in the dbase
+reuse_ingestion_data<-Sys.getenv("REUSE_INGESTION_DATA")
+reuse_ingestion_data<-ifelse(tolower(reuse_ingestion_data) == "true", TRUE, FALSE)
+
+# Only run the comparison script & update the ingestion table, but do not attempt to update the transformation table
+do_dry_run<-Sys.getenv("DO_DRY_RUN")
+do_dry_run<-ifelse(tolower(do_dry_run) == "true", TRUE, FALSE)
+
+# Set location for files received by email
+offline_storage <-Sys.getenv("OFFLINE_STORAGE")
+ostbelgien_data <- paste0(offline_storage,"/school/schuladressen.csv")
+
+# Set log folder
+log_folder <- Sys.getenv("RSCRIPT_LOG_FOLDER")
 
 # Set conditions -----------------------------------------------------------
 distance_matched_threshold <- 50
@@ -54,25 +56,17 @@ distance_raw_threshold <- 250
 
 
 
+
+### Load external functions ------
+
+rscript_folder <- Sys.getenv("LOCAL_RSCRIPT_PATH")
+source(paste0(rscript_folder,"/utils_updated_check_protoanchors.R"))
+source(paste0(rscript_folder,"/utils.R"))
+
+
 # Libraries -------------------------------
 # """""""""""""""""" ----------------------
 
-
-library(osmdata)
-library(sf)
-library(httr)
-library(utils)
-library(DBI)
-library(RPostgres)
-library(jsonlite)
-library(dplyr)
-library(tidyr)
-
-
-# extra for geocoding
-library(phacochr)
-phaco_setup_data()
-phacochr::phaco_best_data_update()
 
 # to remove the é etc special characters
 library(stringi)
@@ -80,10 +74,7 @@ library(stringi)
 # to find the longest common string
 library(PTXQC)
 
-# for the str_extract_all function
-#library(stringr)
 
-library(purrr)
 
 # Local functions
 clean_string <- function(x) {
@@ -103,40 +94,57 @@ clean_string <- function(x) {
 DownloadFlanders <- function(){
   tryCatch({
   print("Start download Flanders")
-rep_vl0 <- GET("https://geo.api.vlaanderen.be/POI/wfs?service=WFS&version=2.0.0&request=GetFeature&typeNames=POI&outputFormat=application/json&CQL_FILTER=CATEGORIE=%20%27Basisonderwijs%27")
-rep_vl0 <- jsonlite::fromJSON(rawToChar(rep_vl0$content))$features
+    
+    
+    # Define the base WFS URL
+    wfs_url <- "https://geo.api.vlaanderen.be/POI/wfs"
+    
+    # Build the request URL
+    build_request_url <- function(start_index) {
+      url <- parse_url(wfs_url)
+      url$query <- list(
+        service = "wfs",
+        request = "GetFeature",
+        typename = "POI",
+        srsName = "EPSG:31370",
+        startIndex = start_index,
+        maxFeatures = 10000,
+        outputFormat = "application/json",
+        CQL_FILTER = "CATEGORIE IN ('Basisonderwijs','Hoger onderwijs','Secundair onderwijs','Deeltijds kunstonderwijs')"
+      )
+      return(build_url(url))
+    }
+    
+    # Initialize variables
+    all_features <- list()
+    start_index <- 0
+    batch_size <- 10000
+    has_more_features <- TRUE
+    
+    # Loop to fetch data in batches
+    while (has_more_features) {
+      # Build the request URL for the current batch
+      request_url <- build_request_url(start_index)
+      
+      # Fetch the data
+      batch <- read_sf(request_url)
+      
+      # Check if there are no more features to fetch
+      if (nrow(batch) == 0) {
+        has_more_features <- FALSE
+      } else {
+        # Append the fetched features to the list
+        all_features <- append(all_features, list(batch))
+        # Increment the start index for the next batch
+        start_index <- start_index + batch_size
+      }
+    }
+    
+    # Combine all fetched features into a single data frame
+    geojson_vl <- do.call(rbind, all_features) 
 
-rep_vl1 <- GET("https://geo.api.vlaanderen.be/POI/wfs?service=WFS&version=2.0.0&request=GetFeature&typeNames=POI&outputFormat=application/json&CQL_FILTER=CATEGORIE=%20%27Hoger%20onderwijs%27")
-rep_vl1 <- jsonlite::fromJSON(rawToChar(rep_vl1$content))$features
-
-rep_vl2 <- GET("https://geo.api.vlaanderen.be/POI/wfs?service=WFS&version=2.0.0&request=GetFeature&typeNames=POI&outputFormat=application/json&CQL_FILTER=CATEGORIE=%20%27Secundair%20onderwijs%27")
-rep_vl2 <- jsonlite::fromJSON(rawToChar(rep_vl2$content))$features
-
-rep_vl3 <- GET("https://geo.api.vlaanderen.be/POI/wfs?service=WFS&version=2.0.0&request=GetFeature&typeNames=POI&outputFormat=application/json&CQL_FILTER=CATEGORIE=%20%27Deeltijds%20kunstonderwijs%27")
-rep_vl3 <- jsonlite::fromJSON(rawToChar(rep_vl3$content))$features
-
-
-
-## create dataframes for the attributes (properties) and the geometry
-vl0_props <- rep_vl0$properties
-vl0_geo <- rep_vl0$geometry
-vl1_props <- rep_vl1$properties
-vl1_geo <- rep_vl1$geometry
-vl2_props <- rep_vl2$properties
-vl2_geo <- rep_vl2$geometry
-vl3_props <- rep_vl3$properties
-vl3_geo <- rep_vl3$geometry
-
-## merge the properties and merge the geographies
-geojson_vl <- rbind(vl0_props,vl1_props,vl2_props,vl3_props)
-geo <- rbind(vl0_geo,vl1_geo,vl2_geo,vl3_geo)
-
-## add geometries to the properties
-geojson_vl$x <- sapply(geo$coordinates, "[[", 1)
-geojson_vl$y <- sapply(geo$coordinates, "[[", 2)
-
-## we like our variable names in lowercase
-names(geojson_vl) <- tolower(names(geojson_vl))
+    ## we like our variable names in lowercase
+    names(geojson_vl) <- tolower(names(geojson_vl))
 
 }, error = function(e) {
     print(paste("Error downloading VL:", e))
@@ -151,10 +159,22 @@ return(geojson_vl)
 
 ### French community ----
 
-
 DownloadBRWA <- function(){ 
   tryCatch({
-geojson_brwa <- st_read(httr::GET("https://www.odwb.be/api/explore/v2.1/catalog/datasets/fwb-age-fichier-signaletique-des-etablissements-d-enseignement-de-la-federation-/exports/geojson?lang=nl&timezone=Europe%2FBrussels"))
+geojson_brwa <- st_read(httr::GET("https://www.odwb.be/api/explore/v2.1/catalog/datasets/fwb-age-fichier-signaletique-des-etablissements-d-enseignement-de-la-federation-/exports/geojson?lang=nl&timezone=Europe%2FBrussels"), quiet=TRUE)
+# if column nom_de_etablissement exists, rename to nom_de_l_etablissement
+if("nom_d_etablissement" %in% colnames(geojson_brwa)){
+  geojson_brwa <- geojson_brwa %>% rename(nom_de_l_etablissement = nom_d_etablissement)
+}
+if("ndeg_fase_de_l_etablissement" %in% colnames(geojson_brwa)){
+  geojson_brwa <- geojson_brwa %>% rename(ndegfase_de_l_etablissement = ndeg_fase_de_l_etablissement)
+}
+if("ndeg_fase_de_l_implantation" %in% colnames(geojson_brwa)){
+  geojson_brwa <- geojson_brwa %>% rename(ndegfase_de_l_implantation = ndeg_fase_de_l_implantation)
+}
+
+
+geojson_brwa <- geojson_brwa %>% filter(!is.na(nom_de_l_etablissement))
   }, 
   error = function(e) {
     print(paste("Error downloading BRWA:", e))
@@ -170,7 +190,7 @@ geojson_brwa <- st_read(httr::GET("https://www.odwb.be/api/explore/v2.1/catalog/
 
 DownloadGER <- function(){  
   tryCatch({
-ger <- read.csv("C:/projects/proto-anchors/raw-data/schuladressen.csv", sep=";")
+ger <- read.csv(ostbelgien_data, sep=";")
 #lower case names
 names(ger) <- tolower(names(ger))
   }, 
@@ -187,9 +207,12 @@ return(ger)
 
 # Download OSM data ----
 
+osm_points <- data.frame() 
+osm_mpoly <- data.frame() 
+
 DownloadOSM <- function(){
   tryCatch({
-
+    start_time <- Sys.time()
 ### OSM DOWNLOAD PARAMETERS ----
 
 # Define the list of features
@@ -199,20 +222,17 @@ features_list_3 <- list("amenity" = "kindergarten")
 features_list_4 <- list("landuse" = "education")
 features_list_5 <- list("amenity" = "college")
 
-# If default server fails, set to TRUE to use mail.ru server (older data)
-alternative_overpass_server<-FALSE
 # Define extra tags to use as columns for properties
 extra_columns <- c("amenity","landuse","faculty","grades","isced:level","max_age","min_age","operator:type","pedagogy","religion","school:language","language:nl","language:de","language:fr","school")
 # Choose which datatypes are needed, as a list of datatypes, using any of "points", "lines", "mpolygons" (this is polygons+multipolygons together)
 datatypes <- c("points", "mpolygon")
 
 
-
 ### Actual OSM download & transformation ----
 
 tryCatch({
   # Call the large function
-  osm_1<-download_osm_process(features_list_1, datatypes, extra_columns, alternative_overpass_server, keep_region=TRUE )
+  osm_1<-download_osm_process(features_list_1, datatypes, extra_columns, keep_region=TRUE, postgres=TRUE)
   print("OSM data downloaded & processes succesfully")
 }, error = function(e) {
   # Print error message
@@ -221,7 +241,7 @@ tryCatch({
 
 tryCatch({
   # Call the large function
-  osm_2<-download_osm_process(features_list_2, datatypes, extra_columns, alternative_overpass_server, keep_region=TRUE)
+  osm_2<-download_osm_process(features_list_2, datatypes, extra_columns, keep_region=TRUE, postgres=TRUE)
   print("OSM data downloaded & processes succesfully")
 }, error = function(e) {
   # Print error message
@@ -230,7 +250,7 @@ tryCatch({
 
 tryCatch({
   # Call the large function
-  osm_3<-download_osm_process(features_list_3, datatypes, extra_columns, alternative_overpass_server, keep_region=TRUE)
+  osm_3<-download_osm_process(features_list_3, datatypes, extra_columns, keep_region=TRUE, postgres=TRUE)
   print("OSM data downloaded & processes succesfully")
 }, error = function(e) {
   # Print error message
@@ -239,7 +259,7 @@ tryCatch({
 
 tryCatch({
   # Call the large function
-  osm_4<-download_osm_process(features_list_4, datatypes, extra_columns, alternative_overpass_server, keep_region=TRUE)
+  osm_4<-download_osm_process(features_list_4, datatypes, extra_columns, extra_columns, keep_region=TRUE, postgres=TRUE)
   print("OSM data downloaded & processes succesfully")
 }, error = function(e) {
   # Print error message
@@ -248,7 +268,7 @@ tryCatch({
 
 tryCatch({
   # Call the large function
-  osm_5<-download_osm_process(features_list_5, datatypes, extra_columns, alternative_overpass_server, keep_region=TRUE)
+  osm_5<-download_osm_process(features_list_5, datatypes, extra_columns, extra_columns, keep_region=TRUE, postgres=TRUE)
   print("OSM data downloaded & processes succesfully")
 }, error = function(e) {
   # Print error message
@@ -269,7 +289,6 @@ osm_all <- osm_all %>%
   mutate(isced_level = ifelse((grades=='0-6' & is.na(isced_level)), '0;1', isced_level)) %>%
   mutate(isced_level = ifelse(((grades=='5-13' | grades=='0-12' | grades=='1-8') & is.na(isced_level)), '1;2', isced_level))
 
-# TODO: mutate school:FR tag?
 
 osm_all <- osm_all %>% 
   mutate(type_kindergarten = ifelse((grepl("kindergarten", osm_all$school, ignore.case = TRUE) | amenity=='kindergarten' | grepl("0", osm_all$isced_level, ignore.case = TRUE)), 1, 0),
@@ -286,8 +305,10 @@ osm_points <- osm_points %>% filter(!(is.na(name)))
 osm_points <- osm_points %>% filter(amenity=='university' | amenity=='college' | amenity=='school' | amenity=='kindergarten')
 
 # keep only one case if osm_id has duplicates (unclear how exactly duplicates arise here)
-osm_points <<- osm_points %>% distinct(osm_id, .keep_all = TRUE)
+osm_points <- osm_points %>% distinct(osm_id, .keep_all = TRUE)
 
+# make available outside the function
+osm_points <<- osm_points
 
 # filter polygons from the relevant types
 osm_mpoly <- osm_all %>% filter(st_geometry_type(.) %in% c("POLYGON", "MULTIPOLYGON"))
@@ -295,8 +316,10 @@ osm_mpoly <- osm_all %>% filter(st_geometry_type(.) %in% c("POLYGON", "MULTIPOLY
 osm_mpoly$geometry <- st_cast(osm_mpoly$geometry, "MULTIPOLYGON")
 
 # remove that one part of ugent that is in Korea if it is included
-osm_mpoly <<- osm_mpoly %>% filter(osm_id!='way/384532065')
+osm_mpoly <- osm_mpoly %>% filter(osm_id!='way/384532065')
 
+# make available outside the function
+osm_mpoly <<- osm_mpoly
 
 
 # paste the list of columns in osm_points (for visual checking)
@@ -309,231 +332,49 @@ osm_mpoly <<- osm_mpoly %>% filter(osm_id!='way/384532065')
 error = function(e) {
   print(paste("Error downloading OSM:", e))
 })
-  print("Download OSM is done")
+  # status message
+  finish<-Sys.time()
+  total_time <- round(as.numeric(difftime(finish, start_time, units = "secs")), 2)
+  print(paste0("Download of OSM data took ",total_time," seconds)"))
 }
+
 
 
 # Upload to Postgresql ------------------------------
 # """""""""""""""""" ----------------------
 
-
-# Upload VL to PGSQL ----
-
-
-
-CreateImportTableVL<-function(dataset, schema, table_name){
-  if(exists("dataset")){
-    con_pg<-get_con()
-    table_id <- DBI::Id(
-      schema  = schema,
-      table   = table_name
-    )
-    table_id_t <- paste0(schema,".",table_name)
-    start<-Sys.time()
-    print(paste0("Start :",format(Sys.time(), "%a %b %d %X %Y")))
-    print(paste0("Import data into postgresql table ", table_id_t))
-    dbWriteTable(con_pg, table_id, dataset, overwrite = TRUE, row.names = FALSE )
-    
-    print("ID primary key")
-    query <- paste("ALTER TABLE ", table_id_t,
-                   "ADD COLUMN ogc_fid SERIAL;")
-    dbExecute(con_pg, query)
-    query <- paste("ALTER TABLE ", table_id_t,
-              "ADD PRIMARY KEY (ogc_fid);")
-    dbExecute(con_pg, query)
-    
-    print("Column Geom")
-        ## Creation of column geom ------------------------------------------------
-    query <- paste("ALTER TABLE ", table_id_t, "ADD COLUMN geom geometry(Point, 31370);")
-    dbExecute(con_pg, query)
-    print("update geom from lat/long")
-    
-    ## Update geom from lat/lon columns ----------------------------------------
-    query <- paste('UPDATE ', table_id_t,' SET geom = ST_SetSRID(ST_MakePoint("x", "y"), 31370);')
-    dbExecute(con_pg, query)
-
-    ## Close connection --------------------------------------------------------
-    dbDisconnect(con_pg)
-    print(paste0("End :",format(Sys.time(), "%a %b %d %X %Y")))
-    print(Sys.time()-start)
-    
-  }else{
-    print(paste0("Error, the geojson you wanted to import into ", table_id_t, "does not exist, try again"))
-  }
-}
-
-
-
-
-
-
-
-
-# Upload BRWA to PGSQL ----
-
-CreateImportTableBRWA<-function(dataset, schema, table_name){
-  if(exists("dataset")){
-    con_pg<-get_con()
-    table_id <- DBI::Id(
-      schema  = schema,
-      table   = table_name
-    )
-    table_id_t <- paste0(schema,".",table_name)
-    start<-Sys.time()
-    print(paste0("Start :",format(Sys.time(), "%a %b %d %X %Y")))
-    print(paste0("Import data into postgresql table ", table_id_t))
-    dbWriteTable(con_pg, table_id, dataset, overwrite = TRUE, row.names = FALSE )
-    
-    print("ID primary key")
-    query <- paste("ALTER TABLE ", table_id_t,
-                   "ADD COLUMN ogc_fid SERIAL;")
-    dbExecute(con_pg, query)
-    query <- paste("ALTER TABLE ", table_id_t,
-                   "ADD PRIMARY KEY (ogc_fid);")
-    dbExecute(con_pg, query)
-
-    ## Close connection --------------------------------------------------------
-    dbDisconnect(con_pg)
-    print(paste0("End :",format(Sys.time(), "%a %b %d %X %Y")))
-    print(Sys.time()-start)
-    
-  }else{
-    print(paste0("Error, the geojson you wanted to import into ", table_id_t, "does not exist, try again"))
-  }
-}
-
-
-# Upload GER to PGSQL ----
-
-CreateImportTableGER<-function(dataset, schema, table_name){
-  if(exists("dataset")){
-    con_pg<-get_con()
-    table_id <- DBI::Id(
-      schema  = schema,
-      table   = table_name
-    )
-    table_id_t <- paste0(schema,".",table_name)
-    start<-Sys.time()
-    print(paste0("Start :",format(Sys.time(), "%a %b %d %X %Y")))
-    print(paste0("Import data into postgresql table ", table_id_t))
-    dbWriteTable(con_pg, table_id, ger, overwrite = TRUE, row.names = FALSE )
-    
-    print("ID primary key")
-    query <- paste("ALTER TABLE ", table_id_t,
-                   "ADD COLUMN ogc_fid SERIAL;")
-    dbExecute(con_pg, query)
-    query <- paste("ALTER TABLE ", table_id_t,
-                   "ADD PRIMARY KEY (ogc_fid);")
-    dbExecute(con_pg, query)
-    
-    ## Close connection --------------------------------------------------------
-    dbDisconnect(con_pg)
-    print(paste0("End :",format(Sys.time(), "%a %b %d %X %Y")))
-    print(Sys.time()-start)
-    
-  }else{
-    print(paste0("Error, the geojson you wanted to import into ", table_id_t, "does not exist, try again"))
-  }
-}
-
-
-# Upload OSM polygons to PGSQL ----
-
-CreateImportTableOSMpoly<-function(dataset, schema, table_name){
-  if(exists("dataset")){
-    con_pg<-get_con()
-    table_id <- DBI::Id(
-      schema  = schema,
-      table   = table_name
-    )
-    table_id_t <- paste0(schema,".",table_name)
-    start<-Sys.time()
-    print(paste0("Start :",format(Sys.time(), "%a %b %d %X %Y")))
-    print(paste0("Import data into postgresql table ", table_id_t))
-    dbWriteTable(con_pg, table_id, dataset, overwrite = TRUE, row.names = FALSE )
-    
-    print("ID primary key")
-    query <- paste("ALTER TABLE ", table_id_t,
-                   "ADD COLUMN ogc_fid SERIAL;") 
-    dbExecute(con_pg, query)
-    query <- paste("ALTER TABLE ", table_id_t,
-                   "ADD PRIMARY KEY (ogc_fid);")
-    dbExecute(con_pg, query)
-    
-    print("Column Geom")
-    ## Making sure geometry is well defined ------------------------------------------------
-    query <- paste("ALTER TABLE ", table_id_t, "ALTER COLUMN geometry TYPE geometry(MultiPolygon, 4326);")
-    dbExecute(con_pg, query)
-
-    ## Close connection --------------------------------------------------------
-    dbDisconnect(con_pg)
-    print(paste0("End :",format(Sys.time(), "%a %b %d %X %Y")))
-    print(Sys.time()-start)
-    
-  }else{
-    print(paste0("Error, the geojson you wanted to import into ", table_id_t, "does not exist, try again"))
-  }
-}
-
-
-
-# Upload OSM points to PGSQL ----
-
-CreateImportTableOSMpoint<-function(dataset, schema, table_name){
-  if(exists("dataset")){
-    con_pg<-get_con()
-    table_id <- DBI::Id(
-      schema  = schema,
-      table   = table_name
-    )
-    table_id_t <- paste0(schema,".",table_name)
-    start<-Sys.time()
-    print(paste0("Start :",format(Sys.time(), "%a %b %d %X %Y")))
-    print(paste0("Import data into postgresql table ", table_id_t))
-    dbWriteTable(con_pg, table_id, dataset, overwrite = TRUE, row.names = FALSE )
-    
-    print("ID primary key")
-    query <- paste("ALTER TABLE ", table_id_t,
-                   "ADD COLUMN ogc_fid SERIAL;") 
-    dbExecute(con_pg, query)
-    query <- paste("ALTER TABLE ", table_id_t,
-                   "ADD PRIMARY KEY (ogc_fid);")
-    dbExecute(con_pg, query)
-    
-    print("Column Geom")
-    ## Making sure geometry is well defined ------------------------------------------------
-    query <- paste("ALTER TABLE ", table_id_t, "ALTER COLUMN geometry TYPE geometry(Point, 4326);")
-    dbExecute(con_pg, query)
-
-    ## Close connection --------------------------------------------------------
-    dbDisconnect(con_pg)
-    print(paste0("End :",format(Sys.time(), "%a %b %d %X %Y")))
-    print(Sys.time()-start)
-    
-  }else{
-    print(paste0("Error, the geojson you wanted to import into ", table_id_t, "does not exist, try again"))
-  }
-}
-
+# this happens at runtime
 
 # Geocoding ----
 
+geocoder <- function(){
+  # geocoding library
+  library(phacochr)
+  phaco_setup_data()
+  phacochr::phaco_best_data_update()
 
-### BRWA ----
 
+### BRWA subfunction ----
 
 GeocodeAndUploadBRWA <-function(){
-brwa_cfwb_odata_schools   <- phaco_geocode(data_to_geocode=t_adresse <- dbGetQuery (con_pg<-get_con(),"SELECT ogc_fid, adresse_de_l_implantation, code_postal_de_l_implantation FROM raw_data.brwa_cfwb_odata_schools") ,colonne_num_rue = "adresse_de_l_implantation",  colonne_code_postal = "code_postal_de_l_implantation")
-sf::st_write(obj = brwa_cfwb_odata_schools[["data_geocoded_sf"]], dsn = con_pg<-get_con(), Id(schema="raw_data", table = "brwa_cfwb_odata_schools_gl"))
+
+  brwa_cfwb_odata_schools   <- phaco_geocode(data_to_geocode=t_adresse <- dbGetQuery (con_pg<-get_con(),"SELECT ogc_fid, adresse_de_l_implantation, code_postal_de_l_implantation FROM raw_data.brwa_cfwb_odata_schools") ,colonne_num_rue = "adresse_de_l_implantation",  colonne_code_postal = "code_postal_de_l_implantation")
+  brwa_cfwb_odata_schools <- brwa_cfwb_odata_schools[["data_geocoded_sf"]]
+  return(brwa_cfwb_odata_schools)
 }
 
 ### German speaking area ----
 
 GeocodeAndUploadGer <-function(){
-ger_dgov_email_schools  <- phaco_geocode(data_to_geocode=t_adresse <- dbGetQuery (con_pg<-get_con(),"SELECT * FROM raw_data.ger_dgov_email_schools ") ,colonne_num_rue = "straße",  colonne_code_postal = "plz.und.ort")
-sf::st_write(obj = ger_dgov_email_schools[["data_geocoded_sf"]], dsn = con_pg<-get_con(), Id(schema="raw_data", table = "ger_dgov_email_schools_g"))
+  ger_dgov_email_schools  <- phaco_geocode(data_to_geocode=t_adresse <- dbGetQuery (con_pg<-get_con(),"SELECT * FROM raw_data.ger_dgov_email_schools ") ,colonne_num_rue = "straße",  colonne_code_postal = "plz.und.ort")
+  ger_dgov_email_schools <- ger_dgov_email_schools[["data_geocoded_sf"]]
+  return(ger_dgov_email_schools)
 }
 
+  # Return the list of functions
+  list(GeocodeAndUploadBRWA = GeocodeAndUploadBRWA, GeocodeAndUploadGer = GeocodeAndUploadGer)
+}  # end of geocoder function 
+  
 # Data transformations ----
 
 ### OSM points SQL----
@@ -605,7 +446,11 @@ jsonb_strip_nulls(jsonb_build_object(
     	) AS properties,
     geometry,
 	CURRENT_DATE as created_at
-FROM final_table;"
+FROM final_table;",
+"ALTER TABLE IF EXISTS ingestion.osm_school_point
+  OWNER to pgn_group_data_team_w;",
+"GRANT ALL ON TABLE ingestion.osm_school_point TO pgn_group_data_team_w;",
+"GRANT ALL ON TABLE ingestion.osm_school_point TO pgn_user_airflow;"
 )
 
 
@@ -863,7 +708,11 @@ WHERE source!='point')
   
   " DROP TABLE IF EXISTS tst.osm_school_polygon CASCADE;",
   " ALTER TABLE ingestion.osm_school_polygon
-  DROP COLUMN REGION;")
+  DROP COLUMN REGION;",
+  "ALTER TABLE IF EXISTS ingestion.osm_school_polygon
+  OWNER to pgn_group_data_team_w;",
+  "GRANT ALL ON TABLE ingestion.osm_school_polygon TO pgn_group_data_team_w;",
+  "GRANT ALL ON TABLE ingestion.osm_school_polygon TO pgn_user_airflow;")
 
 
 ### Make OSM polygons available ----
@@ -1526,11 +1375,8 @@ vla <- dbGetQuery(con_pg, "SELECT
 	categorie,
 	link1,
 	link2,
-        ST_AsText(geom) as off_geometry -- is already in Lambert72
+  ST_AsText(geometry) as off_geometry -- is already in Lambert72
 FROM raw_data.vla_depov_poiservice_schools;")
-
-
-
 dbDisconnect(con_pg)
 
 
@@ -2879,56 +2725,15 @@ error = function(e) {
 
 
 
-# Update transformation
-
-
-
-
-### Create fdw views ----
-fdw_views_sql <- c("
-CREATE OR REPLACE VIEW fdw.fdw_schools
-AS
-SELECT id,
-original_id,
-name,
-legend_item,
-NULL as best_address_id,
-NULL as capakey_id,
-data_list_id,
-risk_level,
-properties,
-properties_secondary,
-imported_at,
-tags,
-deleted_at,
-updated_at,
-created_at,
-created_by,
-updated_by,
-geometry,
-st_pointonsurface(geometry) AS geometry_pt
-FROM transformation.schools;
-","
-ALTER TABLE fdw.fdw_schools
-OWNER TO paragon;
-","
-GRANT SELECT ON TABLE fdw.fdw_schools TO fdw4dev;
-","
-GRANT ALL ON TABLE fdw.fdw_schools TO paragon;
-")
-
-
 
 ### Execute the SQL commands ----
 
 
 TransformOSMpoints <- function() {execute_sql_commands(sql_commands_osm_points, "OSM points transformation")}
 TransformOSMpolygons <- function() {execute_sql_commands(sql_commands_osm_polygons, "OSM polygons transformation")}
-create_fdw_views <- function() {execute_sql_commands(fdw_views_sql, "FDW view")}
 
 ### Run the update ----
-# set update_even_if_checks_fail to TRUE if you want to update the transformation table even if the checks fail. 
-update_even_if_checks_fail <- FALSE
+
 # set do_name_comparison or remove to not use name distance
 
 # During the name comparison these words are removed because they have little meaning. Otherwise "gemeentelijke basisschool sint-jan" and "gemeentelijke basisschool sint-pieter" would be considered a pretty close match
@@ -2938,29 +2743,29 @@ to_ignore_in_name <- c("college","instituts","institut","communale","fondamental
 
 
 run_smart_update = function() {
-  smart_update_process("schools", 50, 200, 100, format(Sys.Date(), "%Y-%m-%d"), update_even_if_checks_fail, do_name_comparison=TRUE, ignore_in_name=to_ignore_in_name)
+  smart_update_process("schools", 50, 200, 100, format(Sys.Date(), "%Y-%m-%d"), allow_update_even_if_checks_fail=overrule_checks, do_name_comparison=TRUE, ignore_in_name=to_ignore_in_name, dry_run=do_dry_run,reuse_ingestion_data=reuse_ingestion_data)
 }
-
 
 
 # Main function -----------------------------------------------------------
 # """"""""""""""""""""----
 
-
-
-
 main_function = function() {
+ if (!reuse_ingestion_data) {
   geojson_vl<-DownloadFlanders()
   geojson_brwa<-DownloadBRWA()
   ger<-DownloadGER()
   DownloadOSM()
-  CreateImportTableVL(dataset = geojson_vl, schema = "raw_data", table_name = "vla_depov_poiservice_schools")  
-  CreateImportTableBRWA(dataset = geojson_brwa, schema = "raw_data", table_name = "brwa_cfwb_odata_schools")  
-  CreateImportTableGER(dataset = ger, schema = "raw_data", table_name = "ger_dgov_email_schools")  
-  CreateImportTableOSMpoly(dataset = osm_mpoly, schema = "raw_data", table_name = "osm_school_polygon")  
-  CreateImportTableOSMpoint(dataset = osm_points, schema = "raw_data", table_name = "osm_school_point")  
-  GeocodeAndUploadBRWA()
-  GeocodeAndUploadGer()
+  CreateImportTable(dataset = geojson_vl, schema = "raw_data", table_name = "vla_depov_poiservice_schools")  
+  CreateImportTable(dataset = geojson_brwa, schema = "raw_data", table_name = "brwa_cfwb_odata_schools")  
+  CreateImportTable(dataset = ger, schema = "raw_data", table_name = "ger_dgov_email_schools")  
+  CreateImportTable(dataset = osm_mpoly, schema = "raw_data", table_name = "osm_school_polygon")  
+  CreateImportTable(dataset = osm_points, schema = "raw_data", table_name = "osm_school_point")  
+  geocoding <- geocoder()
+  brwa_cfwb_odata_schools<-geocoding$GeocodeAndUploadBRWA()
+  ger_dgov_email_schools<-geocoding$GeocodeAndUploadGer()
+  CreateImportTable(dataset = brwa_cfwb_odata_schools, schema = "raw_data", table_name = "brwa_cfwb_odata_schools_gl")  
+  CreateImportTable(dataset = ger_dgov_email_schools, schema = "raw_data", table_name = "ger_dgov_email_schools_g")  
   TransformOSMpoints()
   TransformOSMpolygons()
   DownloadProcessedOSMpoly()
@@ -2968,15 +2773,12 @@ main_function = function() {
   TransformVL()
   TransformGER()
   MergeRegions()
+ }
   run_smart_update()
   #create_fdw_views()
 }
 
-
-
-
-
-if(F){
+if(run_status){
   main_function()
 }
 

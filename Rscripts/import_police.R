@@ -12,58 +12,76 @@
 ## ---------------------------
 
 #TODO: TEST police processing: this combo should not be possible data_list_id='c418b715-4e56-4c27-83bf-bd303a779d56' AND original_id!='none provided'
-# https://osm.org/ to osm original_id; keep in account this has to be done manually on the old transformation table to be able to match on unique id!
 
 
 # Load variables -----------------------------------------------------------
 #  """""""""""""""""" ----------------------
 
-readRenviron("C:/projects/pgn-data-airflow/.Renviron")
 
+
+#readRenviron("C:/projects/pgn-data-airflow/.Renviron")
+
+# connection details
 db_host_name <- Sys.getenv("POSTGRES_HOST_NAME")
 postgres_user <- Sys.getenv("POSTGRES_USER")
 postgres_password <- Sys.getenv("POSTGRES_PASSWORD")
 db_name<- Sys.getenv("POSTGRES_DB_NAME_CURATED")
 
-log_folder <- "C:/temp/logs/"
+# run status
+run_status<-Sys.getenv("RUN_STATUS")
+## this is set to false and prevents any accidental changes to the database by switching off the main_function(). On Airflow, this is set to true.
+run_status<-ifelse(tolower(run_status) == "true", TRUE, FALSE)
 
-data_folder <- "C:/projects/proto-anchors/raw-data/police/"
-local_police_data <- "20231017_9833_onthaalpunten Lokale Politie.csv"
+# overrule the checks
+overrule_checks<-Sys.getenv("OVERRULE_CHECKS")
+## Set to FALSE by default. That means we do not update the anchors if some tests fail. Those tests include "the data has grown or shrunk by a lot of objects". If, after review of the log, you decide that nothing is wrong, set this manually to TRUE.
+# If the input is not correctly understood as boolean, this will force it to it.
+overrule_checks<-ifelse(tolower(overrule_checks) == "true", TRUE, FALSE)
+
+# Do not run the main part of the processing, but just do an update based on the ingestion table already in the dbase
+reuse_ingestion_data<-Sys.getenv("REUSE_INGESTION_DATA")
+reuse_ingestion_data<-ifelse(tolower(reuse_ingestion_data) == "true", TRUE, FALSE)
+
+# Only run the comparison script & update the ingestion table, but do not attempt to update the transformation table
+do_dry_run<-Sys.getenv("DO_DRY_RUN")
+do_dry_run<-ifelse(tolower(do_dry_run) == "true", TRUE, FALSE)
+
+# Data list IDs
+data_list_id_osm<-"9223ce7e-9c3e-461c-87b1-94e8aea59a13"
+data_list_id_dri<- "c418b715-4e56-4c27-83bf-bd303a779d56"
+
+
+
+# Set location for files received by email
+offline_storage <-Sys.getenv("OFFLINE_STORAGE")
+data_folder <- paste0(offline_storage,"/police/")
+local_police_data <- "T_ZPZ_Geol_Pseudo_Mercator_20241204_cleaned.csv"
 federal_police_data <- "20231211_PolFed_adresses_principale_secondaires.xlsx"
 
-
+# Set log folder
+log_folder <- Sys.getenv("RSCRIPT_LOG_FOLDER")
 
 ### Load external functions ------
 
-rscript_folder <- "C:/projects/pgn-data-airflow/rscripts/"
-source(paste0(rscript_folder,"utils_updated_check_protoanchors.R"))
-source(paste0(rscript_folder,"utils.R"))
+rscript_folder <- Sys.getenv("LOCAL_RSCRIPT_PATH")
+source(paste0(rscript_folder,"/utils_updated_check_protoanchors.R"))
+source(paste0(rscript_folder,"/utils.R"))
 
 
 
-# Libraries -------------------------------
+# Extra libraries -------------------------------
 # """""""""""""""""" ----------------------
-
-library(sf)
-library(RPostgres)
 
 ## Geocoding libraries
 library(devtools)
 library(phacochr)
-phaco_setup_data()
-phacochr::phaco_best_data_update()
 
-library(DBI)
 
-## Data processing libraries
-library(dplyr)
 
 ## Wikidata library
 library(WikidataQueryServiceR)
 
-## OSM library
-library(osmdata)
-
+# Excel reading
 library(readxl)
 
 
@@ -71,6 +89,15 @@ library(readxl)
 # EXTRACT ----
 # """""""""""""""""" ----
 
+# Function to download fresh data ----
+process_fresh_data <- function(){
+  # Default: download fresh data
+  if (reuse_ingestion_data==FALSE) {
+    
+    # Only load phaco data if we're actually going to use it
+    phaco_setup_data()
+    phacochr::phaco_best_data_update()
+    
 # Open local police data ----
 
 ## Source: Mieke.Louwage@police.belgium.eu; DRI.Business.PoliceAccounting@police.belgium.eu
@@ -84,18 +111,35 @@ names(police_csv) <- tolower(names(police_csv))
 ## add row numbers
 police_csv <- police_csv %>% mutate(row_number = row_number())
 
-## geocode
-geocode_police <- phaco_geocode(data_to_geocode=t_adresse <- police_csv, colonne_rue= "straatnaam", colonne_num="nummer", colonne_code_postal="postcode")
+# derive geometry from x_long and y_lat columns
+police_full <- police_csv %>%
+  mutate(
+    geometry = st_sfc(lapply(seq_along(x_long), function(i) st_point(c(x_long[i], y_lat[i])))),
+    .keep = "all"
+  )
+# set as SF
+police_full <- st_as_sf(police_full, coords = c("x_long", "y_lat"), crs = 3857)
+#  tranform to 31370
+police_full <- st_transform(police_full, 31370)
+police_full <- police_full %>% rename(geometry_official = geometry)
 
-## change geometry column name and add results to all records
-simple_geocode <- geocode_police$data_geocoded_sf[, c("row_number")]
-simple_geocode <- simple_geocode %>% rename(geometry_geocoding = geometry)
-police_full <- left_join(police_csv, simple_geocode, by = "row_number")
-police_full <- st_set_geometry(police_full, "geometry_geocoding")
+# remove cases that are in the official data, but we decided to erase
+police_full <- police_full %>% filter(paragon!="erase")
+
+# rename hoofd..wijkcommissariaat to hoofd_wijkcommissariaat
+police_full <- police_full %>% rename(hoofd_wijkcommissariaat = hoofd..wijkcommissariaat)
+
+# make it available outside the function
+police_full <<- police_full
+
+# check unicity of id_dri
+if (length(unique(police_full$id_dri)) != nrow(police_full)) {
+  stop("id_dri is not unique")
+}
+print("Loaded local police geodata")
 
 
-# Open federal police data
-
+# Open federal police data ----
 ## Source: Humblet Isabelle (DRI) <Isabelle.Humblet@police.belgium.eu> (and DRI)
 
 fedpol_xlsx <- read_excel(paste0(data_folder,federal_police_data))
@@ -126,9 +170,9 @@ geocode_fedpol_bis <- phaco_geocode(data_to_geocode=t_adresse <- fedpol, colonne
 
 ## change geometry column name and add results to all records
 geocode_fedpol <- geocode_fedpol$data_geocoded_sf[, c("row_number")]
-geocode_fedpol <- geocode_fedpol %>% rename(geometry_geocoding = geometry)
+geocode_fedpol <- geocode_fedpol %>% rename(geometry_official = geometry)
 geocode_fedpol_bis <- geocode_fedpol_bis$data_geocoded_sf[, c("row_number")]
-geocode_fedpol_bis <- geocode_fedpol_bis %>% rename(geometry_geocoding = geometry)
+geocode_fedpol_bis <- geocode_fedpol_bis %>% rename(geometry_official = geometry)
 geocode_fedpol <- rbind(geocode_fedpol, geocode_fedpol_bis)
 # remove duplicates
 geocode_fedpol <- geocode_fedpol %>% distinct()
@@ -155,8 +199,10 @@ fedpol$police_users_fr <- as.character(sapply(fedpol$police_users_fr, process_da
 fedpol$ocpkeys <- as.character(sapply(fedpol$ocpkeys, process_data))
 
 # set geometry
-fedpol <- st_set_geometry(fedpol, "geometry_geocoding")
+fedpol <- st_set_geometry(fedpol, "geometry_official")
 
+# make available outside the function
+fedpol <<- fedpol
 
 
 
@@ -197,7 +243,8 @@ zones_cleaned <- zones_cleaned %>%
     website_wikidata = paste(website, collapse = "; ")
   )
 
-
+# make available outside the function
+zones_cleaned <<- zones_cleaned
 
 
 
@@ -208,7 +255,6 @@ features_list <- list("amenity" = "police")
 # If default server fails, set to TRUE to use mail.ru server (older data)
 alternative_overpass_server<-FALSE
 # Define extra tags to use as columns for properties
-# TODO: this doesn't seem to work properly, but it causes no errors 
 extra_columns <- c("police:type")
 # Choose which datatypes are needed, as a list of datatypes, using any of "points", "lines", "mpolygons" (this is polygons+multipolygons together)
 datatypes <- c("points", "mpolygon")
@@ -218,7 +264,7 @@ datatypes <- c("points", "mpolygon")
 
 tryCatch({
   # Call the large function
-  osm_all<-download_osm_process(features_list, datatypes, extra_columns, alternative_overpass_server)
+  osm_all<-download_osm_process(features_list, datatypes, extra_columns, postgres=TRUE)
   print("OSM data downloaded & processes succesfully")
 }, error = function(e) {
   # Print error message
@@ -231,7 +277,7 @@ tryCatch({
 
 # Upload to raw data ----
 # CreateImportTable is loaded via utils and called in the main function
-osm_all_raw<-osm_all
+osm_all_raw<<-osm_all
 
 
 # TRANSFORM ----
@@ -246,13 +292,12 @@ police_all_official <- bind_rows(police_full, fedpol)
 
 
 ## Join wikidata to police data ----
-police_all_official <- left_join(police_all_official, zones_cleaned, by = c("zonenummer"="zoneId"))
+police_all_official <- left_join(police_all_official, zones_cleaned, by = c("po2key"="zoneId"))
 
 
 ### Transform police data to simple features and reproject ----
+
 # Create an sf object from the data frame
-
-
 police_all_official <- st_set_crs(police_all_official, 31370)
 
 # and add row number
@@ -262,11 +307,11 @@ police_all_official <- police_all_official %>% mutate(police_all_row = row_numbe
 ### Split off the unsuccessfully geocoded ----
 
 # Optional: save unsuccessful police stations
-police_no_luck <- police_all_official %>% filter(st_is_empty(police_all_official$geometry))
-write.csv(police_no_luck, file = paste0(data_folder, "no_geocode_all_police.csv"), row.names = FALSE)
+#police_no_luck <- police_all_official %>% filter(st_is_empty(police_all_official$geometry_official))
+#write.csv(police_no_luck, file = paste0(log_folder, "no_geocode_all_police.csv"), row.names = FALSE)
 
 # Filter successfully geocoded police
-police_geocoded <- police_all_official %>% filter(!st_is_empty(police_all_official$geometry))
+police_geocoded <- police_all_official %>% filter(!st_is_empty(police_all_official$geometry_official))
 
 # do spatial join to OSM data
 
@@ -289,7 +334,7 @@ distance <- left_join(join, as.data.frame(osm_geometry), by = "osm_id")
 # Calculate distance between potential matches
 distance <- distance %>%
   rowwise %>%
-  mutate(distance = st_distance(geometry, geometry_geocoding))
+  mutate(distance = st_distance(geometry, geometry_official))
 distance$distance <- as.numeric(distance$distance)
 
 distance <- distance %>%
@@ -318,8 +363,8 @@ distance  <- distance %>%
 
 # use the OSM geometry where available
 distance<-distance %>%
-  mutate(geometry = ifelse(is.na(osm_id), geometry_geocoding, geometry),
-       geometry_geocoding = NULL)
+  mutate(geometry = ifelse(is.na(osm_id), geometry_official, geometry),
+       geometry_official = NULL)
 distance <- st_set_geometry(distance, "geometry")
 
 
@@ -331,25 +376,32 @@ distance <- distance %>%
   select(-`st_as_text(geometry)`)
 
 
-distance <- st_set_crs(distance, 31370)
-distance <- st_transform(distance, crs = 4326)
-
-#distance0 <- distance %>%
-#  select(osm_id,police_all_row,hoofd_wijkcommissariaat , distance, osm_count, name, straatnaam, nummer, gemeente, strtextbd, lplhousenr, lplzip, geometry, #geometry_geocoding)
 
 
 # replace empty with nulls
 replace_empty_with_null <- function(x) {
-  ifelse(x == "", NA, x)
+  ifelse(x == "", NA_character_, x)
 }
 string_columns <- names(distance)[sapply(distance, is.character) & names(distance) != "geometry"]
 distance <- distance %>%
   mutate_at(vars(all_of(string_columns)), ~ replace_empty_with_null(.))
 
 
+# make sure geometry is used in sf way
+distance <- st_as_sf(distance)
+distance <- st_set_crs(distance, 31370)
+distance <<- st_transform(distance, crs = 4326)
+
+
+
 ### Upload semi processed police data ----
 #this happens in the main function
 
+
+  } else {
+    print("No fresh data downloaded because user requested to re-use existing data")
+  }
+}
 
 
 # LOAD ----
@@ -386,7 +438,7 @@ DROP TABLE IF EXISTS ingestion.local_police CASCADE;",
     geometry geometry(geometry, 4326),
     CONSTRAINT police_cleaned_pkey PRIMARY KEY (id)
   );",
-                      "  WITH merge AS (
+  "WITH merge AS (
     SELECT 
     p.ogc_fid as ogc_fid,
     m.fid as m_fid,
@@ -437,27 +489,14 @@ prep AS (
       CASE
       WHEN osm_id IS NULL THEN null
       ELSE name END AS osm_name,
-      CASE
-      WHEN osm_id IS NULL THEN null
-      WHEN contact_email IS NULL AND email IS NULL THEN NULL
-		ELSE CONCAT_WS('; ',contact_email, email) END AS osm_email,
-      CASE
-      WHEN osm_id IS NULL THEN null
-      WHEN CONCAT_WS('; ', phone, contact_phone, contact_mobile, phone_2, mobile) != '' THEN CONCAT_WS('; ', phone, contact_phone, contact_mobile, phone_2, mobile)
-      ELSE NULL END AS osm_phone, 
-      CASE
-      WHEN osm_id IS NULL THEN null
-      WHEN CONCAT_WS('; ', website, contact_website) != '' THEN CONCAT_WS('; ', website, contact_website)
-      ELSE NULL END AS osm_website,
-CASE WHEN short_name IS NULL AND official_name IS NULL AND alt_name IS NULL AND old_name IS NULL THEN NULL 
-	WHEN osm_id IS NOT NULL THEN CONCAT_WS('; ',short_name, official_name, alt_name, old_name) 
-	ELSE NULL END AS osm_other_names,
-CASE WHEN addr_street IS NULL THEN NULL 
-	WHEN osm_id IS NOT NULL THEN LTRIM(CONCAT(addr_street, ' ' || CASE WHEN nohousenumber='yes' THEN 'w/n' ELSE addr_housenumber END, ', ' || addr_postcode, ' ' || addr_city),', ')
-	ELSE NULL END AS osm_address,
-	  CASE
-      WHEN osm_id IS NULL THEN null
-      ELSE opening_hours END AS osm_opening_hours,
+      NULLIF(CONCAT_WS('; ',contact_email, email),'') AS osm_email,
+      NULLIF(CONCAT_WS('; ', phone, contact_phone, contact_mobile, phone_2, mobile),'') AS osm_phone, 
+      NULLIF(CONCAT_WS('; ', website, contact_website),'') AS osm_website,
+	  NULLIF(CONCAT_WS('; ',short_name, official_name, alt_name, old_name),'') AS osm_other_names,
+	CASE WHEN addr_street IS NULL THEN NULL 
+	ELSE LTRIM(CONCAT(addr_street, ' ' || CASE WHEN nohousenumber='yes' THEN 'w/n' ELSE addr_housenumber END, ', ' || CONCAT((addr_postcode || ' '), addr_city))) END
+	AS osm_address,
+	  opening_hours AS osm_opening_hours,
       CASE WHEN zone_name_de IS null and zone_name_fr IS NOT null THEN zone_name_fr
       WHEN zone_name_de IS null and zone_name_fr IS null THEN zone_name_nl
       ELSE zone_name_de END
@@ -480,7 +519,7 @@ CASE WHEN addr_street IS NULL THEN NULL
 	enterprisenr as fedpol_enterprisenr,
 	police_users_nl as fedpol_police_users_nl,
 	police_users_fr as fedpol_police_users_fr,
-	ocpkeys as fedpol_ocpkeys	
+	ocpkeys as fedpol_ocpkeys
       FROM ingestion.police_prep p
       LEFT JOIN merge m ON p.ogc_fid=m.ogc_fid),
 
@@ -500,17 +539,17 @@ as nameund
 from prep)
 
 
-
-  INSERT INTO ingestion.local_police 
-  (original_id, name, legend_item, name_source, properties, properties_secondary, geometry, created_at)
-  SELECT 
-  CASE WHEN source='DRI' THEN 'none provided'
-  ELSE osm_id END as original_id,
+INSERT INTO ingestion.local_police 
+(original_id, name, legend_item, name_source, properties, properties_secondary, geometry, created_at)
+  SELECT
+  CASE WHEN source='DRI' AND id_dri IS NOT NULL THEN id_dri
+  WHEN source='DRI' THEN 'none provided'
+  ELSE 'https://osm.org/' || osm_id END as original_id,
   CASE WHEN source='DRI' THEN 
-  jsonb_build_object('dut', CONCAT(type_post_dut,' ',namedut),
-                     'fre', CONCAT(type_post_fre,' ',namefre),
-                     'ger', CONCAT(type_post_ger,' ',nameger),
-					           'und', CONCAT(type_post_und,' ',nameund))
+  JSONB_STRIP_NULLS(jsonb_build_object('dut', CONCAT(type_post_dut,(' ' || namedut)),
+                     'fre', CONCAT(type_post_fre,(' ' ||namefre)),
+                     'ger', CONCAT(type_post_ger,(' ' ||nameger)),
+					           'und', type_post_und || ' ' || nameund))
        WHEN osm_name IS NULL THEN jsonb_build_object('und', 'police station')
   ELSE jsonb_build_object('und', osm_name) END
   as name,
@@ -520,59 +559,50 @@ from prep)
     'ger', concat(type_post_ger)  
   ) as legend_item,
   source as name_source, 
-  CASE WHEN source='DRI' AND zonenummer IS NOT NULL THEN
+  CASE WHEN source='DRI' AND po2key IS NOT NULL THEN
   JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
-		'address', CONCAT(straatnaam,' ',nummer),
-    	'postcode', postcode,
-    	'municipality', gemeente,
-	  	'zone_name', CONCAT(zone,' (',zonenummer,')')
+		'address', CONCAT(street,' ',house,', ',zip,' ',city),
+	  	'zone_name', CASE WHEN region='Vlaanderen' THEN CONCAT(po2textbd,' (',po2key,')') ELSE CONCAT(po2textbf,' (',po2key,')') END
   		))
   WHEN source='DRI' THEN
   	JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
 		'address', fedpol_address,
 		'police_users_nl', fedpol_police_users_nl,
-	  'police_users_fr', fedpol_police_users_fr,
-	  'ocpkeys', fedpol_ocpkeys))
+	  'police_users_fr', fedpol_police_users_fr))
   ELSE JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
     'website', osm_website,
     'phone', osm_phone,
     'email', osm_email,
-    'opening hours', osm_opening_hours,
+    'opening_hours', osm_opening_hours,
   	'address', osm_address,
   	'other_names', osm_other_names))
   END as properties,
-  CASE WHEN source='OSM' AND zonenummer IS NOT NULL THEN
+  CASE WHEN source='OSM' AND po2key IS NOT NULL THEN
     JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
-		'address', CONCAT(straatnaam,' ',nummer),
-    	'postcode', postcode,
-    	'municipality', gemeente,
-		'zone_name', CONCAT(zone,' (',zonenummer,')'),
-	    'website (via wikidata)', website,
+		'address', CONCAT(street,' ',house,', ',zip,' ',city),
+		'zone_name', CASE WHEN region='Vlaanderen' THEN CONCAT(po2textbd,' (',po2key,')') ELSE CONCAT(po2textbf,' (',po2key,')') END,
+	    'website_via_wikidata', website,
     	'wikidata',  operator_wikidata))
-  WHEN source='OSM' AND zonenummer IS NULL THEN
+  WHEN source='OSM' AND po2key IS NULL THEN
   	JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
       'address', fedpol_address,
 		  'police_users_nl', fedpol_police_users_nl,
 	    'police_users_fr', fedpol_police_users_fr,
-	    'ocpkeys', fedpol_ocpkeys,
 	    'website (via wikidata)', website,
       'wikidata',  operator_wikidata))
   ELSE JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
     'website', osm_website,
     'phone', osm_phone,
     'email', osm_email,
-	'opening hours', osm_opening_hours,
+	'opening_hours', osm_opening_hours,
   	'address', osm_address,
   	'other_names', osm_other_names,
-    'website (via wikidata)', website,
+    'website_via_wikidata', website,
     'wikidata',  operator_wikidata))
   END as properties_secondary,
---  CASE WHEN source='DRI' THEN 'data delivered by DRI.Business.PoliceAccounting at police.belgium.eu>'
---  ELSE CONCAT('https://osm.org/',osm_final_id) END AS metadata,  
   geometry AS geometry,
   CURRENT_DATE as created_at
-  FROM prep2;
-")
+  FROM prep2")
 
 
 
@@ -608,7 +638,7 @@ sql_osm <- c(
                from raw_data.osm_police),
 
 name_cleaned AS (
-SELECT *, 
+SELECT *, 'https://osm.org/' || osm_id as osm_id_full,
 	CASE WHEN name IS NOT null THEN name
   		 WHEN addr_city IS NOT null THEN addr_city
 		 ELSE 'police station' END as name_clean
@@ -618,28 +648,19 @@ from osm)
 -- left join on OSM id to find the stations already used as local police geometry (we keep the ones that cannot be found in the police table)
 INSERT INTO ingestion.police_osm (original_id, name, legend_item, name_source, properties, geometry, created_at)
   SELECT 
-  o.osm_id AS original_id,
+  o.osm_id_full AS original_id,
   JSONB_BUILD_OBJECT('und', o.name_clean)
    as name,
   JSONB_BUILD_OBJECT('und', 'police station') as legend_item,
   o.source as name_source,
   JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
-	  'other_names', CASE WHEN short_name IS NULL AND official_name IS NULL AND alt_name IS NULL AND old_name IS NULL THEN NULL 
-						ELSE CONCAT_WS('; ',short_name, official_name, alt_name, old_name) END,
+	  'other_names', NULLIF(CONCAT_WS('; ',short_name, official_name, alt_name, old_name),''),
 	  'address', CASE WHEN addr_street IS NULL THEN NULL 
 		ELSE LTRIM(CONCAT(addr_street, ' ' || CASE WHEN nohousenumber='yes' THEN 'w/n' ELSE addr_housenumber END, ', ' || CONCAT((addr_postcode || ' '), addr_city))) END,
-	  'website', 
-    CASE WHEN CONCAT_WS('; ', o.website, o.contact_website)='' THEN NULL 
-    ELSE CONCAT_WS('; ', o.website, o.contact_website) END,
-    'email', 
-       CASE WHEN CONCAT_WS('; ', o.email, o.contact_email) ='' THEN NULL
-       ELSE CONCAT_WS('; ', o.email, o.contact_email) END,
-    'phone', 
-       CASE WHEN CONCAT_WS('; ', o.phone, o.contact_phone, o.mobile, o.contact_mobile, o.phone_2) ='' THEN NULL
-       ELSE CONCAT_WS('; ', o.phone, o.contact_phone, o.mobile, o.contact_mobile, o.phone_2) END,
-    'wikidata', 
-       CASE WHEN CONCAT_WS('; ', o.wikidata, o.operator_wikidata) ='' THEN NULL
-       ELSE CONCAT_WS('; ', o.wikidata, o.operator_wikidata) END,
+	  'website', NULLIF(CONCAT_WS('; ', o.website, o.contact_website),''),
+    'email', NULLIF(CONCAT_WS('; ', o.email, o.contact_email),''),
+    'phone', NULLIF(CONCAT_WS('; ', o.phone, o.contact_phone, o.mobile, o.contact_mobile, o.phone_2),''),
+    'wikidata', NULLIF(CONCAT_WS('; ', o.wikidata, o.operator_wikidata),''),
     'quality_remark',
        CASE WHEN o.operator_wikidata is not NULL OR EXTRACT(YEAR FROM CURRENT_DATE)-CAST(LEFT(o.check_date, 4) AS NUMERIC)<3 THEN 'not found in official sources but high confidence'
        ELSE 'not found in official sources' END
@@ -648,7 +669,7 @@ INSERT INTO ingestion.police_osm (original_id, name, legend_item, name_source, p
   o.geometry as geometry,
   CURRENT_DATE as created_at
   FROM name_cleaned o
-  LEFT JOIN ingestion.local_police p ON o.osm_id = p.original_id
+  LEFT JOIN ingestion.local_police p ON o.osm_id_full = p.original_id
   WHERE p.name_source IS null;
 ")
 
@@ -678,7 +699,7 @@ sql_merge <- c(
   geometry geometry(geometry, 4326),
   CONSTRAINT ing_police_pkey PRIMARY KEY (id)
 );",
-  "  
+paste0("  
 
 WITH merge AS 
 (SELECT * FROM ingestion.local_police
@@ -686,8 +707,8 @@ WITH merge AS
   SELECT * FROM ingestion.police_osm),
 
 alldata AS (SELECT *, 
-CASE WHEN name_source='OSM' THEN '9223ce7e-9c3e-461c-87b1-94e8aea59a13'
-ELSE 'c418b715-4e56-4c27-83bf-bd303a779d56' END as data_list_id 
+CASE WHEN name_source='OSM' THEN '",data_list_id_osm,"'
+ELSE '",data_list_id_dri,"' END as data_list_id 
 FROM merge)
   
 
@@ -696,16 +717,16 @@ select id, original_id, name, legend_item,
 data_list_id::uuid,
 0 as risk_level, properties, 
 CASE WHEN name_source='OSM' AND properties_secondary <> '{}' THEN 
-jsonb_build_object('c418b715-4e56-4c27-83bf-bd303a779d56', properties_secondary)
+jsonb_build_object('",data_list_id_dri,"', properties_secondary)
 WHEN name_source='DRI' AND properties_secondary <> '{}' THEN 
-jsonb_build_object('9223ce7e-9c3e-461c-87b1-94e8aea59a13', properties_secondary)
+jsonb_build_object('",data_list_id_osm,"', properties_secondary)
 ELSE properties_secondary
 END AS properties_secondary,	
 geometry as geometry,
 created_at as created_at
 FROM alldata
 WHERE geometry IS NOT NULL;
-","
+"),"
 --add this if you want to be able to easily test the data in QGIS
 --DROP TABLE IF EXISTS tst.transf_police CASCADE;
 ","
@@ -725,19 +746,9 @@ TransformLocalPolice <- function() {execute_sql_commands(sql_local_police, "Offi
 TransformOSM <- function() {execute_sql_commands(sql_osm, "OSM police data transformation")}
 TransformMergeAll <- function() {execute_sql_commands(sql_merge, "Merge police data")}
 
-
-
-
-
-# set to TRUE if you want to update the transformation table even if the checks fail. 
-update_even_if_checks_fail<-FALSE
-# Don't forget to also set checks_failed<-0 if there were already some issues in the base data
-
-# set to TRUE if you just want to generate data comparison updates but not actually update the database
-dry_run<-FALSE
-
+#When running manually: use the parameters at the start of the code to change defaults
 run_smart_update = function() {
-  smart_update_process("police", 50, 40, 40, format(Sys.Date(), "%Y-%m-%d"), update_even_if_checks_fail,dry_run)
+  smart_update_process("police", 50, 40, 40, format(Sys.Date(), "%Y-%m-%d"), allow_update_even_if_checks_fail=overrule_checks, dry_run=do_dry_run,reuse_ingestion_data=reuse_ingestion_data)
 }
 
 
@@ -746,37 +757,22 @@ run_smart_update = function() {
 # """"""""""""""""""""----
 
 main_function = function() {
-  CreateImportTable(dataset = police_full, schema = "raw_data", table_name = "fed_dri_police_local_mail")  
-  CreateImportTable(dataset = fedpol, schema = "raw_data", table_name = "fed_dri_police_fed_mail")  
-  CreateImportTable(dataset = osm_all_raw, schema = "raw_data", table_name = "osm_police")  
-  CreateImportTable(dataset = zones_cleaned, schema = "raw_data", table_name = "wikidata_be_local_police")  
-  CreateImportTable(dataset = distance, schema = "ingestion", table_name = "police_prep")  
-  TransformLocalPolice()
-  TransformOSM()
-  TransformMergeAll()
+  if (!reuse_ingestion_data) {
+    process_fresh_data()
+    CreateImportTable(dataset = police_full, schema = "raw_data", table_name = "fed_dri_police_local_mail")  
+    CreateImportTable(dataset = fedpol, schema = "raw_data", table_name = "fed_dri_police_fed_mail")  
+    CreateImportTable(dataset = osm_all_raw, schema = "raw_data", table_name = "osm_police")  
+    CreateImportTable(dataset = zones_cleaned, schema = "raw_data", table_name = "wikidata_be_local_police")  
+    CreateImportTable(dataset = distance, schema = "ingestion", table_name = "police_prep")  
+    TransformLocalPolice()
+    TransformOSM()
+    TransformMergeAll()
+  }
   run_smart_update()
   #create_transformation_table()
-  #create_fdw_views()
 }
 
 
-if(F){
+if(run_status){
   main_function()
 }
-
-
-
-
-# TODO - Processing for OSM improvement (pending DRI permission) ----
-# """""""""""""""""" ----
-## under the same conditions, create a suggested update for the OSM object
-
-# Select OSM data that might be wrong 
-## In Belgium, split by language-region so we can pick the right name
-## Not near to a police csv point
-
-## and then the other way around:
-#- if the OSM data can be found in the police CSV, we are sure
-#- if the OSM data is not found, we can use it as risky data
-#- if the police data is found in OSM, we enrich and use the OSM geometry
-#- if the police data is not found in OSM, we simply use it as is

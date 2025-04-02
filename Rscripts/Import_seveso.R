@@ -15,7 +15,7 @@
 # what to do before/while/after the script runs?
 ## update the file locations and the new table and file names!
 ## inform Jonathan that a new table has been created in GISGOV (see upload new data to GISGOV)
-## email Thomas Gijs <thomas.gijs@nccn.fgov.be> and/or Comm <comm@nccn.fgov.be> with Bettina in CC with the excel file created under "save an Excel for Communications"
+## email Comm <comm@nccn.fgov.be> with Bettina in CC with the excel file created under "save an Excel for Communications"
 ## email DRI.Business.PoliceAccounting@police.belgium.eu with a new geo CSV
 
 # note: script assumes sites do not move, but Flanders now does manage the coordinates. To be monitored, especially during smart update!
@@ -25,7 +25,6 @@
 
 
 # todo
-## add a warning/stop as soon as a geocoding is missing.
 ## migrate from csv to a table in curated_dev_playground
 ## build a check to see if the list of used provinces is still what we expect
 ## if allowed, update the excel for the website with this: select(-contact_entreprise,-site_firme) to keep all the relevant info --- Bettina said no, to be continued
@@ -57,7 +56,6 @@
 
 
 # Set parameters ------
-
 readRenviron("C:/projects/pgn-data-airflow/.Renviron")
 local_folder <- "C:/projects/proto-anchors/raw-data/seveso/"
 
@@ -65,15 +63,16 @@ log_folder <- "C:/temp/logs/"
 rscript_folder <- "C:/projects/pgn-data-airflow/rscripts/"
 
 # Update every time!
-xlsx_output_filename <- "seveso_sites_11_24"
-new_table <- "seveso_11_24"
+xlsx_output_filename <- "seveso_sites_03_25"
+new_table <- "seveso_03_25"
 
 # Update if new files received
-fedlink_filename <- "seveso ACR 20241105.xlsx"
-flanders_filename <- "20241105_VlaamsGewest.xlsx"
+fedlink_filename <- "seveso ACR 20250305.xlsx"
+flanders_filename <- "20250305_VlaamsGewest.xlsx"
 flanders_linkfile <- "20240704_Seveso_exploitant-vergunning.xlsx"
 # note: doublecheck for "Seveso status"=0
-wallonia_filename <- "Wallonia_20241031.xlsx"
+# next update, check if changed coordinates in wallonia_20250113_notes.xlsx have been integrated
+wallonia_filename <- "wallonia_20250221.xlsx"
 brussels_filename <- "LIST_20231214_GegevensBedrijven.xlsx"
 
 
@@ -85,19 +84,8 @@ source(paste0(rscript_folder,"utils.R"))
 
 # Library -----------------------------------------------------------------
 # """""""""""""""""" ----------------------
-
-library(sf)
-library(httr)
-library(utils)
-library(DBI)
-library(RPostgres)
-library(jsonlite)
-library(dplyr)
-library(tidyr)
-library(stringr)
-
 library(openxlsx)
-
+# other required libraries loaded via the utils scripts
 
 
 
@@ -108,7 +96,7 @@ library(openxlsx)
 
 db_host_name <- Sys.getenv("POSTGRES_HOST_NAME")
 postgres_user <- Sys.getenv("POSTGRES_USER")
-postgres_password <- Sys.getenv("POSTGRES_PASSWORD")
+postgres_password <- get_azure_access_token()
 db_name<- Sys.getenv("POSTGRES_DB_NAME_CURATED")
 
 get_con<-function(){
@@ -147,15 +135,12 @@ get_con_gg<-function(){
 
 
 
-
 # EXTRACT ----
 # """""""""""""""""" ----------------------
 
 
 # Get current version ----
 
-# !!! IMPORTANT !!!
-# NOTE NOTE NOTE: in the December run, first refresh the MV or download from the 24_11 table instead of the normal table
 con_pg_gg<-get_con_gg()
 seveso0<- dbGetQuery(con_pg_gg, "SELECT id, name, type, street, nr, zip, city, commune, province, region, contact_entreprise, site_firme, emanations, incendie, explosion, ecotoxique, act_all_nl, act_all_fr, act_all_de, act_all_en, x, y, date_inspection FROM seveso.seveso")
 dbDisconnect(con_pg_gg)
@@ -565,6 +550,12 @@ geocode_input <- new_merge %>%
   filter(is.na(x)) %>%
   select(reference,street,nr,zip)
 
+# stop if there are cases
+if(nrow(geocode_input) > 0){
+  stop(nrow(geocode_input)," records have no coordinates", "\n")
+}
+
+
 # do if geocode_input is not empty
 if(nrow(geocode_input) > 0){
   # extra for geocoding
@@ -626,7 +617,14 @@ if(nrow(geocode_input) > 0){
     mutate(
       province = str_to_title(province)
     )
+
+  geocode_input_test <- new_merge %>%
+    filter(is.na(x)) %>%
+    select(reference,street,nr,zip)  
   
+  if(nrow(geocode_input_test) > 0){
+    stop(nrow(geocode_input_test)," records have no coordinates after geocoding", "\n")
+  }
   
 }
 # end conditional geocoding
@@ -800,12 +798,12 @@ excel <- new_merge %>%
   select(id,name,type,street,nr,zip,city,commune,province,region,act_all_nl,act_all_fr,act_all_de,act_all_en,date_inspection)
 excel <- as.data.frame(st_drop_geometry(excel))
 
-write.xlsx(excel, file = paste0(local_folder,xlsx_output_filename,".xlsx"))
+write.xlsx(excel, file = paste0(local_folder,"outputs/",xlsx_output_filename,".xlsx"))
 
 
 # save a CSV for the police ----
 csv <- as.data.frame(st_drop_geometry(new_merge))
-write.csv(csv, file = paste0(local_folder,xlsx_output_filename,".csv"), row.names = FALSE)
+write.csv(csv, file = paste0(local_folder,"outputs/",xlsx_output_filename,".csv"), row.names = FALSE)
 
 
 
@@ -859,7 +857,7 @@ gpkg_vla_df<- as.data.frame(gpkg_vla) %>%
 
 
 
-
+### Add Brussels polygon data ----
 # open Brussels polygons
 brussels_pg<-st_read(paste0(local_folder,"polygons-brussels-lambert72.geojson"))
 # rename geometry to geometry_pg
@@ -867,10 +865,25 @@ brussels_pg<-brussels_pg %>% rename(geometry_pg = geometry)
 
 polygons <-bind_rows(gpkg_vla_df, brussels_pg)
 
+
+### Add Wallonia polygon data ----
+# download 
+wallonia_pg <- st_read("https://geoservices.wallonie.be/arcgis/rest/services/INDUSTRIES_SERVICES/SEVESO/MapServer/1/query?where=1%3D1&outFields=*&returnGeometry=true&f=geojson")
+wallonia_pg <- wallonia_pg %>% rename(geometry_pg = geometry)
+wallonia_pg <- wallonia_pg %>% st_transform(31370)
+wallonia_pg <- wallonia_pg %>%
+  mutate(referentie = sprintf("WA%04d", REF_SEVESO)) %>%
+  select(referentie, geometry_pg)
+
+polygons <-bind_rows(polygons, wallonia_pg)
+
+
+### Join polygon data to points ----
 new_merge_pg <- left_join(new_merge, polygons, by = c("reference" = "referentie"))
 
 
 new_merge_pg$distance <- mapply(calculate_distance_integrated, new_merge_pg$geometry, new_merge_pg$geometry_pg)
+
 
 # this logic should not be needed anymore, but is useful as a fallback in case there is an error
 # if distance>0, make geometry_pg empty
@@ -878,6 +891,19 @@ new_merge_pg$geometry_pg[!is.na(new_merge_pg$distance) & new_merge_pg$distance >
 new_merge_pg<-new_merge_pg %>% 
   select(-distance) %>%
   rename(geometry_pt = geometry)
+
+# select just the records of new_merge_pg that have an invalid geometry_pg
+invalid_geometries <- new_merge_pg %>% filter(st_is_valid(geometry_pg) == FALSE)
+print(paste0("Invalid geometries: ", nrow(invalid_geometries)))
+if (nrow(invalid_geometries)>0) {
+new_merge_pg$geometry_pg <- st_make_valid(new_merge_pg$geometry_pg)
+} 
+invalid_geometries <- new_merge_pg %>% filter(st_is_valid(geometry_pg) == FALSE)
+print(paste0("Invalid geometries after fix: ", nrow(invalid_geometries)))
+if (nrow(invalid_geometries)>0) {
+  stop("ERROR: There are still invalid geometries after fix")
+}
+
 
 ### Import to raw data ----
 
@@ -969,7 +995,8 @@ JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
 	'activity_dut',act_all_nl,
 	'activity_fre',act_all_fr,
 	'date_inspection',date_inspection,
-	'type',type)),
+	'seveso_risk', CASE WHEN type=2 THEN 'upper limit'
+  WHEN type=1 THEN 'lower limit' ELSE null END)),
 geometry,
 geometry_pt,
 geometry_pg,
@@ -1009,47 +1036,12 @@ SELECT original_id, name, legend_item, data_list_id::uuid, risk_level,properties
 
 
 
-### Create fdw views ----
-### ONLY IF YOU NEED TO START FROM SCRATCH - Create SQL for transformation table ----
-fdw_views_sql <- c("
-CREATE OR REPLACE VIEW fdw.fdw_seveso
-AS
-SELECT id,
-original_id,
-name,
-legend_item,
-NULL::uuid as best_address_id,
-NULL::uuid as capakey_id,
-data_list_id,
-risk_level,
-properties,
-properties_secondary,
-imported_at,
-tags,
-deleted_at,
-updated_at,
-created_at,
-created_by,
-updated_by,
-geometry,
-st_pointonsurface(geometry) AS geometry_pt
-FROM transformation.seveso;
-","
-ALTER TABLE fdw.fdw_seveso
-OWNER TO paragon;
-","
-GRANT SELECT ON TABLE fdw.fdw_seveso TO fdw4dev;
-","
-GRANT ALL ON TABLE fdw.fdw_seveso TO paragon;
-")
-
 ### Execute the SQL commands ----
 
 
 
 create_ingestion_table <- function() {execute_sql_commands(ingestion_table_sql, "Ingestion table")}
 create_transformation_table <- function() {execute_sql_commands(transformation_table_sql, "Transformation table")}
-create_fdw_views <- function() {execute_sql_commands(fdw_views_sql, "FDW view")}
 
 
 
@@ -1150,7 +1142,7 @@ cat("# This is the comparison of old and new data after the new data was cleaned
   We also provide the old and new size in km² of the bbox enclosing all the data.\n\n", file = filename, append = TRUE)
 print(paste0("Report written to ",filename))
 
-gisgov = function() {
+gisgov_update = function() {
   CreateImportTableGG(dataset = gisgov, schema = "seveso", table_name = new_table) 
   GisgovMV()
 }
@@ -1158,7 +1150,6 @@ gisgov = function() {
 paragon_import = function() {
   CreateImportTable(dataset = new_merge_pg, schema = "raw_data", table_name = "seveso")  
   create_ingestion_table()
-  #create_fdw_views() #only if you had to delete the transformation table for some reason
 }
 
 
@@ -1176,7 +1167,7 @@ run_smart_update = function() {
 
 
 main_function = function() {
-  gisgov()
+  gisgov_update()
   paragon_import()
   run_smart_update()
 }
@@ -1192,7 +1183,6 @@ if(F){
     stop("Paragon & GISGOV not updated due to failed checks in the initial validation. Please check the reports for details.")
   }
 }
-
 
 
 
