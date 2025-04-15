@@ -139,11 +139,16 @@ gezinsopvang <- transformTable(df = df_tmp)
 gezinsopvang$type<- "Gezinsopvang voor kinderen"
 
 df_tmp <- NA
+url <- "https://www.desocialekaart.be/api/health-offers?rubrics=10.07.04.%20Opvang%20schoolgaande%20kinderen%20(schooljaar%20en%20vakantie)"
+df_tmp <- getPagesAndContent(query_url = url)
+groepsopvang <- transformTable(df = df_tmp)
+groepsopvang$type<- "Opvang schoolgaande kinderen (schooljaar en vakantie)"
+
+df_tmp <- NA
 url <- "https://www.desocialekaart.be/api/health-offers?rubrics=10.07.02.%20Groepsopvang%20voor%20kinderen"
 df_tmp <- getPagesAndContent(query_url = url)
 groepsopvang <- transformTable(df = df_tmp)
 groepsopvang$type<- "Groepsopvang voor kinderen"
-
 
 
 # 2. Ostbelgien data ----
