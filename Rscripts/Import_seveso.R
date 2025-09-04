@@ -56,6 +56,10 @@
 
 
 # Set parameters ------
+
+legend_item_id <- "70088593-ec60-42c0-952d-81968e3b273f"
+data_list_id <- "ccd8ec1f-d624-47dd-b24b-1df1e371c4b2"
+
 readRenviron("C:/projects/pgn-data-airflow/.Renviron")
 local_folder <- "C:/projects/proto-anchors/raw-data/seveso/"
 
@@ -63,16 +67,15 @@ log_folder <- "C:/temp/logs/"
 rscript_folder <- "C:/projects/pgn-data-airflow/rscripts/"
 
 # Update every time!
-xlsx_output_filename <- "seveso_sites_03_25"
-new_table <- "seveso_03_25"
+xlsx_output_filename <- "seveso_sites_08_25"
+new_table <- "seveso_08_25"
 
 # Update if new files received
-fedlink_filename <- "seveso ACR 20250305.xlsx"
-flanders_filename <- "20250305_VlaamsGewest.xlsx"
+fedlink_filename <- "seveso ACR 20250811.xlsx"
+flanders_filename <- "20250805_VlaamsGewest.xlsx"
 flanders_linkfile <- "20240704_Seveso_exploitant-vergunning.xlsx"
 # note: doublecheck for "Seveso status"=0
-# next update, check if changed coordinates in wallonia_20250113_notes.xlsx have been integrated
-wallonia_filename <- "wallonia_20250221.xlsx"
+wallonia_filename <- "wallonia_20250818.xlsx"
 brussels_filename <- "LIST_20231214_GegevensBedrijven.xlsx"
 
 
@@ -269,6 +272,9 @@ write.csv(OL, file = paste0(local_folder, "own_links_backup_", Sys.Date(), ".csv
 
 # TRANSFORM ----
 # """""""""""""""""" ----------------------
+# remove Flemish data that does not have a risk level yet
+VL <- VL %>%
+  filter(vl.sevesostatus==1 | vl.sevesostatus ==2)
 
 
 # Update the ID number of sites recently added to the federal link dataset but that still have a 99X number ----
@@ -473,8 +479,8 @@ new_merge <- new_merge %>%
     zip = ifelse(!is.na(wal.zipcode), wal.zipcode, zip),
     city = ifelse(!is.na(wal.city), wal.city, city),
     act_all_fr = ifelse(!is.na(wal.description), wal.description, act_all_fr),
-    x = ifelse(!is.na(wal.lambertx), wal.lambertx, x),
-    y = ifelse(!is.na(wal.lamberty), wal.lamberty, y),
+    x = ifelse(is.na(x), wal.lambertx, x), # only add x-y if we don't have it yet, because our version is likely better
+    y = ifelse(is.na(y), wal.lamberty, y), 
     type = ifelse(!is.na(wal.sevesostatus), wal.sevesostatus, type)
   )
 
@@ -509,11 +515,22 @@ new_merge <- new_merge %>%
     type = ifelse(!is.na(bru.sevesostatus), bru.sevesostatus, type)
   )
 
+
+
+#test for sevesostatus not 1 or 2
+seveso_status_check <- new_merge %>%
+  filter(!type %in% c(1, 2))
+if (nrow(seveso_status_check) > 0) {
+  stop(nrow(seveso_status_check), " records have a sevesostatus that is not 1 or 2", "\n")
+}
+new_merge <- new_merge %>%
+  filter(type %in% c(1, 2))
+
 # test for missing or empty names ----
 missing_name <- new_merge %>%
   filter(is.na(name) | name == "")
 if (nrow(missing_name) > 0) {
-  stop(nrow(dup_check_id)," records have no name", "\n")
+  stop(nrow(missing_name)," records have no name", "\n")
 }
 
 # to be used when/if we decided to use the nickname
@@ -536,11 +553,11 @@ new_merge <- new_merge %>%
 # example code: how to manually set a location:
 # YOU NEED TO ADD commune, region and province manually if the geometry from a new record is added via the raw files
 #new_merge <- new_merge %>%  mutate(
-    #x = ifelse(reference == "VL0220", 153143, x),
-    #y = ifelse(reference == "VL0220", 216740, y),
-    #commune = ifelse(reference == "VL0766", "Kortrijk", commune),
-    #region = ifelse(reference == "VL0766", "Vlaams Gewest", region),
-    #province = ifelse(reference == "VL0766", "Antwerpen", province)  )
+#x = ifelse(reference == "VL0220", 153143, x),
+#y = ifelse(reference == "VL0220", 216740, y),
+#commune = ifelse(reference == "VL0766", "Kortrijk", commune),
+#region = ifelse(reference == "VL0766", "Vlaams Gewest", region),
+#province = ifelse(reference == "VL0766", "Antwerpen", province)  )
 
 
 
@@ -617,7 +634,7 @@ if(nrow(geocode_input) > 0){
     mutate(
       province = str_to_title(province)
     )
-
+  
   geocode_input_test <- new_merge %>%
     filter(is.na(x)) %>%
     select(reference,street,nr,zip)  
@@ -667,7 +684,14 @@ new_merge <- new_merge %>%
   )) %>%
   ungroup()
 
-
+# make sure the specific risks are always 0 or 1. Replace NA with 0
+new_merge <- new_merge %>%
+  mutate(
+    emanations = ifelse(is.na(emanations), 0, emanations),
+    incendie = ifelse(is.na(incendie), 0, incendie),
+    explosion = ifelse(is.na(explosion), 0, explosion),
+    ecotoxique = ifelse(is.na(ecotoxique), 0, ecotoxique)
+  )
 
 # checking for strange values in the type column. Should always be 1 (low risk) or 2 (high risk). If it's a value like "in review", it should be removed (which will happen in a next step). If it's value like "high risk" or "low risk", it should be changed to 1 or 2. Consult with source or Jonathan.
 # the process will stop automatically if this is the case!
@@ -792,7 +816,11 @@ GisgovMV <- function() {
   dbDisconnect(con_pg)
 }
 
-
+# TODO
+# make sure excel has X-Y (see CSV below)
+# write the excel to Github
+# add link on Paragon Support
+# OR BETTER YET: do not write an excel here, but let it be done by "the generic process" to export geojson to file
 # save an Excel for Communications ----
 excel <- new_merge %>%
   select(id,name,type,street,nr,zip,city,commune,province,region,act_all_nl,act_all_fr,act_all_de,act_all_en,date_inspection)
@@ -896,7 +924,7 @@ new_merge_pg<-new_merge_pg %>%
 invalid_geometries <- new_merge_pg %>% filter(st_is_valid(geometry_pg) == FALSE)
 print(paste0("Invalid geometries: ", nrow(invalid_geometries)))
 if (nrow(invalid_geometries)>0) {
-new_merge_pg$geometry_pg <- st_make_valid(new_merge_pg$geometry_pg)
+  new_merge_pg$geometry_pg <- st_make_valid(new_merge_pg$geometry_pg)
 } 
 invalid_geometries <- new_merge_pg %>% filter(st_is_valid(geometry_pg) == FALSE)
 print(paste0("Invalid geometries after fix: ", nrow(invalid_geometries)))
@@ -911,6 +939,7 @@ if (nrow(invalid_geometries)>0) {
 
 ### Create SQL for proper ingestion table ----
 
+# note: during this step we merge identical geometries together (to fit with general Paragon anchor logic). Strings are combined, for risks, the highest risk is kept.
 ingestion_table_sql <- c("
 DROP TABLE IF EXISTS ingestion.seveso CASCADE;
 ","
@@ -920,24 +949,24 @@ CREATE TABLE IF NOT EXISTS ingestion.seveso
     original_id text,    
     name jsonb,
     legend_item jsonb,
-	data_list_id text,
-	risk_level integer,
+    legend_item_id uuid,
+  	data_list_id uuid,
+  	risk_level integer,
     properties jsonb,
-	properties_secondary jsonb,
-	imported_at timestamptz,
-	tags jsonb,
-	deleted_at timestamptz,
-	updated_at timestamptz,
-	created_at timestamptz,
-	created_by uuid,
-	updated_by uuid,
+  	properties_secondary jsonb,
+  	imported_at timestamptz,
+  	tags jsonb,
+  	deleted_at timestamptz,
+  	updated_at timestamptz,
+  	created_at timestamptz,
+  	created_by uuid,
+  	updated_by uuid,
     geometry geometry(geometry, 4326),
-	geometry_pt geometry(geometry, 4326),
-	geometry_pg geometry(geometry, 4326),
+  	geometry_pt geometry(geometry, 4326),
+  	geometry_pg geometry(geometry, 4326),
     CONSTRAINT seveso_pkey PRIMARY KEY (id)
   );
-","
-
+",paste0("
 WITH cleaned as (SELECT
 reference AS original_id,
 name,
@@ -945,7 +974,7 @@ LTRIM(CONCAT(street,' ', nr, ', ', zip,' ',
 			 CASE WHEN region='Vlaams Gewest' THEN city
 			 WHEN region='Région wallonne' THEN commune
 			 ELSE commune END)) AS address,
-id, type, province, region, emanations, incendie, explosion, ecotoxique, act_all_nl, act_all_fr, date_inspection,
+id, type, province, region, emanations, incendie, explosion, ecotoxique, NULLIF(act_all_nl,'') as act_all_nl, NULLIF(act_all_fr,'') as act_all_fr, date_inspection,
 CASE WHEN ST_IsEmpty(geometry_pg) THEN ST_Transform(geometry_pt,4326)
 	    ELSE ST_Transform(geometry_pg,4326) END as geometry,
 ST_Transform(geometry_pt,4326) as geometry_pt,
@@ -957,19 +986,20 @@ string_agg(name,'; ') as name,
 jsonb_build_object(
 	'dut', 'Sevesobedrijf',
 	'fre', 'entreprise Seveso',
-	'ger', 'Seveso-betriebs') as legend_item,
+	'ger', 'Seveso-betriebs',
+	'eng', 'Seveso company') as legend_item,
 	min(address) as address,
 	string_agg(id::text, ';') as id,
-	min(type) as type,
+	max(type) as type,
 	min(province) as province,
 	min(region) as region,
-	min(emanations) as emanations,
-	min(incendie) as incendie,
-	min(explosion) as explosion,
-	min(ecotoxique) as ecotoxique,
-	min(act_all_nl) as act_all_nl,
-	min(act_all_fr) as act_all_fr,
-	min(date_inspection) as date_inspection,
+	max(emanations) as emanations,
+	max(incendie) as incendie,
+	max(explosion) as explosion,
+	max(ecotoxique) as ecotoxique,
+	string_agg(DISTINCT act_all_nl, ';') as act_all_nl,
+	string_agg(DISTINCT act_all_fr, ';') as act_all_fr,
+	max(date_inspection) as date_inspection,
 	geometry,
 	min(geometry_pt)::geometry as geometry_pt,
 	min(geometry_pg)::geometry as geometry_pg
@@ -977,12 +1007,13 @@ FROM cleaned
 GROUP by geometry)
 
 INSERT INTO ingestion.seveso 
-(original_id, name, legend_item, data_list_id, risk_level, properties, geometry, geometry_pt, geometry_pg, created_at)
+(original_id, name, legend_item, legend_item_id, data_list_id, risk_level, properties, geometry, geometry_pt, geometry_pg, created_at)
 SELECT
 original_id,
 jsonb_build_object('und', CASE WHEN name IS NULL THEN 'seveso company' ELSE name END) as name,
 legend_item,
-'ccd8ec1f-d624-47dd-b24b-1df1e371c4b2' as data_list_id,
+'",legend_item_id,"'::uuid as legend_item_id,
+'",data_list_id,"'::uuid as data_list_id,
 CASE WHEN type=2 THEN 4
   WHEN type=1 THEN 3 ELSE null END as risk_level,
 JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
@@ -1001,39 +1032,11 @@ geometry,
 geometry_pt,
 geometry_pg,
 CURRENT_DATE as created_at
-FROM aggregated;
-")
-
-### ONLY IF YOU NEED TO START FROM SCRATCH - Create SQL for transformation table ----
-transformation_table_sql <- c("
-DROP TABLE IF EXISTS transformation.seveso CASCADE;
-","
-CREATE TABLE IF NOT EXISTS transformation.seveso
-  (
-    id uuid NOT NULL DEFAULT gen_random_uuid(),
-    original_id text,    
-    name jsonb,
-    legend_item jsonb,
-	data_list_id uuid,
-	risk_level integer,
-    properties jsonb,
-	properties_secondary jsonb,
-	imported_at timestamptz,
-	tags jsonb,
-	deleted_at timestamptz,
-	updated_at timestamptz,
-	created_at timestamptz,
-	created_by uuid,
-	updated_by uuid,
-    geometry geometry(geometry, 4326),
-    CONSTRAINT seveso_pkey PRIMARY KEY (id)
-  );
-","
-INSERT INTO transformation.seveso
-(original_id, name, legend_item, data_list_id, risk_level, properties, geometry, created_at)
-SELECT original_id, name, legend_item, data_list_id::uuid, risk_level,properties, geometry, created_at FROM ingestion.seveso;
-")
-
+FROM aggregated;"),
+                         "ALTER TABLE IF EXISTS ingestion.seveso OWNER to pgn_group_data_team_w;",
+                         "GRANT ALL ON TABLE ingestion.seveso TO pgn_group_data_team_w;",
+                         "GRANT ALL ON TABLE ingestion.seveso TO pgn_user_airflow;"
+)
 
 
 ### Execute the SQL commands ----
@@ -1041,14 +1044,7 @@ SELECT original_id, name, legend_item, data_list_id::uuid, risk_level,properties
 
 
 create_ingestion_table <- function() {execute_sql_commands(ingestion_table_sql, "Ingestion table")}
-create_transformation_table <- function() {execute_sql_commands(transformation_table_sql, "Transformation table")}
 
-
-
-### ONLY IF YOU NEED TO START FROM SCRATCH
-# create_transformation_table()
-# create_fdw_views()
-### ONLY IF YOU NEED TO START FROM SCRATCH - Create SQL for transformation table ----
 
 # Run the import functions ----
 
@@ -1167,9 +1163,9 @@ run_smart_update = function() {
 
 
 main_function = function() {
-  gisgov_update()
   paragon_import()
   run_smart_update()
+  gisgov_update()
 }
 
 # uncomment below to ignore failed checks of the raw data (after you have reviewed and verified there is no real issue)

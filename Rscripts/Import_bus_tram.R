@@ -10,28 +10,62 @@
 ##
 ##
 ## ---------------------------
-
 # Docs: https://dev.azure.com/NCCN-Paragon/Paragon/_wiki/wikis/Paragon.wiki/756/Bus-tram#
-
 
 #  """""""""""""""""" ----------------------
 
-readRenviron("C:/projects/pgn-data-airflow/.Renviron")
+# Load variables -----------------------------------------------------------
+#  """""""""""""""""" ----------------------
 
+legend_item_pt_line_bus <- "6235cdd3-23b8-41c2-ba46-10ca3a77794e"
+legend_item_pt_line_metro <- "3f277f95-29f2-433b-a669-5e9637756dff"
+legend_item_pt_line_tram <- "e991547a-4b2c-4183-9542-5ee6663dc8ad"
+
+
+legend_item_pt_stop_tram <- "9300df60-e16e-4557-b716-f04a4613c57a"
+legend_item_pt_stop_bus <- "426a60d1-066e-4fd0-872c-aac4b5371f35"
+legend_item_pt_stop_metro <- "c8bbd5ea-bddc-4141-a8af-3d54534617e9"
+
+#readRenviron("C:/projects/pgn-data-airflow/.Renviron")
+
+# connection details
 db_host_name <- Sys.getenv("POSTGRES_HOST_NAME")
 postgres_user <- Sys.getenv("POSTGRES_USER")
 postgres_password <- Sys.getenv("POSTGRES_PASSWORD")
 db_name<- Sys.getenv("POSTGRES_DB_NAME_CURATED")
 
+# run status
+run_status<-Sys.getenv("RUN_STATUS")
+## this is set to false and prevents any accidental changes to the database by switching off the main_function(). On Airflow, this is set to true.
+run_status<-ifelse(tolower(run_status) == "true", TRUE, FALSE)
+
+# overrule the checks
+overrule_checks<-Sys.getenv("OVERRULE_CHECKS")
+## Set to FALSE by default. That means we do not update the anchors if some tests fail. Those tests include "the data has grown or shrunk by a lot of objects". If, after review of the log, you decide that nothing is wrong, set this manually to TRUE.
+# If the input is not correctly understood as boolean, this will force it to it.
+overrule_checks<-ifelse(tolower(overrule_checks) == "true", TRUE, FALSE)
+
+# Do not run the main part of the processing, but just do an update based on the ingestion table already in the dbase
+reuse_ingestion_data<-Sys.getenv("REUSE_INGESTION_DATA")
+reuse_ingestion_data<-ifelse(tolower(reuse_ingestion_data) == "true", TRUE, FALSE)
+
+# Only run the comparison script & update the ingestion table, but do not attempt to update the transformation table
+do_dry_run<-Sys.getenv("DO_DRY_RUN")
+do_dry_run<-ifelse(tolower(do_dry_run) == "true", TRUE, FALSE)
+
+
 #data_list_id<-"cannot be added centrally, since several items are processed"
-log_folder <- "C:/temp/logs/"
-local_folder <- "C:/temp/"
+
+temporary_folder <-Sys.getenv("TEMPORARY_STORAGE")
+log_folder <- Sys.getenv("RSCRIPT_LOG_FOLDER")
 
 ### Load external functions ------
 
-rscript_folder <- "C:/projects/pgn-data-airflow/rscripts/"
-source(paste0(rscript_folder,"utils_updated_check_protoanchors.R"))
-source(paste0(rscript_folder,"utils.R"))
+rscript_folder <- Sys.getenv("LOCAL_RSCRIPT_PATH")
+source(paste0(rscript_folder,"/utils_updated_check_protoanchors.R"))
+source(paste0(rscript_folder,"/utils.R"))
+
+
 
 # Set conditions -----------------------------------------------------------
 # threshold for deciding a stop is a tram stop
@@ -42,14 +76,19 @@ distance_threshold_merge_extraregional <- 15
 
 # Libraries -------------------------------
 # """""""""""""""""" ----------------------
-library(sf) # simple features packages for handling vector GIS data
-library(httr) # generic webservice package
+
 library(tidyverse) # a suite of packages for data wrangling, transformation, plotting, ...
 library(ows4R) # interface for OGC webservices
 
 
 # Download data -----------------------------------------------------------
 # """"""""""""""""""----------------------
+
+# Function to download fresh data ----
+process_fresh_data <- function(){
+  # Default: download fresh data
+  if (reuse_ingestion_data==FALSE) {
+
 ### Vlaanderen ----
 
 # WFS download as explained on https://inbo.github.io/tutorials/tutorials/spatial_wfs_services/
@@ -100,7 +139,7 @@ while (has_more_features) {
 # Combine all fetched features into a single data frame
 vl_haltes <- do.call(rbind, all_features)
 
-vl_haltes_raw<-vl_haltes
+vl_haltes_raw<<-vl_haltes
 
 # set all columns to lowercase
 vl_haltes <- vl_haltes %>% 
@@ -125,7 +164,7 @@ request <- build_url(url)
 reiswegen <- read_sf(request)
 cat("Total VL routes retrieved:", nrow(reiswegen), "\n")
 
-reiswegen_raw<-reiswegen
+reiswegen_raw<<-reiswegen
 
 # set all columns to lowercase
 reiswegen <- reiswegen %>% 
@@ -175,11 +214,14 @@ geom_duplicate_ids <- as.data.frame(geom_duplicates) %>%
   select(id)
 
 geom_unique <- vl_haltes %>%
+  anti_join(geom_duplicate_ids, by = "id") %>%
   mutate(geom_wkt = st_as_text(geometry),
-         original_id = id,
          stopid = as.character(stopid),
          source = "De Lijn") %>%
-  anti_join(geom_duplicate_ids, by = "id")
+  rename(original_id = id,
+         name_dut = naamhalte,
+         stop_type = lbltypehal)
+  
 
 # Step 3: Aggregate the duplicates
 geom_aggregated <- geom_duplicates %>%
@@ -214,19 +256,21 @@ cat("Total VL stops after processing:", nrow(vl_haltes_agg), "\n")
 # set the source
 zip_url<-"https://stibmivb.opendatasoft.com/api/explore/v2.1/catalog/datasets/shapefiles-production/alternative_exports/shapefileszip/"
 # set the location to save it
-local_zip_path <- paste0(local_folder,"shapefiles.zip")
+local_zip_path <- paste0(temporary_folder,"/shapefiles.zip")
 # Download the ZIP file
 GET(url = zip_url, write_disk(local_zip_path, overwrite = TRUE))
 # Unzip the downloaded file
-unzip(local_zip_path, exdir = local_folder)
+unzip(local_zip_path, exdir = temporary_folder)
 
 # List the contents of the unzipped directory
-unzipped_contents <- list.dirs(paste0(local_folder,"shapefiles"), recursive = FALSE)
+unzipped_contents <- list.dirs(paste0(temporary_folder,"/shapefiles"), recursive = FALSE)
+print(unzipped_contents)
 unzipped_folder <- unzipped_contents[1]
+print(unzipped_folder)
 
 # open the shapefile 
 brussels_stops <- st_read(paste0(unzipped_folder,"/ACTU_STOPS.shp"))
-brussels_stops_raw<-brussels_stops
+brussels_stops_raw<<-brussels_stops
 
 # set all columns to lowercase
 brussels_stops <- brussels_stops %>% 
@@ -234,7 +278,7 @@ brussels_stops <- brussels_stops %>%
 
 
 brussels_lines <- st_read(paste0(unzipped_folder,"/ACTU_LIGNES_BRUTES.shp"))
-brussels_lines_raw<-brussels_lines
+brussels_lines_raw<<-brussels_lines
 
 # set all columns to lowercase
 brussels_lines <- brussels_lines %>% 
@@ -243,8 +287,9 @@ brussels_lines <- brussels_lines %>%
 cat("Total BRU stops:", nrow(brussels_stops), "\n")
 cat("Total BRU lines:", nrow(brussels_lines), "\n")
 
-# delete the unzipped folder
-unlink(paste0(local_folder,"shapefiles"), recursive = TRUE)
+# delete the temporary data
+unlink(paste0(temporary_folder,"/shapefiles"), recursive = TRUE)
+unlink(local_zip_path)
 
 # turn POINT Z into just POINT geometry
 brussels_stops <- brussels_stops %>%
@@ -277,10 +322,15 @@ geom_duplicate_ids <- as.data.frame(geom_duplicates) %>%
   select(stop_id)
 
 geom_unique <- brussels_stops %>%
+  anti_join(geom_duplicate_ids, by = "stop_id") %>%
   mutate(geom_wkt = st_as_text(geometry),
          original_id = as.character(stop_id),
-         source = "STIB") %>% # Ensure stop_id is character
-  anti_join(geom_duplicate_ids, by = "stop_id")
+         source = "STIB") %>%
+  rename(
+    name_dut = alpha_nl,
+    name_fre = alpha_fr
+  )
+  
 
 # Step 3: Aggregate the duplicates
 geom_aggregated <- geom_duplicates %>%
@@ -315,11 +365,11 @@ cat("Total BRU stops after processing:", nrow(brussels_stops_agg), "\n")
 # WFS download as explained on https://inbo.github.io/tutorials/tutorials/spatial_wfs_services/
 
 # Define the base WFS URL
-wfs_haltes <- "https://geodata.tec-wl.be/server/services/Poteaux/MapServer/WFSServer"
+wfs_poteaux <- "https://geodata.tec-wl.be/server/services/Poteaux/MapServer/WFSServer"
 
 # Build the request URL
 build_request_url <- function(start_index) {
-  url <- parse_url(wfs_haltes)
+  url <- parse_url(wfs_poteaux)
   url$query <- list(
     service = "wfs",
     request = "GetFeature",
@@ -362,7 +412,7 @@ wal_poteaux <- do.call(rbind, all_features)
 
 cat("Total WAL stops:", nrow(wal_poteaux), "\n")
 
-wal_poteaux_raw <- wal_poteaux
+wal_poteaux_raw <<- wal_poteaux
 
 # set all columns to lowercase
 wal_poteaux <- wal_poteaux %>% 
@@ -370,11 +420,11 @@ wal_poteaux <- wal_poteaux %>%
 
 # Download Wallonia lines
 # Define the base WFS URL
-wfs_haltes <- "https://geodata.tec-wl.be/server/services/Lignes/MapServer/WFSServer"
+wfs_lignes <- "https://geodata.tec-wl.be/server/services/Lignes/MapServer/WFSServer"
 
 # Build the request URL
 build_request_url <- function(start_index) {
-  url <- parse_url(wfs_haltes)
+  url <- parse_url(wfs_lignes)
   url$query <- list(
     service = "wfs",
     request = "GetFeature",
@@ -416,7 +466,7 @@ while (has_more_features) {
 wal_lines <- do.call(rbind, all_features)
 cat("Total WAL lines:", nrow(wal_lines), "\n")
 
-wal_lines_raw <- wal_lines
+wal_lines_raw <<- wal_lines
 
 # set all columns to lowercase
 wal_lines <- wal_lines %>% 
@@ -424,9 +474,9 @@ wal_lines <- wal_lines %>%
 
 # metro lines: "LGN_NUM" = 'M1', M2', 'M3', 'M3AB', 'M4'
 wal_lines <- wal_lines %>%
-  mutate(tram=ifelse(lgn_num %in% c('M1','M1AB', 'M2', 'M3', 'M3AB', 'M4', 'M4AB'),1,0)) %>%
+  mutate(tram=ifelse(lgn_num %in% c('M1', 'M2', 'M3', 'M4'),1,0)) %>%
   mutate(metro=0) %>%
-  mutate(bus=ifelse(lgn_num %in% c('M1','M1AB', 'M2', 'M3', 'M3AB', 'M4', 'M4AB'),0,1))
+  mutate(bus=ifelse(lgn_num %in% c('M1', 'M2', 'M3', 'M4'),0,1))
 
 # check: count the number of times any value of lgn_id is used
 wal_lines_check <- as.data.frame(wal_lines) %>%
@@ -467,10 +517,14 @@ geom_duplicate_ids <- as.data.frame(geom_duplicates) %>%
   select(globalid)
 
 geom_unique <- wal_poteaux_joined %>%
+  anti_join(geom_duplicate_ids, by = "globalid") %>%
   mutate(geom_wkt = st_as_text(geometry),
          original_id=as.character(globalid),
          source = "TEC") %>% # Ensure globalid is character
-  anti_join(geom_duplicate_ids, by = "globalid")
+  rename(
+    name_fre = pot_nom,
+  )
+  
 
 # Step 3: Aggregate the duplicates
 geom_aggregated <- geom_duplicates %>%
@@ -542,6 +596,7 @@ all_lines <- all_lines %>%
     ifelse(source == "De Lijn", 'bdbb2fa4-0902-4496-a1e1-5aaebf2fbccf', 
            ifelse(source == "TEC", '315ed87c-559e-4dfe-86fc-933ed76bae69', NA))))
 
+all_lines <<- all_lines
 
 ### Unify the stops ----
 
@@ -634,7 +689,9 @@ all_stops <- all_stops %>%
   ungroup()
 
 # create TEC properties
+
 all_stops <- all_stops %>%
+  rowwise() %>%
   mutate(
     tec_properties = ifelse(
       source == "TEC",
@@ -691,6 +748,7 @@ all_stops <- all_stops %>%
 
 
 # create mivb_properties
+# these are only relevant as secondary, because the only property is the original id, there is no further interesting info
 all_stops <- all_stops %>%
   rowwise() %>%
   mutate(
@@ -737,7 +795,7 @@ all_stops <- all_stops %>%
 mergeable_stops <- all_stops %>% filter(count > 1 & region_type == "special")
 unmergeable_stops <- all_stops %>% filter(count == 1 | (count > 1 & region_type == "normal"))
 
-## in the main dataset, set the properties column with the content of that region if count=1 or count>1 and source is the source of the region
+## in the main dataset, set the properties column with the content of that region if count=1 or count>1 and source is the source of the region. Again, properties is not filled for MIVB/STIB because they have no relevant primary properties
 unmergeable_stops <- unmergeable_stops %>%
   mutate(properties = case_when(
     source == "De Lijn" ~ delijn_properties,
@@ -816,17 +874,45 @@ all_stops_merged <- unmergeable_stops %>%
 all_stops_merged <- all_stops_merged %>%
   select(-count, -merge_id)
 
-## set columns as text
-all_stops_merged <- all_stops_merged %>%
+
+
+all_stops_merged_adjustproperties <- all_stops_merged %>%
+  filter(!is.na(source_secondary))
+
+  
+all_stops_merged_adjustproperties <-  all_stops_merged_adjustproperties %>%
+  rowwise() %>%
+  mutate(properties =ifelse(is.na(properties), "{}", properties)) %>%
+  mutate(
+    properties = {
+      prop_list <- fromJSON(properties)
+      prop_list$secondary_user <- source_secondary
+      toJSON(prop_list, auto_unbox = TRUE)
+    }
+  ) %>%
   mutate(
     properties = as.character(properties),
     properties_secondary = as.character(properties_secondary)
-  )
+  ) %>%
+  ungroup()
 
-## merge secondary source to source
-all_stops_merged <- all_stops_merged %>% 
-  mutate(source = if_else(is.na(source_secondary), source, paste(source, source_secondary, sep = ", "))) %>%
-  select(-source_secondary)
+
+# merge the adjusted properties back to the main dataset
+all_stops_merged <- all_stops_merged %>%
+  filter(is.na(source_secondary)) %>%
+  mutate(
+    properties = as.character(properties),
+    properties_secondary = as.character(properties_secondary)
+  ) %>%
+  bind_rows(all_stops_merged_adjustproperties)
+
+# make data available outside the function
+all_stops_merged <<- all_stops_merged
+
+} else {
+  print("No fresh data downloaded because user requested to re-use existing data")
+  }
+} # end process_fresh_data function  
 
 
 # LOAD ----
@@ -842,6 +928,7 @@ CREATE TABLE IF NOT EXISTS ingestion.bus_tram_metro_stops
   original_id text,  
   name jsonb,
   legend_item jsonb,
+  legend_item_id uuid,
   data_list_id uuid,
   risk_level integer,
   properties jsonb,
@@ -866,22 +953,28 @@ cleaned as (SELECT
               WHEN name_dut='' OR name_dut is NULL THEN name_fre 
               ELSE name_dut END)) as name,
             jsonb_build_object(
-              'dut', CASE WHEN source='TEC' then 'halte openbaar vervoer' || ' (' || source || ')'
-              WHEN metro=1 then 'metrohalte' || ' (' || source || ')'
-              WHEN tram=1 then 'tramhalte' || ' (' || source || ')'
-              ELSE 'bushalte' || ' (' || source || ')' END,
-              'fre', CASE WHEN source='TEC' then 'arrêt de transport en commun' || ' (' || source || ')'
-              WHEN metro=1 then 'arrêt de métro' || ' (' || source || ')'
-              WHEN tram=1 then 'arrêt de tram' || ' (' || source || ')'
-              ELSE 'arrêt de bus' || ' (' || source || ')' END,
-              'ger', CASE WHEN source='TEC' then 'Haltestelle' || ' (' || source || ')'
-              WHEN metro=1 then 'U-Bahn-Haltestelle' || ' (' || source || ')'
-              WHEN tram=1 then 'Straßenbahnhaltestelle' || ' (' || source || ')'
-              ELSE 'Bushaltestelle' || ' (' || source || ')' END,
-              'eng', CASE WHEN source='TEC' then 'public transport stop' || ' (' || source || ')'
-              WHEN metro=1 then 'metro stop' || ' (' || source || ')'
-              WHEN tram=1 then 'tram stop' || ' (' || source || ')'
-              ELSE 'bus stop' || ' (' || source || ')' END) as legend_item,
+              'dut', CASE 
+                WHEN metro=1 then 'metrohalte'
+                WHEN tram=1 then 'tramhalte'
+                ELSE 'bushalte' END,
+              'fre', CASE 
+                WHEN metro=1 then 'arrêt de métro'
+                WHEN tram=1 then 'arrêt de tram'
+                ELSE 'arrêt de bus' END,
+              'ger', CASE 
+                WHEN metro=1 then 'U-Bahn-Haltestelle'
+                WHEN tram=1 then 'Straßenbahnhaltestelle'
+                ELSE 'Bushaltestelle' END,
+              'eng', CASE
+                WHEN metro=1 then 'metro stop'
+                WHEN tram=1 then 'tram stop'
+                ELSE 'bus stop' END) 
+              as legend_item,
+            CASE 
+              WHEN tram=1 then '",legend_item_pt_stop_tram,"'::uuid
+            	WHEN metro=1 then '",legend_item_pt_stop_metro,"'::uuid
+            	ELSE '",legend_item_pt_stop_bus,"'::uuid END
+            	as legend_item_id,
             data_list_id::uuid,
             properties,
             CASE WHEN properties_secondary='NULL' THEN NULL ELSE properties_secondary END as properties_secondary,
@@ -889,19 +982,23 @@ cleaned as (SELECT
             FROM raw_data.all_public_transport_stops
 )
 INSERT INTO ingestion.bus_tram_metro_stops 
-(original_id, name, legend_item, data_list_id, risk_level, properties, properties_secondary, geometry, created_at)
+(original_id, name, legend_item, legend_item_id, data_list_id, risk_level, properties, properties_secondary, geometry, created_at)
 SELECT
 original_id,
 name,
 legend_item,
+legend_item_id,
 data_list_id,
 1 as risk_level,
 properties::jsonb,
 properties_secondary::jsonb,
 geometry,
 CURRENT_DATE as created_at
-FROM cleaned;
-"))
+FROM cleaned;"),
+"ALTER TABLE IF EXISTS ingestion.bus_tram_metro_stops OWNER to pgn_group_data_team_w;",
+"GRANT ALL ON TABLE ingestion.bus_tram_metro_stops TO pgn_group_data_team_w;",
+"GRANT ALL ON TABLE ingestion.bus_tram_metro_stops TO pgn_user_airflow;"
+)
 
 
 ingestion_table_routes_sql <- c("DROP TABLE IF EXISTS ingestion.bus_tram_metro_routes CASCADE;
@@ -912,6 +1009,7 @@ CREATE TABLE IF NOT EXISTS ingestion.bus_tram_metro_routes
   original_id text,  
   name jsonb,
   legend_item jsonb,
+  legend_item_id uuid,
   data_list_id uuid,
   risk_level integer,
   properties jsonb,
@@ -949,6 +1047,11 @@ CREATE TABLE IF NOT EXISTS ingestion.bus_tram_metro_routes
     WHEN tram=1 then 'Straßenbahnlinie'
     ELSE 'Buslinie' END
   ) as legend_item,
+  CASE 
+   WHEN metro=1 then '",legend_item_pt_line_metro,"'::uuid
+   WHEN tram=1 then '",legend_item_pt_line_tram,"'::uuid
+   ELSE '",legend_item_pt_line_bus,"'::uuid END
+   as legend_item_id,
   data_list_id::uuid as data_list_id,
   1 as risk_level,
   jsonb_strip_nulls(jsonb_build_object(
@@ -963,78 +1066,22 @@ CREATE TABLE IF NOT EXISTS ingestion.bus_tram_metro_routes
   ST_Transform(geometry, 4326) AS geometry 
   FROM raw_data.all_public_transport_routes)
 INSERT INTO ingestion.bus_tram_metro_routes 
-(original_id, name, legend_item, data_list_id, risk_level, properties, geometry, created_at)
+(original_id, name, legend_item, legend_item_id, data_list_id, risk_level, properties, geometry, created_at)
 SELECT
 original_id,
 name,
 legend_item,
+legend_item_id,
 data_list_id,
 1 as risk_level,
 properties::jsonb,
 geometry,
 CURRENT_DATE as created_at
-FROM cleaned;"))
-
-
-
-### Create transformation table ----
-transformation_table_stops_sql <- c("
-DROP TABLE IF EXISTS transformation.bus_tram_metro_stops CASCADE;
-","
-CREATE TABLE IF NOT EXISTS transformation.bus_tram_metro_stops
-  (
-    id uuid NOT NULL DEFAULT gen_random_uuid(),
-    original_id text,    
-    name jsonb,
-    legend_item jsonb,
-	data_list_id uuid,
-	risk_level integer,
-    properties jsonb,
-	properties_secondary jsonb,
-	imported_at timestamptz,
-	tags jsonb,
-	deleted_at timestamptz,
-	updated_at timestamptz,
-	created_at timestamptz,
-	created_by uuid,
-	updated_by uuid,
-    geometry geometry(geometry, 4326),
-    CONSTRAINT bus_tram_metro_stops_pkey PRIMARY KEY (id)
-  );
-","
-INSERT INTO transformation.bus_tram_metro_stops
-(id, original_id, name, legend_item, data_list_id, properties, geometry, created_at)
-SELECT id, original_id, name, legend_item, data_list_id, properties, geometry, created_at FROM ingestion.bus_tram_metro_stops;
-")
-
-transformation_table_routes_sql <- c("
-DROP TABLE IF EXISTS transformation.bus_tram_metro_routes CASCADE;
-","
-CREATE TABLE IF NOT EXISTS transformation.bus_tram_metro_routes
-  (
-    id uuid NOT NULL DEFAULT gen_random_uuid(),
-    original_id text,    
-    name jsonb,
-    legend_item jsonb,
-	data_list_id uuid,
-	risk_level integer,
-    properties jsonb,
-	properties_secondary jsonb,
-	imported_at timestamptz,
-	tags jsonb,
-	deleted_at timestamptz,
-	updated_at timestamptz,
-	created_at timestamptz,
-	created_by uuid,
-	updated_by uuid,
-    geometry geometry(geometry, 4326),
-    CONSTRAINT bus_tram_metro_routes_pkey PRIMARY KEY (id)
-  );
-","
-INSERT INTO transformation.bus_tram_metro_routes
-(id, original_id, name, legend_item, data_list_id, properties, geometry, created_at)
-SELECT id, original_id, name, legend_item, data_list_id, properties, geometry, created_at FROM ingestion.bus_tram_metro_routes;
-")
+FROM cleaned;"),
+"ALTER TABLE IF EXISTS ingestion.bus_tram_metro_routes OWNER to pgn_group_data_team_w;",
+"GRANT ALL ON TABLE ingestion.bus_tram_metro_routes TO pgn_group_data_team_w;",
+"GRANT ALL ON TABLE ingestion.bus_tram_metro_routes TO pgn_user_airflow;"
+)
 
 
 
@@ -1043,20 +1090,12 @@ SELECT id, original_id, name, legend_item, data_list_id, properties, geometry, c
 ### Execute the SQL commands ----
 create_ingestion_table_stops <- function() {execute_sql_commands(ingestion_table_stops_sql, "Stops Ingestion table")}
 create_ingestion_table_routes <- function() {execute_sql_commands(ingestion_table_routes_sql, "Routes Ingestion table")}
-create_transformation_table_stops <- function() {execute_sql_commands(transformation_table_stops_sql, "Stops Transformation table")}
-create_transformation_table_routes <- function() {execute_sql_commands(transformation_table_routes_sql, "Routes Transformation table")}
 
-
-# set to TRUE if you want to update the transformation table even if the checks fail. 
-update_even_if_checks_fail<-FALSE
-# Don't forget to also set checks_failed<-0 if there were already some issues in the base data
 
 run_smart_update = function() {
-  smart_update_process("bus_tram_metro_stops", 50, 100, 50, format(Sys.Date(), "%Y-%m-%d"), update_even_if_checks_fail)
-  smart_update_process("bus_tram_metro_routes", 200, 400, 200, format(Sys.Date(), "%Y-%m-%d"), update_even_if_checks_fail)
+  smart_update_process("bus_tram_metro_stops", 50, 100, 50, format(Sys.Date(), "%Y-%m-%d"), allow_update_even_if_checks_fail=overrule_checks, dry_run=do_dry_run,reuse_ingestion_data=reuse_ingestion_data)
+  smart_update_process("bus_tram_metro_routes", 200, 400, 200, format(Sys.Date(), "%Y-%m-%d"), allow_update_even_if_checks_fail=overrule_checks, dry_run=do_dry_run,reuse_ingestion_data=reuse_ingestion_data)
 }
-
-
 
 
 
@@ -1064,24 +1103,22 @@ run_smart_update = function() {
 # """"""""""""""""""""----
 
 main_function = function() {
-  CreateImportTable(dataset = vl_haltes_raw, schema = "raw_data", table_name = "vla_delijn_stops") 
-  CreateImportTable(dataset = reiswegen_raw, schema = "raw_data", table_name = "vla_delijn_routes") 
-  CreateImportTable(dataset = brussels_stops_raw, schema = "raw_data", table_name = "bru_mivb_stib_stops") 
-  CreateImportTable(dataset = wal_poteaux_raw, schema = "raw_data", table_name = "wal_tec_stops") 
-  CreateImportTable(dataset = all_stops_merged, schema = "raw_data", table_name = "all_public_transport_stops") 
-  CreateImportTable(dataset = all_lines, schema = "raw_data", table_name = "all_public_transport_routes")
-  CreateImportTable(dataset = brussels_lines_raw, schema = "raw_data", table_name = "bru_mivb_stib_routes")
-  CreateImportTable(dataset = wal_lines_raw, schema = "raw_data", table_name = "wal_tec_routes")
-  create_ingestion_table_stops()
-  create_ingestion_table_routes()
+  if (!reuse_ingestion_data) {
+    process_fresh_data()
+    CreateImportTable(dataset = vl_haltes_raw, schema = "raw_data", table_name = "vla_delijn_stops")
+    CreateImportTable(dataset = reiswegen_raw, schema = "raw_data", table_name = "vla_delijn_routes")
+    CreateImportTable(dataset = brussels_stops_raw, schema = "raw_data", table_name = "bru_mivb_stib_stops")
+    CreateImportTable(dataset = wal_poteaux_raw, schema = "raw_data", table_name = "wal_tec_stops")
+    CreateImportTable(dataset = all_stops_merged, schema = "raw_data", table_name = "all_public_transport_stops")
+    CreateImportTable(dataset = all_lines, schema = "raw_data", table_name = "all_public_transport_routes")
+    CreateImportTable(dataset = brussels_lines_raw, schema = "raw_data", table_name = "bru_mivb_stib_routes")
+    CreateImportTable(dataset = wal_lines_raw, schema = "raw_data", table_name = "wal_tec_routes")
+    create_ingestion_table_stops()
+    create_ingestion_table_routes()
+    }
   run_smart_update()
-  #create_transformation_table_stops()
-  #create_transformation_table_routes()
 }
 
-if(F){
+if(run_status){
   main_function()
 }
-
-
-

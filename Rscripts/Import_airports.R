@@ -1,8 +1,8 @@
 ## ---------------------------
 ##
-## Script name: Import dams & locks from OSM
+## Script name: Import airports from OSM
 ##
-## Purpose of script: Load OSM airport data & transform into proto-anchors for Paragon
+## Purpose of script: Load OSM international airport and military airbase data & transform into proto-anchors for Paragon
 ##
 ## Author: Joost Schouppe
 ##
@@ -15,21 +15,49 @@
 # Load variables -----------------------------------------------------------
 #  """""""""""""""""" ----------------------
 
-readRenviron("C:/projects/pgn-data-airflow/.Renviron")
+data_list_id<-"484a4303-9a16-4a01-a63c-e2f50025a095"
+legend_item_id_international <- "348540ec-6c03-4a97-9112-01d8453726b0"
+legend_item_id_military <- "a0c704ab-a2d6-4e48-8873-a8089b3dc582"
 
+
+
+#readRenviron("C:/projects/pgn-data-airflow/.Renviron")
+
+# connection details
 db_host_name <- Sys.getenv("POSTGRES_HOST_NAME")
 postgres_user <- Sys.getenv("POSTGRES_USER")
 postgres_password <- Sys.getenv("POSTGRES_PASSWORD")
 db_name<- Sys.getenv("POSTGRES_DB_NAME_CURATED")
 
-data_list_id<-"484a4303-9a16-4a01-a63c-e2f50025a095"
-log_folder <- "C:/temp/logs/"
+# run status
+run_status<-Sys.getenv("RUN_STATUS")
+## this is set to false and prevents any accidental changes to the database by switching off the main_function(). On Airflow, this is set to true.
+run_status<-ifelse(tolower(run_status) == "true", TRUE, FALSE)
+
+# overrule the checks
+overrule_checks<-Sys.getenv("OVERRULE_CHECKS")
+## Set to FALSE by default. That means we do not update the anchors if some tests fail. Those tests include "the data has grown or shrunk by a lot of objects". If, after review of the log, you decide that nothing is wrong, set this manually to TRUE.
+# If the input is not correctly understood as boolean, this will force it to it.
+overrule_checks<-ifelse(tolower(overrule_checks) == "true", TRUE, FALSE)
+
+
+# Do not run the main part of the processing, but just do an update based on the ingestion table already in the dbase
+reuse_ingestion_data<-Sys.getenv("REUSE_INGESTION_DATA")
+reuse_ingestion_data<-ifelse(tolower(reuse_ingestion_data) == "true", TRUE, FALSE)
+
+# Only run the comparison script & update the ingestion table, but do not attempt to update the transformation table
+do_dry_run<-Sys.getenv("DO_DRY_RUN")
+do_dry_run<-ifelse(tolower(do_dry_run) == "true", TRUE, FALSE)
+
+
+
+log_folder <- Sys.getenv("RSCRIPT_LOG_FOLDER")
 
 ### Load external functions ------
 
-rscript_folder <- "C:/projects/pgn-data-airflow/rscripts/"
-source(paste0(rscript_folder,"utils_updated_check_protoanchors.R"))
-source(paste0(rscript_folder,"utils.R"))
+rscript_folder <- Sys.getenv("LOCAL_RSCRIPT_PATH")
+source(paste0(rscript_folder,"/utils_updated_check_protoanchors.R"))
+source(paste0(rscript_folder,"/utils.R"))
 
 
 
@@ -37,51 +65,96 @@ source(paste0(rscript_folder,"utils.R"))
 # Libraries -------------------------------
 # """""""""""""""""" ----------------------
 
-library(sf)
-library(RPostgres)
-library(DBI)
-
-## Data processing libraries
-library(dplyr)
-
-
-## OSM library
-library(osmdata)
-
-
-
+# loaded in utils
 
 
 
 # EXTRACT ----
 # """""""""""""""""" ----
 
-
+process_fresh_data <- function(){
+  # Default: download fresh data
+  if (reuse_ingestion_data==FALSE) {
+    
 
 # Download OSM data ----
 ### OSM DOWNLOAD PARAMETERS ----
 
 # Define the list of features
-features_list <- list("aerodrome:type" = "international",
-                      "aerodrome" = "international")
-# If default server fails, set to TRUE to use mail.ru server (older data)
-alternative_overpass_server<-FALSE
+
+# international airports
+features_international <- list("aerodrome:type" = "international",
+                               "aerodrome" = "international")
+
+# military airports
+features_military <- list("military"="airfield")
+
+
+
 # Define extra tags to use as columns for properties
-extra_columns <- c("iata")
+extra_columns <- c("aerodrome:type", "aeroway", "military", "landuse", "iata", "icao")
 # Choose which datatypes are needed, as a list of datatypes, using any of "points", "lines", "mpolygons" (this is polygons+multipolygons together)
 datatypes <- c("points", "mpolygon")
 
 
 ### Actual OSM download & transformation ----
+
+# download international airports
 tryCatch({
   # Call the large function
-  osm_all<-download_osm_process(features_list, datatypes, extra_columns, alternative_overpass_server)
+  osm_international<-download_osm_process(features_international, datatypes, extra_columns, postgres=TRUE)
   print("OSM data downloaded & processed succesfully")
 }, error = function(e) {
   # Print error message
   print(paste("Something went wrong:", e$message))
 })
 
+osm_international <- osm_international %>% mutate(object_type = "international airport")
+
+# download military airports
+tryCatch({
+  # Call the large function
+  osm_military<-download_osm_process(features_military, datatypes, extra_columns, postgres=TRUE)
+  print("OSM data downloaded & processed succesfully")
+}, error = function(e) {
+  # Print error message
+  print(paste("Something went wrong:", e$message))
+})
+
+osm_military <- osm_military %>% mutate(object_type = "military airbase")
+
+# Keep only full-time operational military airbases
+
+osm_military_operational <- osm_military %>%
+  filter(aeroway == "aerodrome" | is.na(aeroway)) %>% # removes heliports/helipads
+  filter(! str_detect(name, "modélisme")) %>% # removes model airplane clubs
+  filter(! str_detect(name, "Saint-Hubert|Wevelsmoer|Brasschaat|Moorsele")) # removes reserve airbases in Belgium (SHAPE and other)
+
+# other NATO SHAPE airbases and runways on military domains are under general tags aeroway=aerodrome or aeroway=runway
+# query results for Dutch, German, French military airbases within bounding box + buffer seem to be accurate and complete
+
+# Is there overlap between civil and military airports?
+
+compare_types <- st_join(osm_military_operational, osm_international, join = st_intersects, left = FALSE) # inner spatial join
+
+# airports with well-defined public and military parts can exist as two separate objects
+
+# Is there overlap between nodes and ways in military airports?
+
+osm_military_merged <- osm_military_operational %>%
+  group_by(group = st_intersects(geometry)) %>%
+  arrange(desc(osm_id)) %>% # prioritizes ways over nodes
+  summarize(across(-geometry, ~first(na.omit(.)))) %>% # adds value of node where value of way is NA
+  ungroup() %>%
+  select(- group)
+
+
+osm_all <<- rbind(osm_international, osm_military_merged)
+
+  } else {
+    print("No fresh data downloaded because user requested to re-use existing data")
+  }
+} # end process_fresh_data function
 
 
 # Upload to raw data ----
@@ -107,7 +180,8 @@ CREATE TABLE IF NOT EXISTS ingestion.airports
     original_id text,    
     name jsonb,
     legend_item jsonb,
-	data_list_id text,
+    legend_item_id uuid,
+	data_list_id uuid,
 	risk_level integer,
     properties jsonb,
 	properties_secondary jsonb,
@@ -129,10 +203,13 @@ jsonb_strip_nulls(jsonb_build_object('und', CASE WHEN name IS NULL THEN 'airport
     	'ger', name_de,
     	'dut', name_nl)) as name,
 jsonb_build_object(
-	'dut', 'luchthaven',
-	'fre', 'aéroport',
-	'ger', 'Flughafen',
-	'eng', 'airport') as legend_item,
+      'dut', CASE WHEN object_type='international airport' THEN 'internationale luchthaven' ELSE 'militaire luchtmachtbasis' END,
+      'fre', CASE WHEN object_type='international airport' THEN 'aéroport international' ELSE 'base aérienne militaire' END,
+      'ger', CASE WHEN object_type='international airport' THEN 'internationaler Flughafen' ELSE 'Militärflughafen' END,
+      'eng', CASE WHEN object_type='international airport' THEN 'international airport' ELSE 'military airbase' END) as legend_item,
+     CASE WHEN object_type='international airport' THEN '",legend_item_id_international,"'::uuid
+     ELSE '",legend_item_id_military,"'::uuid END
+     as legend_item_id,
 CASE WHEN short_name IS NULL AND official_name IS NULL AND alt_name IS NULL AND old_name IS NULL THEN NULL 
 	ELSE CONCAT_WS('; ',short_name, official_name, alt_name, old_name) END AS other_names,
 CASE WHEN addr_street IS NULL THEN NULL 
@@ -147,21 +224,24 @@ CASE WHEN website IS NULL AND contact_website IS NULL THEN NULL
 	ELSE CONCAT_WS('; ',website, contact_website) END AS local_website,
 operator_website,
 operator_wikidata, operator, operator_type, image, 
-iata,		
+iata,	icao, wikidata,
+CASE WHEN object_type='international airport' THEN 3 ELSE 2 END AS risk_level,
 geometry
 FROM raw_data.osm_airports)
 
 
 INSERT INTO ingestion.airports 
-(original_id, name, legend_item, data_list_id, risk_level, properties, geometry, created_at)
+(original_id, name, legend_item, legend_item_id, data_list_id, risk_level, properties, geometry, created_at)
 SELECT
 original_id,
 name,
 legend_item,
-'",data_list_id,"' as data_list_id,
-3 as risk_level,
+legend_item_id,
+'",data_list_id,"'::uuid as data_list_id,
+risk_level,
 JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
-	'IATA code', iata,
+	'iata', iata,
+	'iaco', icao,
 	'other_names', other_names,
 	'local_email',local_email,
 	'local_phone',local_phone,
@@ -171,82 +251,19 @@ JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
 	'operator_wikidata',operator_wikidata,
 	'operator',operator,
 	'operator_type',operator_type,
-	'image', image))
+	'image', image,
+	'wikidata', wikidata))
 END,
 geometry,
 CURRENT_DATE as created_at
-FROM cleaned;
-"))
+FROM cleaned;"),
+"ALTER TABLE IF EXISTS ingestion.airports OWNER to pgn_group_data_team_w;",
+"GRANT ALL ON TABLE ingestion.airports TO pgn_group_data_team_w;",
+"GRANT ALL ON TABLE ingestion.airports TO pgn_user_airflow;")
 
-### Create SQL for transformation table ----
-transformation_table_sql <- c("
-DROP TABLE IF EXISTS transformation.airports CASCADE;
-","
-CREATE TABLE IF NOT EXISTS transformation.airports
-  (
-    id uuid NOT NULL DEFAULT gen_random_uuid(),
-    original_id text,    
-    name jsonb,
-    legend_item jsonb,
-	data_list_id uuid,
-	risk_level integer,
-    properties jsonb,
-	properties_secondary jsonb,
-	imported_at timestamptz,
-	tags jsonb,
-	deleted_at timestamptz,
-	updated_at timestamptz,
-	created_at timestamptz,
-	created_by uuid,
-	updated_by uuid,
-    geometry geometry(geometry, 4326),
-    CONSTRAINT airports_pkey PRIMARY KEY (id)
-  );
-","
-INSERT INTO transformation.airports
-(original_id, name, legend_item, data_list_id, risk_level, properties, geometry, created_at)
-SELECT original_id, name, legend_item, data_list_id::uuid, risk_level, properties, geometry, created_at FROM ingestion.airports;
-")
-
-
-
-### Create fdw views ----
-fdw_views_sql <- c("
-CREATE OR REPLACE VIEW fdw.fdw_airports
-AS
-SELECT id,
-original_id,
-name,
-legend_item,
-NULL::uuid as best_address_id,
-NULL::uuid as capakey_id,
-data_list_id,
-risk_level,
-properties,
-properties_secondary,
-imported_at,
-tags,
-deleted_at,
-updated_at,
-created_at,
-created_by,
-updated_by,
-geometry,
-st_pointonsurface(geometry) AS geometry_pt
-FROM transformation.airports;
-","
-ALTER TABLE fdw.fdw_airports
-OWNER TO paragon;
-","
-GRANT SELECT ON TABLE fdw.fdw_airports TO fdw4paragon;
-","
-GRANT ALL ON TABLE fdw.fdw_airports TO paragon;
-")
 
 ### Execute the SQL commands ----
 create_ingestion_table <- function() {execute_sql_commands(ingestion_table_sql, "Ingestion table")}
-create_transformation_table <- function() {execute_sql_commands(transformation_table_sql, "Transformation table")}
-create_fdw_views <- function() {execute_sql_commands(fdw_views_sql, "FDW view")}
 
 
 
@@ -255,7 +272,7 @@ update_even_if_checks_fail<-FALSE
 # Don't forget to also set checks_failed<-0 if there were already some issues in the base data
 
 run_smart_update = function() {
-  smart_update_process("airports", 1000, 2000, 1000, format(Sys.Date(), "%Y-%m-%d"), update_even_if_checks_fail)
+  smart_update_process("airports", 1000, 2000, 1000, format(Sys.Date(), "%Y-%m-%d"), allow_update_even_if_checks_fail=overrule_checks, dry_run=do_dry_run,reuse_ingestion_data=reuse_ingestion_data)
 }
 
 
@@ -263,16 +280,15 @@ run_smart_update = function() {
 # """"""""""""""""""""----
 
 main_function = function() {
-  CreateImportTable(dataset = osm_all, schema = "raw_data", table_name = "osm_airports")  
-  create_ingestion_table()
+  if (!reuse_ingestion_data) {
+    process_fresh_data()
+    CreateImportTable(dataset = osm_all, schema = "raw_data", table_name = "osm_airports")  
+    create_ingestion_table()
+  }
   run_smart_update()
-  #create_transformation_table()
-  #create_fdw_views()
 }
 
 
-if(F){
+if(run_status){
   main_function()
 }
-
-

@@ -11,13 +11,21 @@
 ##
 ## ---------------------------
 
-#TODO: TEST police processing: this combo should not be possible data_list_id='c418b715-4e56-4c27-83bf-bd303a779d56' AND original_id!='none provided'
+
 
 
 # Load variables -----------------------------------------------------------
 #  """""""""""""""""" ----------------------
 
+# External IDs
+data_list_id_osm<-"9223ce7e-9c3e-461c-87b1-94e8aea59a13"
+data_list_id_dri<- "c418b715-4e56-4c27-83bf-bd303a779d56"
 
+li_police_local_small <- "10c44553-d06c-407d-8472-d74aa8fdb50e"
+li_police_local_large <- "8252fc22-cb61-4fe2-92db-74cc6ee2810e"
+li_police_mixed <- "ebb45d0c-768e-4a49-aae7-9d48b0a8c543"
+li_police_federal <- "ebd57ff2-427a-4f9e-9fab-01ca0dd080c8"
+li_police_generic <- "f0adb5b6-ca23-46c8-ae0c-a7793e7f4257"
 
 #readRenviron("C:/projects/pgn-data-airflow/.Renviron")
 
@@ -46,9 +54,7 @@ reuse_ingestion_data<-ifelse(tolower(reuse_ingestion_data) == "true", TRUE, FALS
 do_dry_run<-Sys.getenv("DO_DRY_RUN")
 do_dry_run<-ifelse(tolower(do_dry_run) == "true", TRUE, FALSE)
 
-# Data list IDs
-data_list_id_osm<-"9223ce7e-9c3e-461c-87b1-94e8aea59a13"
-data_list_id_dri<- "c418b715-4e56-4c27-83bf-bd303a779d56"
+
 
 
 
@@ -415,30 +421,29 @@ distance <<- st_transform(distance, crs = 4326)
 
 sql_local_police <- c("
 -- in the end, we will fill up this ingestion table
-
-
 DROP TABLE IF EXISTS ingestion.local_police CASCADE;",
-                      "CREATE TABLE IF NOT EXISTS ingestion.local_police
+"CREATE TABLE IF NOT EXISTS ingestion.local_police
   (
     id uuid NOT NULL DEFAULT gen_random_uuid(),
     original_id text,    
     name jsonb,
     legend_item jsonb,
+    legend_item_id uuid,
     name_source text,
-	risk_level integer,
+  	risk_level integer,
     properties jsonb,
-	properties_secondary jsonb,
-	imported_at timestamptz,
-	tags jsonb,
-	deleted_at timestamptz,
-	updated_at timestamptz,
-	created_at timestamptz,
-	created_by uuid,
-	updated_by uuid,
+  	properties_secondary jsonb,
+  	imported_at timestamptz,
+  	tags jsonb,
+  	deleted_at timestamptz,
+  	updated_at timestamptz,
+  	created_at timestamptz,
+  	created_by uuid,
+  	updated_by uuid,
     geometry geometry(geometry, 4326),
     CONSTRAINT police_cleaned_pkey PRIMARY KEY (id)
   );",
-  "WITH merge AS (
+paste0("WITH merge AS (
     SELECT 
     p.ogc_fid as ogc_fid,
     m.fid as m_fid,
@@ -458,9 +463,7 @@ DROP TABLE IF EXISTS ingestion.local_police CASCADE;",
     WHERE ST_Intersects(p.geometry,m.shape)),
   
   -- set the source
-  
   -- fill in all the names, not just the local name!
-    
 prep AS (
 -- find the municipality (to get the language)
      SELECT m.languagestatute, m.nameger, m.namefre, m.namedut, m.language, p.* ,
@@ -486,40 +489,46 @@ prep AS (
       WHEN LOWER(p.hoofd_wijkcommissariaat)='hoofd' THEN 'Police station'
 	  	  WHEN p.hoofd_wijkcommissariaat IS NULL AND p.enterprisenr IS NOT NULL THEN 'Federal police office'
       ELSE 'Police station (mixed use)' END as type_post_eng,
-      CASE
+    CASE 
+      WHEN LOWER(p.hoofd_wijkcommissariaat)='wijk' THEN '",li_police_local_small,"'::uuid
+      WHEN LOWER(p.hoofd_wijkcommissariaat)='hoofd' THEN '",li_police_local_large,"'::uuid
+	    WHEN p.hoofd_wijkcommissariaat IS NULL AND p.enterprisenr IS NOT NULL THEN '",li_police_federal,"'::uuid
+      ELSE '",li_police_mixed,"'::uuid
+      END as legend_item_id,
+    CASE
       WHEN osm_id IS NULL THEN null
       ELSE name END AS osm_name,
-      NULLIF(CONCAT_WS('; ',contact_email, email),'') AS osm_email,
-      NULLIF(CONCAT_WS('; ', phone, contact_phone, contact_mobile, phone_2, mobile),'') AS osm_phone, 
-      NULLIF(CONCAT_WS('; ', website, contact_website),'') AS osm_website,
+    NULLIF(CONCAT_WS('; ',contact_email, email),'') AS osm_email,
+    NULLIF(CONCAT_WS('; ', phone, contact_phone, contact_mobile, phone_2, mobile),'') AS osm_phone, 
+    NULLIF(CONCAT_WS('; ', website, contact_website),'') AS osm_website,
 	  NULLIF(CONCAT_WS('; ',short_name, official_name, alt_name, old_name),'') AS osm_other_names,
-	CASE WHEN addr_street IS NULL THEN NULL 
-	ELSE LTRIM(CONCAT(addr_street, ' ' || CASE WHEN nohousenumber='yes' THEN 'w/n' ELSE addr_housenumber END, ', ' || CONCAT((addr_postcode || ' '), addr_city))) END
-	AS osm_address,
+	  CASE WHEN addr_street IS NULL THEN NULL 
+	    ELSE LTRIM(CONCAT(addr_street, ' ' || CASE WHEN nohousenumber='yes' THEN 'w/n' ELSE addr_housenumber END, ', ' ||        CONCAT((addr_postcode || ' '), addr_city))) END
+	    AS osm_address,
 	  opening_hours AS osm_opening_hours,
-      CASE WHEN zone_name_de IS null and zone_name_fr IS NOT null THEN zone_name_fr
+    CASE WHEN zone_name_de IS null and zone_name_fr IS NOT null THEN zone_name_fr
       WHEN zone_name_de IS null and zone_name_fr IS null THEN zone_name_nl
       ELSE zone_name_de END
       AS zone_name_de_cleaned,
-      CASE WHEN zone_name_nl IS null and zone_name_fr IS NOT null THEN zone_name_fr
+    CASE WHEN zone_name_nl IS null and zone_name_fr IS NOT null THEN zone_name_fr
       WHEN zone_name_nl IS null and zone_name_fr IS null THEN zone_name_de
       ELSE zone_name_nl END
       AS zone_name_nl_cleaned,
-      CASE WHEN zone_name_fr IS null and zone_name_de IS NOT null THEN zone_name_de
+    CASE WHEN zone_name_fr IS null and zone_name_de IS NOT null THEN zone_name_de
       WHEN zone_name_fr IS null and zone_name_de IS null THEN zone_name_nl
       ELSE zone_name_fr END
       AS zone_name_fr_cleaned,
-	CASE 
-	WHEN enterprisenr IS NULL THEN NULL
-	WHEN language='brussels' THEN CONCAT(strtextbd,'/',strtextbf,' ',lplhousenr,', ',lplzip,' ',namedut,'/',namefre)
-	WHEN language='ger' THEN CONCAT(strtextbd,' ',lplhousenr,', ',lplzip,' ',nameger)
-	WHEN language='dut' THEN CONCAT(strtextbd,' ',lplhousenr,', ',lplzip,' ',namedut)
-	WHEN language='fre' THEN CONCAT(strtextbf,' ',lplhousenr,', ',lplzip,' ',namefre)
-	ELSE CONCAT(strtextbd,' ',lplhousenr,', ',lplzip) END AS fedpol_address,
-	enterprisenr as fedpol_enterprisenr,
-	police_users_nl as fedpol_police_users_nl,
-	police_users_fr as fedpol_police_users_fr,
-	ocpkeys as fedpol_ocpkeys
+	  CASE 
+    	WHEN enterprisenr IS NULL THEN NULL
+    	WHEN language='brussels' THEN CONCAT(strtextbd,'/',strtextbf,' ',lplhousenr,', ',lplzip,' ',namedut,'/',namefre)
+    	WHEN language='ger' THEN CONCAT(strtextbd,' ',lplhousenr,', ',lplzip,' ',nameger)
+    	WHEN language='dut' THEN CONCAT(strtextbd,' ',lplhousenr,', ',lplzip,' ',namedut)
+    	WHEN language='fre' THEN CONCAT(strtextbf,' ',lplhousenr,', ',lplzip,' ',namefre)
+    	ELSE CONCAT(strtextbd,' ',lplhousenr,', ',lplzip) END AS fedpol_address,
+    enterprisenr as fedpol_enterprisenr,
+  	police_users_nl as fedpol_police_users_nl,
+  	police_users_fr as fedpol_police_users_fr,
+  	ocpkeys as fedpol_ocpkeys
       FROM ingestion.police_prep p
       LEFT JOIN merge m ON p.ogc_fid=m.ogc_fid),
 
@@ -540,7 +549,7 @@ from prep)
 
 
 INSERT INTO ingestion.local_police 
-(original_id, name, legend_item, name_source, properties, properties_secondary, geometry, created_at)
+(original_id, name, legend_item, legend_item_id, name_source, properties, properties_secondary, geometry, created_at)
   SELECT
   CASE WHEN source='DRI' AND id_dri IS NOT NULL THEN id_dri
   WHEN source='DRI' THEN 'none provided'
@@ -550,14 +559,22 @@ INSERT INTO ingestion.local_police
                      'fre', CONCAT(type_post_fre,(' ' ||namefre)),
                      'ger', CONCAT(type_post_ger,(' ' ||nameger)),
 					           'und', type_post_und || ' ' || nameund))
-       WHEN osm_name IS NULL THEN jsonb_build_object('und', 'police station')
+       WHEN osm_name IS NULL THEN jsonb_build_object(
+       'und', 'police',
+       'eng', 'police',
+       'dut', 'politie',
+       'fre', 'police',
+       'ger', 'Polizei'
+       )
   ELSE jsonb_build_object('und', osm_name) END
   as name,
   JSONB_BUILD_OBJECT(
     'dut', concat(type_post_dut),
     'fre', concat(type_post_fre),
-    'ger', concat(type_post_ger)  
+    'ger', concat(type_post_ger),
+    'eng', concat(type_post_eng)
   ) as legend_item,
+  legend_item_id,
   source as name_source, 
   CASE WHEN source='DRI' AND po2key IS NOT NULL THEN
   JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
@@ -602,7 +619,10 @@ INSERT INTO ingestion.local_police
   END as properties_secondary,
   geometry AS geometry,
   CURRENT_DATE as created_at
-  FROM prep2")
+  FROM prep2;"),"
+  ALTER TABLE IF EXISTS ingestion.local_police OWNER to pgn_group_data_team_w;","
+  GRANT ALL ON TABLE ingestion.local_police TO pgn_group_data_team_w;","
+  GRANT ALL ON TABLE ingestion.local_police TO pgn_user_airflow;")
 
 
 
@@ -610,81 +630,89 @@ INSERT INTO ingestion.local_police
 ### Create SQL for OSM ingestion table ----
 
 sql_osm <- c(
-    "DROP TABLE IF EXISTS ingestion.police_osm CASCADE;",
-    "CREATE TABLE IF NOT EXISTS ingestion.police_osm
-  (
+  "DROP TABLE IF EXISTS ingestion.police_osm CASCADE;",
+  "CREATE TABLE IF NOT EXISTS ingestion.police_osm (
     id uuid NOT NULL DEFAULT gen_random_uuid(),
     original_id text,    
     name jsonb,
     legend_item jsonb,
+    legend_item_id uuid,
     name_source text,
-	risk_level integer,
+    risk_level integer,
     properties jsonb,
-	properties_secondary jsonb,
-	imported_at timestamptz,
-	tags jsonb,
-	deleted_at timestamptz,
-	updated_at timestamptz,
-	created_at timestamptz,
-	created_by uuid,
-	updated_by uuid,
+    properties_secondary jsonb,
+    imported_at timestamptz,
+    tags jsonb,
+    deleted_at timestamptz,
+    updated_at timestamptz,
+    created_at timestamptz,
+    created_by uuid,
+    updated_by uuid,
     geometry geometry(geometry, 4326),
     CONSTRAINT police_osm_cleaned_pkey PRIMARY KEY (id)
-  );
-  ","  
-  WITH osm AS (SELECT
-               *, 
-               'OSM' as source
-               from raw_data.osm_police),
-
-name_cleaned AS (
-SELECT *, 'https://osm.org/' || osm_id as osm_id_full,
-	CASE WHEN name IS NOT null THEN name
-  		 WHEN addr_city IS NOT null THEN addr_city
-		 ELSE 'police station' END as name_clean
-from osm)
-
-
--- left join on OSM id to find the stations already used as local police geometry (we keep the ones that cannot be found in the police table)
-INSERT INTO ingestion.police_osm (original_id, name, legend_item, name_source, properties, geometry, created_at)
+  );",
+  paste0("WITH osm AS (
+     SELECT *, 'OSM' AS source
+     FROM raw_data.osm_police
+   ), 
+   name_cleaned AS (
+     SELECT *, 
+     'https://osm.org/' || osm_id AS osm_id_full,
+     CASE 
+       WHEN name IS NOT NULL THEN name
+       WHEN addr_city IS NOT NULL THEN addr_city
+       ELSE 'police station'
+     END AS name_clean
+     FROM osm
+   )",
+  "INSERT INTO ingestion.police_osm (
+    original_id, name, legend_item, legend_item_id, name_source, properties, geometry, created_at
+  ) 
   SELECT 
-  o.osm_id_full AS original_id,
-  JSONB_BUILD_OBJECT('und', o.name_clean)
-   as name,
-  JSONB_BUILD_OBJECT('und', 'police station') as legend_item,
-  o.source as name_source,
-  JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
-	  'other_names', NULLIF(CONCAT_WS('; ',short_name, official_name, alt_name, old_name),''),
-	  'address', CASE WHEN addr_street IS NULL THEN NULL 
-		ELSE LTRIM(CONCAT(addr_street, ' ' || CASE WHEN nohousenumber='yes' THEN 'w/n' ELSE addr_housenumber END, ', ' || CONCAT((addr_postcode || ' '), addr_city))) END,
-	  'website', NULLIF(CONCAT_WS('; ', o.website, o.contact_website),''),
-    'email', NULLIF(CONCAT_WS('; ', o.email, o.contact_email),''),
-    'phone', NULLIF(CONCAT_WS('; ', o.phone, o.contact_phone, o.mobile, o.contact_mobile, o.phone_2),''),
-    'wikidata', NULLIF(CONCAT_WS('; ', o.wikidata, o.operator_wikidata),''),
-    'quality_remark',
-       CASE WHEN o.operator_wikidata is not NULL OR EXTRACT(YEAR FROM CURRENT_DATE)-CAST(LEFT(o.check_date, 4) AS NUMERIC)<3 THEN 'not found in official sources but high confidence'
-       ELSE 'not found in official sources' END
-  ))
-  as properties,
-  o.geometry as geometry,
-  CURRENT_DATE as created_at
+    o.osm_id_full AS original_id,
+    JSONB_BUILD_OBJECT('und', o.name_clean) AS name,
+    JSONB_BUILD_OBJECT('und', 'police', 'eng', 'police', 'dut', 'politie', 'fre', 'police', 'ger', 'Polizei') AS legend_item,
+    '", li_police_generic, "'::uuid AS legend_item_id,
+    o.source AS name_source,
+    JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
+      'other_names', NULLIF(CONCAT_WS('; ', short_name, official_name, alt_name, old_name), ''),
+      'address', CASE 
+        WHEN addr_street IS NULL THEN NULL 
+        ELSE LTRIM(CONCAT(addr_street, ' ' || CASE WHEN nohousenumber='yes' THEN 'w/n' ELSE addr_housenumber END, ', ' || CONCAT((addr_postcode || ' '), addr_city))) 
+      END,
+      'website', NULLIF(CONCAT_WS('; ', o.website, o.contact_website), ''),
+      'email', NULLIF(CONCAT_WS('; ', o.email, o.contact_email), ''),
+      'phone', NULLIF(CONCAT_WS('; ', o.phone, o.contact_phone, o.mobile, o.contact_mobile, o.phone_2), ''),
+      'wikidata', NULLIF(CONCAT_WS('; ', o.wikidata, o.operator_wikidata), ''),
+      'quality_remark', CASE 
+        WHEN o.operator_wikidata IS NOT NULL OR EXTRACT(YEAR FROM CURRENT_DATE) - CAST(LEFT(o.check_date, 4) AS NUMERIC) < 3
+        THEN 'not found in official sources but high confidence'
+        ELSE 'not found in official sources'
+      END
+    )) AS properties,
+    o.geometry AS geometry,
+    CURRENT_DATE AS created_at
   FROM name_cleaned o
   LEFT JOIN ingestion.local_police p ON o.osm_id_full = p.original_id
-  WHERE p.name_source IS null;
-")
+  WHERE p.name_source IS NULL;"),"
+  ALTER TABLE IF EXISTS ingestion.police_osm OWNER to pgn_group_data_team_w;","
+  GRANT ALL ON TABLE ingestion.police_osm TO pgn_group_data_team_w;","
+  GRANT ALL ON TABLE ingestion.police_osm TO pgn_user_airflow;"
+)
+
 
 
 
 ### Create SQL for final ingestion table ----
 
-sql_merge <- c(
-  "DROP TABLE IF EXISTS ingestion.police CASCADE;",
+sql_merge <- c("DROP TABLE IF EXISTS ingestion.police CASCADE;",
   "CREATE TABLE IF NOT EXISTS ingestion.police
 (
   id uuid NOT NULL DEFAULT gen_random_uuid(),
   original_id text,    
   name jsonb,
   legend_item jsonb,
+  legend_item_id uuid,
   data_list_id uuid,
   risk_level integer,
   properties jsonb,
@@ -707,13 +735,13 @@ WITH merge AS
   SELECT * FROM ingestion.police_osm),
 
 alldata AS (SELECT *, 
-CASE WHEN name_source='OSM' THEN '",data_list_id_osm,"'
-ELSE '",data_list_id_dri,"' END as data_list_id 
+CASE WHEN name_source='OSM' THEN '",data_list_id_osm,"'::uuid
+ELSE '",data_list_id_dri,"'::uuid END as data_list_id 
 FROM merge)
   
 
-INSERT INTO ingestion.police (id, original_id, name, legend_item, data_list_id, risk_level, properties, properties_secondary, geometry, created_at)
-select id, original_id, name, legend_item,
+INSERT INTO ingestion.police (id, original_id, name, legend_item, legend_item_id, data_list_id, risk_level, properties, properties_secondary, geometry, created_at)
+select id, original_id, name, legend_item, legend_item_id,
 data_list_id::uuid,
 0 as risk_level, properties, 
 CASE WHEN name_source='OSM' AND properties_secondary <> '{}' THEN 
@@ -727,14 +755,9 @@ created_at as created_at
 FROM alldata
 WHERE geometry IS NOT NULL;
 "),"
---add this if you want to be able to easily test the data in QGIS
---DROP TABLE IF EXISTS tst.transf_police CASCADE;
-","
---CREATE TABLE tst.transf_police AS
---SELECT *,
---CASE WHEN ST_GeometryType(geometry) = 'ST_Point' THEN geometry END as geometry_point,
---CASE WHEN ST_GeometryType(geometry) = 'ST_MultiPolygon' THEN geometry END AS geometry_poly
---FROM ingestion.police;"
+ALTER TABLE IF EXISTS ingestion.police_osm OWNER to pgn_group_data_team_w;","
+GRANT ALL ON TABLE ingestion.police TO pgn_group_data_team_w;","
+GRANT ALL ON TABLE ingestion.police TO pgn_user_airflow;"
 )
 
 
@@ -745,6 +768,8 @@ WHERE geometry IS NOT NULL;
 TransformLocalPolice <- function() {execute_sql_commands(sql_local_police, "Official police data transformation")}
 TransformOSM <- function() {execute_sql_commands(sql_osm, "OSM police data transformation")}
 TransformMergeAll <- function() {execute_sql_commands(sql_merge, "Merge police data")}
+
+
 
 #When running manually: use the parameters at the start of the code to change defaults
 run_smart_update = function() {
@@ -769,9 +794,7 @@ main_function = function() {
     TransformMergeAll()
   }
   run_smart_update()
-  #create_transformation_table()
 }
-
 
 if(run_status){
   main_function()

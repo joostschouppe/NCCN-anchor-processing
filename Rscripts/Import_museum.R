@@ -16,35 +16,51 @@
 # Load variables -----------------------------------------------------------
 #  """""""""""""""""" ----------------------
 
-readRenviron("C:/projects/pgn-data-airflow/.Renviron")
+# External IDs
+data_list_id <- "09faf6c9-fb36-44ff-9ea3-3643cca17df6"
+legend_item_id <- "3b565ddc-0d72-4c5f-8a32-c1329ab2323b"
 
+
+#readRenviron("C:/projects/pgn-data-airflow/.Renviron")
+
+# connection details
 db_host_name <- Sys.getenv("POSTGRES_HOST_NAME")
 postgres_user <- Sys.getenv("POSTGRES_USER")
 postgres_password <- Sys.getenv("POSTGRES_PASSWORD")
 db_name<- Sys.getenv("POSTGRES_DB_NAME_CURATED")
 
-data_list_id<-"09faf6c9-fb36-44ff-9ea3-3643cca17df6"
-log_folder <- "C:/temp/logs/"
+# run status
+run_status<-Sys.getenv("RUN_STATUS")
+## this is set to false and prevents any accidental changes to the database by switching off the main_function(). On Airflow, this is set to true.
+run_status<-ifelse(tolower(run_status) == "true", TRUE, FALSE)
+
+# overrule the checks
+overrule_checks<-Sys.getenv("OVERRULE_CHECKS")
+## Set to FALSE by default. That means we do not update the anchors if some tests fail. Those tests include "the data has grown or shrunk by a lot of objects". If, after review of the log, you decide that nothing is wrong, set this manually to TRUE.
+# If the input is not correctly understood as boolean, this will force it to it.
+overrule_checks<-ifelse(tolower(overrule_checks) == "true", TRUE, FALSE)
+
+# Do not run the main part of the processing, but just do an update based on the ingestion table already in the dbase
+reuse_ingestion_data<-Sys.getenv("REUSE_INGESTION_DATA")
+reuse_ingestion_data<-ifelse(tolower(reuse_ingestion_data) == "true", TRUE, FALSE)
+
+# Only run the comparison script & update the ingestion table, but do not attempt to update the transformation table
+do_dry_run<-Sys.getenv("DO_DRY_RUN")
+do_dry_run<-ifelse(tolower(do_dry_run) == "true", TRUE, FALSE)
+
+
+
+# Set log folder
+log_folder <- Sys.getenv("RSCRIPT_LOG_FOLDER")
 
 ### Load external functions ------
+rscript_folder <- Sys.getenv("LOCAL_RSCRIPT_PATH")
+source(paste0(rscript_folder,"/utils_updated_check_protoanchors.R"))
+source(paste0(rscript_folder,"/utils.R"))
 
-rscript_folder <- "C:/projects/pgn-data-airflow/rscripts/"
-source(paste0(rscript_folder,"utils_updated_check_protoanchors.R"))
-source(paste0(rscript_folder,"utils.R"))
-
-# Libraries -------------------------------
+# Extra libraries -------------------------------
 # """""""""""""""""" ----------------------
-
-library(sf)
-library(RPostgres)
-library(DBI)
-
-## Data processing libraries
-library(dplyr)
-
-
-## OSM library
-library(osmdata)
+# all are loaded via the utils
 
 
 
@@ -53,6 +69,10 @@ library(osmdata)
 # EXTRACT ----
 # """""""""""""""""" ----
 
+# Function to download fresh data ----
+process_fresh_data <- function(){
+  # Default: download fresh data
+  if (reuse_ingestion_data==FALSE) {
 
 # Download OSM data ----
 ### OSM DOWNLOAD PARAMETERS ----
@@ -60,8 +80,7 @@ library(osmdata)
 # Define the list of features
 features_list <- list("tourism" = "museum")
 
-# If default server fails, set to TRUE to use mail.ru server (older data)
-alternative_overpass_server<-FALSE
+
 # Define extra tags to use as columns for properties
 extra_columns <- c("description", "museum", "level", "tourism")
 # Choose which datatypes are needed, as a list of datatypes, using any of "points", "lines", "mpolygons" (this is polygons+multipolygons together)
@@ -74,7 +93,7 @@ datatypes <- c("points", "mpolygon")
 
 tryCatch({
   # Call the large function
-  osm_all<-download_osm_process(features_list, datatypes, extra_columns, alternative_overpass_server, keep_region=TRUE )
+  osm_all<-download_osm_process(features_list, datatypes, extra_columns, postgres=TRUE, keep_region=TRUE )
   print("OSM data downloaded & processes succesfully")
 }, error = function(e) {
   # Print error message
@@ -193,9 +212,12 @@ join_filtered <- st_as_sf(join_filtered, "geometry")
 
 
 # Upload to raw data ----
+CreateImportTable(dataset = join_filtered, schema = "raw_data", table_name = "osm_museum") 
 
-# CreateImportTable is loaded via utils and called in the main function
-
+} else {
+  print("No fresh data downloaded because user requested to re-use existing data")
+}
+} # end process_fresh_data function
 
 
 
@@ -212,7 +234,8 @@ CREATE TABLE IF NOT EXISTS ingestion.museum
   original_id text,  
   name jsonb,
   legend_item jsonb,
-  data_list_id text,
+  legend_item_id uuid,
+  data_list_id uuid,
   risk_level integer,
   properties jsonb,
   properties_secondary jsonb,
@@ -238,6 +261,7 @@ cleaned as (SELECT
               'fre', 'musée',
               'ger', 'Museum',
               'eng', 'museum') as legend_item,
+'",legend_item_id,"'::uuid as legend_item_id,
             CASE WHEN short_name IS NULL AND official_name IS NULL AND alt_name IS NULL AND old_name IS NULL THEN NULL 
 	ELSE CONCAT_WS('; ',short_name, official_name, alt_name, old_name) END AS other_names,
 CASE WHEN addr_street IS NULL THEN NULL 
@@ -254,12 +278,13 @@ operator_website,operator_wikidata,operator,
 description,museum,level,
 	geometry FROM raw_data.osm_museum)
 INSERT INTO ingestion.museum 
-(original_id, name, legend_item, data_list_id, risk_level, properties, geometry, created_at)
+(original_id, name, legend_item, legend_item_id, data_list_id, risk_level, properties, geometry, created_at)
 SELECT
 original_id,
 name,
 legend_item,
-'",data_list_id,"' as data_list_id,
+legend_item_id,
+'",data_list_id,"'::uuid as data_list_id,
 1 as risk_level,
 JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
   'other_names', other_names,
@@ -276,75 +301,10 @@ JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
 )),
 geometry,
 CURRENT_DATE as created_at
-FROM cleaned;
-"))
-                            
-### Create transformation table ----
-transformation_table_sql <- c("
-DROP TABLE IF EXISTS transformation.museum CASCADE;
-","
-CREATE TABLE IF NOT EXISTS transformation.museum
-  (
-    id uuid NOT NULL DEFAULT gen_random_uuid(),
-    original_id text,    
-    name jsonb,
-    legend_item jsonb,
-	data_list_id uuid,
-	risk_level integer,
-    properties jsonb,
-	properties_secondary jsonb,
-	imported_at timestamptz,
-	tags jsonb,
-	deleted_at timestamptz,
-	updated_at timestamptz,
-	created_at timestamptz,
-	created_by uuid,
-	updated_by uuid,
-    geometry geometry(geometry, 4326),
-    CONSTRAINT museum_pkey PRIMARY KEY (id)
-  );
-","
-INSERT INTO transformation.museum
-(id, original_id, name, legend_item, data_list_id, properties, geometry, created_at)
-SELECT id, original_id, name, legend_item, data_list_id::uuid, properties, geometry, created_at FROM ingestion.museum;
-")
-
-
-### Create fdw views ----
-fdw_views_sql <- c("
-DROP VIEW IF EXISTS fdw.fdw_museum CASCADE;
-","
-CREATE OR REPLACE VIEW fdw.fdw_museum
-AS
-SELECT id,
-original_id,
-name,
-legend_item,
-NULL::uuid as best_address_id,
-NULL::uuid as capakey_id,
-data_list_id,
-risk_level,
-properties,
-properties_secondary,
-imported_at,
-tags,
-deleted_at,
-updated_at,
-created_at,
-created_by,
-updated_by,
-st_reduceprecision(geometry, 0.000001::double precision) AS geometry,
-st_reduceprecision(st_pointonsurface(geometry), 0.000001::double precision) AS geometry_pt,
-CASE
-  WHEN st_geometrytype(geometry) = ANY (ARRAY['ST_Point'::text, 'ST_LineString'::text]) THEN st_reduceprecision(st_transform(st_buffer(st_transform(geometry, 31370), 20::double precision), 4326), 0.000001::double precision)
-  ELSE geometry
-  END AS geometry_pg
-FROM transformation.museum;
-","
-GRANT ALL ON TABLE fdw.fdw_museum TO paragon;
-")
-
-
+FROM cleaned;"),
+"ALTER TABLE ingestion.museum OWNER to pgn_group_data_team_w;",
+"GRANT ALL ON TABLE ingestion.museum TO pgn_group_data_team_w;",
+"GRANT ALL ON TABLE ingestion.museum TO pgn_user_airflow;")
 
 
 
@@ -352,17 +312,10 @@ GRANT ALL ON TABLE fdw.fdw_museum TO paragon;
 
 
 create_ingestion_table <- function() {execute_sql_commands(ingestion_table_sql, "Ingestion table")}
-create_transformation_table <- function() {execute_sql_commands(transformation_table_sql, "Transformation table")}
-create_fdw_views <- function() {execute_sql_commands(fdw_views_sql, "FDW view")}
 
-
-
-# set to TRUE if you want to update the transformation table even if the checks fail. 
-update_even_if_checks_fail<-FALSE
-# Don't forget to also set checks_failed<-0 if there were already some issues in the base data
 
 run_smart_update = function() {
-  smart_update_process("museum", 50, 100, 50, format(Sys.Date(), "%Y-%m-%d"), update_even_if_checks_fail)
+  smart_update_process("museum", 50, 100, 50, format(Sys.Date(), "%Y-%m-%d"), allow_update_even_if_checks_fail=overrule_checks, dry_run=do_dry_run,reuse_ingestion_data=reuse_ingestion_data)
 }
 
 
@@ -371,14 +324,18 @@ run_smart_update = function() {
 # """"""""""""""""""""----
 
 main_function = function() {
-  CreateImportTable(dataset = join_filtered, schema = "raw_data", table_name = "osm_museum") 
-  create_ingestion_table()
+  if (!reuse_ingestion_data) {
+    process_fresh_data()
+    create_ingestion_table()
+  }
   run_smart_update()
-  #create_transformation_table()
-  #create_fdw_views()
 }
 
-if(F){
+
+if (run_status) {
   main_function()
 }
+
+
+
 

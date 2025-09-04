@@ -11,9 +11,21 @@
 ##
 ## ---------------------------
 
+# Load variables ------
+#  """""""""""""""""" ------
+
+data_list_id <- "8e9397ed-e8c2-490a-b0e7-32f4bf4e3f84"
+
+li_fetrapi_beacon <- "ce68e5a4-13a5-4eee-804f-1c7840998337"
+li_fetrapi_pipeline <- "34457d0f-2269-484b-8ad5-0ab99470ffdd"
+li_fetrapi_site <- "0e744e22-d66e-4381-aa89-2dc8cace8868"
+li_fetrapi_station <- "264567ce-f82e-4b60-b690-7b668c435804"
+
 
 
 # Set parameters ------
+
+
 
 readRenviron("C:/projects/pgn-data-airflow/.Renviron")
 local_folder <- "C:/temp/fetrapi/"
@@ -36,9 +48,6 @@ source(paste0(rscript_folder,"utils.R"))
 
 
 
-
-# Load variables ------
-#  """""""""""""""""" ------
 
 
 
@@ -157,6 +166,7 @@ filename <- headers(downloaded_data)$`content-disposition`
 filename_start <- regexpr("filename=", filename)
 filename <- substr(filename, filename_start + 9, nchar(filename))
 date_part <- substr(filename, 15, 22)
+print(paste0("Data being processed for dataset version date: ", date_part))
 
 # write the file
 dir.create(local_folder, recursive = TRUE, showWarnings = FALSE)
@@ -527,22 +537,23 @@ CREATE TABLE IF NOT EXISTS ingestion.pipelines_sites
     original_id text,    
     name jsonb,
     legend_item jsonb,
-	data_list_id text,
-	risk_level integer,
+    legend_item_id uuid,
+  	data_list_id uuid,
+  	risk_level integer,
     properties jsonb,
-	properties_secondary jsonb,
-	imported_at timestamptz,
-	tags jsonb,
-	deleted_at timestamptz,
-	updated_at timestamptz,
-	created_at timestamptz,
-	created_by uuid,
-	updated_by uuid,
+  	properties_secondary jsonb,
+  	imported_at timestamptz,
+  	tags jsonb,
+  	deleted_at timestamptz,
+  	updated_at timestamptz,
+  	created_at timestamptz,
+  	created_by uuid,
+  	updated_by uuid,
     geometry geometry(geometry, 4326),
     CONSTRAINT pipelines_sites_pkey PRIMARY KEY (id)
   );
-","
-WITH cleaned as (SELECT
+",
+paste0("WITH cleaned as (SELECT
 id_number AS original_id,
 jsonb_build_object('und', id_name) as name,			
 jsonb_build_object(
@@ -555,12 +566,13 @@ geometry
 FROM raw_data.fetrapi_adcr_site)
 
 INSERT INTO ingestion.pipelines_sites
-(original_id, name, legend_item, data_list_id, properties, geometry, created_at)
+(original_id, name, legend_item, legend_item_id, data_list_id, properties, geometry, created_at)
 SELECT
 original_id,
 name,
 legend_item,
-'8e9397ed-e8c2-490a-b0e7-32f4bf4e3f84' as data_list_id,
+'",li_fetrapi_site,"'::uuid as legend_item_id,
+'",data_list_id,"'::uuid as data_list_id,
 JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
 	'function', function,
 	'state', state,
@@ -574,7 +586,10 @@ JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
 geometry,
 CURRENT_DATE as created_at
 FROM cleaned;
-")
+"),
+"ALTER TABLE ingestion.pipelines_sites OWNER to pgn_group_data_team_w;",
+"GRANT ALL ON TABLE ingestion.pipelines_sites TO pgn_group_data_team_w;",
+"GRANT ALL ON TABLE ingestion.pipelines_sites TO pgn_user_airflow;")
 
 ingestion_table_sql_s <- c("
 DROP TABLE IF EXISTS ingestion.pipelines_stations CASCADE;
@@ -585,21 +600,22 @@ CREATE TABLE IF NOT EXISTS ingestion.pipelines_stations
     original_id text,    
     name jsonb,
     legend_item jsonb,
-	data_list_id text,
-	risk_level integer,
+    legend_item_id uuid,
+  	data_list_id uuid,
+	  risk_level integer,
     properties jsonb,
-	properties_secondary jsonb,
-	imported_at timestamptz,
-	tags jsonb,
-	deleted_at timestamptz,
-	updated_at timestamptz,
-	created_at timestamptz,
-	created_by uuid,
-	updated_by uuid,
+  	properties_secondary jsonb,
+  	imported_at timestamptz,
+  	tags jsonb,
+  	deleted_at timestamptz,
+  	updated_at timestamptz,
+  	created_at timestamptz,
+  	created_by uuid,
+  	updated_by uuid,
     geometry geometry(geometry, 4326),
     CONSTRAINT pipeline_stations_pkey PRIMARY KEY (id)
   );
-","
+",paste0("
 WITH cleaned as (SELECT
 id_number AS original_id,
 jsonb_build_object('und', id_name) as name,			
@@ -613,12 +629,13 @@ geometry
 FROM raw_data.fetrapi_adcr_s)
 
 INSERT INTO ingestion.pipelines_stations
-(original_id, name, legend_item, data_list_id, properties, geometry, created_at)
+(original_id, name, legend_item, legend_item_id, data_list_id, properties, geometry, created_at)
 SELECT
 original_id,
 name,
 legend_item,
-'8e9397ed-e8c2-490a-b0e7-32f4bf4e3f84' as data_list_id,
+'",li_fetrapi_station,"'::uuid as legend_item_id,
+'",data_list_id,"'::uuid as data_list_id,
 JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
 	'function', function,
 	'state', state,
@@ -632,7 +649,10 @@ JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
 geometry,
 CURRENT_DATE as created_at
 FROM cleaned;
-")
+"),
+"ALTER TABLE ingestion.pipelines_stations OWNER to pgn_group_data_team_w;",
+"GRANT ALL ON TABLE ingestion.pipelines_stations TO pgn_group_data_team_w;",
+"GRANT ALL ON TABLE ingestion.pipelines_stations TO pgn_user_airflow;")
 
 
 # NOTE: select code manually
@@ -644,7 +664,8 @@ CREATE TABLE IF NOT EXISTS ingestion.pipelines_beacons
   original_id text,    
   name jsonb,
   legend_item jsonb,
-  data_list_id text,
+  legend_item_id uuid,
+  data_list_id uuid,
   risk_level integer,
   properties jsonb,
   properties_secondary jsonb,
@@ -658,31 +679,35 @@ CREATE TABLE IF NOT EXISTS ingestion.pipelines_beacons
   geometry geometry(geometry, 4326),
   CONSTRAINT pipeline_beacons_pkey PRIMARY KEY (id)
 );
-","
+",paste0("
 WITH cleaned as (SELECT
-                 id_number AS original_id,
-                 jsonb_build_object('und', id_number) as name,			
-                 jsonb_build_object(
-                   'eng', 'pipeline beacons',
-                   'dut', 'pijpleiding bakens',
-                   'fre', 'pipeline balise',
-                   'ger', 'Rohrleitungleuchtfeuer') as legend_item,
-                 owner,delivery_d,
-                 geometry
-                 FROM raw_data.fetrapi_adcr_b)
+  id_number AS original_id,
+  jsonb_build_object('und', id_number) as name,			
+  jsonb_build_object(
+    'eng', 'pipeline beacons',
+    'dut', 'pijpleiding bakens',
+    'fre', 'pipeline balise',
+    'ger', 'Rohrleitungleuchtfeuer') as legend_item,
+  owner,delivery_d,
+  geometry
+  FROM raw_data.fetrapi_adcr_b)
 INSERT INTO ingestion.pipelines_beacons
-(original_id, name, legend_item, data_list_id, properties, geometry, created_at)
+(original_id, name, legend_item, legend_item_id, data_list_id, properties, geometry, created_at)
 SELECT
 original_id,
 name,
 legend_item,
-'8e9397ed-e8c2-490a-b0e7-32f4bf4e3f84' as data_list_id,
+'",li_fetrapi_beacon,"'::uuid as legend_item_id,
+'",data_list_id,"'::uuid as data_list_id,
 JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
   'owner', owner,
   'delivery_d', delivery_d)),
 geometry,
 CURRENT_DATE as created_at
-FROM cleaned;")
+FROM cleaned;"),
+"ALTER TABLE ingestion.pipelines_beacons OWNER to pgn_group_data_team_w;",
+"GRANT ALL ON TABLE ingestion.pipelines_beacons TO pgn_group_data_team_w;",
+"GRANT ALL ON TABLE ingestion.pipelines_beacons TO pgn_user_airflow;")
 
                            
 ingestion_table_sql_p <- c("
@@ -694,21 +719,22 @@ CREATE TABLE IF NOT EXISTS ingestion.pipelines
     original_id text,    
     name jsonb,
     legend_item jsonb,
-	data_list_id text,
-	risk_level integer,
+    legend_item_id uuid,
+  	data_list_id uuid,
+  	risk_level integer,
     properties jsonb,
-	properties_secondary jsonb,
-	imported_at timestamptz,
-	tags jsonb,
-	deleted_at timestamptz,
-	updated_at timestamptz,
-	created_at timestamptz,
-	created_by uuid,
-	updated_by uuid,
+  	properties_secondary jsonb,
+  	imported_at timestamptz,
+  	tags jsonb,
+  	deleted_at timestamptz,
+  	updated_at timestamptz,
+  	created_at timestamptz,
+  	created_by uuid,
+  	updated_by uuid,
     geometry geometry(geometry, 4326),
     CONSTRAINT pipelines_pkey PRIMARY KEY (id)
   );
-","
+",paste0("
 WITH cleaned as (SELECT
 id_number AS original_id,
 jsonb_build_object('und', id_name) as name,			
@@ -722,12 +748,13 @@ ST_LineMerge(geometry) as geometry
 FROM raw_data.fetrapi_adcr_p)
 
 INSERT INTO ingestion.pipelines
-(original_id, name, legend_item, data_list_id, properties, geometry, created_at)
+(original_id, name, legend_item, legend_item_id, data_list_id, properties, geometry, created_at)
 SELECT
 original_id,
 name,
 legend_item,
-'8e9397ed-e8c2-490a-b0e7-32f4bf4e3f84' as data_list_id,
+'",li_fetrapi_pipeline,"'::uuid as legend_item_id,
+'",data_list_id,"'::uuid as data_list_id,
 JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
 	'state', state,
 	'mop', mop,
@@ -741,7 +768,10 @@ JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
 geometry,
 CURRENT_DATE as created_at
 FROM cleaned;
-")
+"),
+"ALTER TABLE ingestion.pipelines OWNER to pgn_group_data_team_w;",
+"GRANT ALL ON TABLE ingestion.pipelines TO pgn_group_data_team_w;",
+"GRANT ALL ON TABLE ingestion.pipelines TO pgn_user_airflow;")
 
 
 
@@ -922,7 +952,7 @@ paragon_import = function() {
 # different_id_distance_unique_threshold<-50
 # Identifying name for the version of the dataset that was used for this process
 # source_identifier<-date_part
-# source_identifier<-"20240308"
+# source_identifier<-"20250703"
 # If TRUE, the transformation table will be updated, even if the tests fail. Do this if you have verified that the changes in the data are understandable and acceptable.
 # allow_update_even_if_checks_fail <- FALSE
 

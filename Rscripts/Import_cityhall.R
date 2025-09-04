@@ -12,41 +12,57 @@
 ## ---------------------------
 
 
-
 # Load variables -----------------------------------------------------------
 #  """""""""""""""""" ----------------------
 
-readRenviron("C:/projects/pgn-data-airflow/.Renviron")
+li_town_hall <- "968bb9ac-51f0-42e2-ac13-cb6938eb5260"
+li_municipal_building <- "611c6125-3a7e-4fe8-9223-a677c522e5e5"
+
+data_list_id<-"c4dcb93c-8a52-4239-8763-97194ed3a793"
+
+#readRenviron("C:/projects/pgn-data-airflow/.Renviron")
 
 db_host_name <- Sys.getenv("POSTGRES_HOST_NAME")
 postgres_user <- Sys.getenv("POSTGRES_USER")
 postgres_password <- Sys.getenv("POSTGRES_PASSWORD")
 db_name<- Sys.getenv("POSTGRES_DB_NAME_CURATED")
 
-data_list_id<-"c4dcb93c-8a52-4239-8763-97194ed3a793"
-log_folder <- "C:/temp/logs/"
-NGI_file <- "C:/projects/proto-anchors/raw-data/NGI/poi_elementsofgeneralinterest_4326.gpkg"
 
+# run status
+run_status<-Sys.getenv("RUN_STATUS")
+## this is set to false and prevents any accidental changes to the database by switching off the main_function(). On Airflow, this is set to true.
+run_status<-ifelse(tolower(run_status) == "true", TRUE, FALSE)
+
+# overrule the checks
+overrule_checks<-Sys.getenv("OVERRULE_CHECKS")
+## Set to FALSE by default. That means we do not update the anchors if some tests fail. Those tests include "the data has grown or shrunk by a lot of objects". If, after review of the log, you decide that nothing is wrong, set this manually to TRUE.
+# If the input is not correctly understood as boolean, this will force it to it.
+overrule_checks<-ifelse(tolower(overrule_checks) == "true", TRUE, FALSE)
+
+# Do not run the main part of the processing, but just do an update based on the ingestion table already in the dbase
+reuse_ingestion_data<-Sys.getenv("REUSE_INGESTION_DATA")
+reuse_ingestion_data<-ifelse(tolower(reuse_ingestion_data) == "true", TRUE, FALSE)
+
+# Only run the comparison script & update the ingestion table, but do not attempt to update the transformation table
+do_dry_run<-Sys.getenv("DO_DRY_RUN")
+do_dry_run<-ifelse(tolower(do_dry_run) == "true", TRUE, FALSE)
+
+# Set location for temporary files
+temporary_folder <-Sys.getenv("TEMPORARY_STORAGE")
+
+# Set log folder
+log_folder <- Sys.getenv("RSCRIPT_LOG_FOLDER")
+
+
+
+
+NGI_url <- "https://ac.ngi.be/remoteclient-open/ngi-standard-open/Vectordata/POI/POI-ElementsOfGeneralInterest/6c697427-8b2e-4bc6-8737-50e7cf12f5b4_geopackage+sqlite3_4326.zip"
 
 ### Load external functions ------
 
-rscript_folder <- "C:/projects/pgn-data-airflow/rscripts/"
-source(paste0(rscript_folder,"utils_updated_check_protoanchors.R"))
-source(paste0(rscript_folder,"utils.R"))
-
-
-# Libraries -------------------------------
-# """""""""""""""""" ----------------------
-
-library(sf)
-library(RPostgres)
-library(DBI)
-
-## Data processing libraries
-library(dplyr)
-
-
-
+rscript_folder <- Sys.getenv("LOCAL_RSCRIPT_PATH")
+source(file.path(rscript_folder,"utils_updated_check_protoanchors.R"))
+source(file.path(rscript_folder,"utils.R"))
 
 
 
@@ -54,10 +70,23 @@ library(dplyr)
 # EXTRACT ----
 # """""""""""""""""" ----
 
+PrepareNewData <- function(){
+
+# Download the data ----
+
+
+zip_path <- file.path(temporary_folder, "ngi_poi.zip")
+
+# Download the zip file
+GET(NGI_url, write_disk(zip_path, overwrite = TRUE))
+
+# Unzip it
+unzip(zip_path, exdir = temporary_folder)
+
 # Import NGI data ----
 
 #yes, there is a typo in the name of the layer
-ngi_muni <- st_read(NGI_file, layer = "municpalitybuilding")
+ngi_muni <- st_read(file.path(temporary_folder, "poi_elementsofgeneralinterest_4326.gpkg"), layer = "municpalitybuilding")
 
 # force geom to 2D
 ngi_muni <- st_zm(ngi_muni, drop = TRUE)
@@ -169,19 +198,9 @@ ngi_townhalls <- ngi_townhalls %>%
 
 # simplify dataset
 ngi_townhalls <- st_set_geometry(ngi_townhalls, "geom")
-ngi_townhalls <-ngi_townhalls %>%
+ngi_townhalls <<-ngi_townhalls %>%
   select(tgid, real_town_hall, language, nameger, namefre, namedut, count_ordering, ordering_number)
-
-
-
-
-
-
-
-
-
-
-# CreateImportTable is loaded via utils and called in the main function
+}
 
 
 
@@ -189,7 +208,7 @@ ngi_townhalls <-ngi_townhalls %>%
 # """""""""""""""""" ----
 
 
-# Create transformation table ----
+# Create ingestion table ----
 ingestion_table_sql <- c("DROP TABLE IF EXISTS ingestion.town_halls CASCADE;",
 "CREATE TABLE IF NOT EXISTS ingestion.town_halls
 (
@@ -197,6 +216,7 @@ ingestion_table_sql <- c("DROP TABLE IF EXISTS ingestion.town_halls CASCADE;",
   original_id text,    
   name jsonb,
   legend_item jsonb,
+  legend_item_id uuid,
   data_list_id uuid,
   risk_level integer,
   properties jsonb,
@@ -227,15 +247,18 @@ ingestion_table_sql <- c("DROP TABLE IF EXISTS ingestion.town_halls CASCADE;",
     'ger', 'städtisches Gebäude',
     'eng', 'municipal building')
   END as legend_item,
+  CASE 
+    WHEN real_town_hall=1 THEN '",li_town_hall,"'::uuid
+    ELSE '",li_municipal_building,"'::uuid END 
+    AS legend_item_id,
   CASE WHEN count_ordering>1 THEN nameger || ' (' || ordering_number || '/' || count_ordering || ')' ELSE nameger END as nameger,
   CASE WHEN count_ordering>1 THEN namedut || ' (' || ordering_number || '/' || count_ordering || ')' ELSE namedut END as namedut,
   CASE WHEN count_ordering>1 THEN namefre || ' (' || ordering_number || '/' || count_ordering || ')' ELSE namefre END as namefre,
-'",data_list_id,"' as data_list_id,
   geom as geometry
   FROM raw_data.ngi_ign_municipality_building)
 
 INSERT INTO ingestion.town_halls 
-(original_id, name, legend_item, data_list_id, risk_level, geometry, created_at)
+(original_id, name, legend_item, legend_item_id, data_list_id, risk_level, geometry, created_at)
 SELECT
 tgid as original_id,
 CASE WHEN real_town_hall=1 THEN 
@@ -249,12 +272,15 @@ jsonb_build_object(
   'ger', 'Städtisches Gebäude ' || nameger) END
 AS name,
 legend_item,
-data_list_id::uuid as data_list_id,
+legend_item_id,
+'",data_list_id,"'::uuid as data_list_id,
 1 as risk_level,
 geometry,
 CURRENT_DATE as created_at
-FROM cleaned;
-"))
+FROM cleaned;"),
+"ALTER TABLE IF EXISTS ingestion.town_halls OWNER to pgn_group_data_team_w;",
+"GRANT ALL ON TABLE ingestion.town_halls TO pgn_group_data_team_w;",
+"GRANT ALL ON TABLE ingestion.town_halls TO pgn_user_airflow;")
 
 
 
@@ -262,71 +288,33 @@ FROM cleaned;
 #LOAD ----
 # """""""""""""""""" ----
 
-# Create fdw views ----
-fdw_views_sql <- c("
-DROP VIEW IF EXISTS fdw.fdw_town_halls CASCADE;
-","
-CREATE OR REPLACE VIEW fdw.fdw_town_halls
-AS
-SELECT id,
-original_id,
-name,
-legend_item,
-NULL::uuid as best_address_id,
-NULL::uuid as capakey_id,
-data_list_id,
-risk_level,
-properties,
-properties_secondary,
-imported_at,
-tags,
-deleted_at,
-updated_at,
-created_at,
-created_by,
-updated_by,
-geometry,
-st_pointonsurface(geometry) AS geometry_pt
-FROM transformation.town_halls;
-","
-ALTER TABLE fdw.fdw_town_halls
-OWNER TO paragon;
-","
-GRANT SELECT ON TABLE fdw.fdw_town_halls TO fdw4paragon;
-","
-GRANT ALL ON TABLE fdw.fdw_town_halls TO paragon;
-")
-
-
 ### Execute the SQL commands ----
 
-
 create_ingestion_table <- function() {execute_sql_commands(ingestion_table_sql, "Ingestion table")}
-create_fdw_views <- function() {execute_sql_commands(fdw_views_sql, "FDW view")}
 
 
+# Prepare update -----
+
+run_smart_update = function() {
+  smart_update_process("town_halls", 50, 100, 50, format(Sys.Date(), "%Y-%m-%d"), allow_update_even_if_checks_fail=overrule_checks, dry_run=do_dry_run,reuse_ingestion_data=reuse_ingestion_data)
+}
 
 # Main function -----------------------------------------------------------
 # """"""""""""""""""""----
 
-# set to TRUE if you want to update the transformation table even if the checks fail. 
-update_even_if_checks_fail<-FALSE
-# Don't forget to also set checks_failed<-0 if there were already some issues in the base data
-
-run_smart_update = function() {
-  smart_update_process("town_halls", 50, 100, 50, format(Sys.Date(), "%Y-%m-%d"), update_even_if_checks_fail)
-}
-
-
 main_function = function() {
-  CreateImportTable(dataset = ngi_townhalls, schema = "raw_data", table_name = "ngi_ign_municipality_building")
-  create_ingestion_table()
+  if (!reuse_ingestion_data) {
+    PrepareNewData()
+    CreateImportTable(dataset = ngi_townhalls, schema = "raw_data", table_name = "ngi_ign_municipality_building")
+    create_ingestion_table()
+  }
+  #create_transformation_table()
   run_smart_update()
-  #create_fdw_views()
 }
 
 
-if(F){
+if(run_status){
   main_function()
 }
+
 

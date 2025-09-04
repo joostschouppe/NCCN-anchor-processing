@@ -294,7 +294,7 @@ osm_all <- osm_all %>%
   mutate(type_kindergarten = ifelse((grepl("kindergarten", osm_all$school, ignore.case = TRUE) | amenity=='kindergarten' | grepl("0", osm_all$isced_level, ignore.case = TRUE)), 1, 0),
          type_primary = ifelse((grepl("primary", osm_all$school, ignore.case = TRUE) | grepl("1", osm_all$isced_level, ignore.case = TRUE)), 1, 0),
          type_secondary = ifelse((grepl("secondary", osm_all$school, ignore.case = TRUE)| grepl("2", osm_all$isced_level, ignore.case = TRUE) | grepl("3", osm_all$isced_level, ignore.case = TRUE)), 1, 0),
-         type_higher_education = ifelse((amenity=='university' | amenity=='college'), 1, 0),
+         type_tertiary = ifelse((amenity=='university' | amenity=='college'), 1, 0),
          type_special_needs = ifelse(grepl("special_education_needs", osm_all$school, ignore.case = TRUE), 1, 0))
 
 
@@ -412,7 +412,7 @@ operator_email,
  NULLIF(CONCAT_WS('; ',b.website, b.contact_website),'') AS local_website,
 	b.operator_website,
 	j.niscode as region,
-	b.type_kindergarten, b.type_primary, b.type_secondary, b.type_higher_education, b.type_special_needs,
+	b.type_kindergarten, b.type_primary, b.type_secondary, b.type_tertiary, b.type_special_needs,
 	b.geometry as geometry
 FROM raw_data.osm_school_point b 
 LEFT JOIN join_region j ON b.osm_id=j.id
@@ -441,14 +441,13 @@ jsonb_strip_nulls(jsonb_build_object(
 			'type_kindergarten',type_kindergarten,
 			'type_primary',type_primary,
 			'type_secondary',type_secondary,
-			'type_higher_education',type_higher_education,
+			'type_tertiary',type_tertiary,
 			'type_special_needs',type_special_needs)	
     	) AS properties,
     geometry,
 	CURRENT_DATE as created_at
 FROM final_table;",
-"ALTER TABLE IF EXISTS ingestion.osm_school_point
-  OWNER to pgn_group_data_team_w;",
+"ALTER TABLE IF EXISTS ingestion.osm_school_point OWNER to pgn_group_data_team_w;",
 "GRANT ALL ON TABLE ingestion.osm_school_point TO pgn_group_data_team_w;",
 "GRANT ALL ON TABLE ingestion.osm_school_point TO pgn_user_airflow;"
 )
@@ -539,9 +538,9 @@ sql_commands_osm_polygons <- c(
 
   -- we prepare a big attribute table from both points & polygons
   attributes AS (
-  	select osm_id,name,name_nl,operator_wikidata,operator,operator_type,addr_city,addr_housenumber,addr_street,addr_postcode,short_name,alt_name,contact_email,email,website,contact_website,phone,contact_phone,opening_hours,check_date,image,wikidata,amenity,faculty,religion,name_fr,name_de,nohousenumber,old_name,official_name,phone_2,mobile,contact_mobile,alt_website,operator_email,operator_website,landuse,grades,isced_level,max_age,min_age,pedagogy,school_language,language_nl,language_de,language_fr,school,language,type_kindergarten,type_primary,type_secondary,type_higher_education,type_special_needs,geometry, 'poly' AS source FROM raw_data.osm_school_polygon
+  	select osm_id,name,name_nl,operator_wikidata,operator,operator_type,addr_city,addr_housenumber,addr_street,addr_postcode,short_name,alt_name,contact_email,email,website,contact_website,phone,contact_phone,opening_hours,check_date,image,wikidata,amenity,faculty,religion,name_fr,name_de,nohousenumber,old_name,official_name,phone_2,mobile,contact_mobile,alt_website,operator_email,operator_website,landuse,grades,isced_level,max_age,min_age,pedagogy,school_language,language_nl,language_de,language_fr,school,language,type_kindergarten,type_primary,type_secondary,type_tertiary,type_special_needs,geometry, 'poly' AS source FROM raw_data.osm_school_polygon
 	  UNION ALL
-    select osm_id,name,name_nl,operator_wikidata,operator,operator_type,addr_city,addr_housenumber,addr_street,addr_postcode,short_name,alt_name,contact_email,email,website,contact_website,phone,contact_phone,opening_hours,check_date,image,wikidata,amenity,faculty,religion,name_fr,name_de,nohousenumber,old_name,official_name,phone_2,mobile,contact_mobile,alt_website,operator_email,operator_website,landuse,grades,isced_level,max_age,min_age,pedagogy,school_language,language_nl,language_de,language_fr,school,language,type_kindergarten,type_primary,type_secondary,type_higher_education,type_special_needs,geometry, 'point' AS source FROM raw_data.osm_school_point
+    select osm_id,name,name_nl,operator_wikidata,operator,operator_type,addr_city,addr_housenumber,addr_street,addr_postcode,short_name,alt_name,contact_email,email,website,contact_website,phone,contact_phone,opening_hours,check_date,image,wikidata,amenity,faculty,religion,name_fr,name_de,nohousenumber,old_name,official_name,phone_2,mobile,contact_mobile,alt_website,operator_email,operator_website,landuse,grades,isced_level,max_age,min_age,pedagogy,school_language,language_nl,language_de,language_fr,school,language,type_kindergarten,type_primary,type_secondary,type_tertiary,type_special_needs,geometry, 'point' AS source FROM raw_data.osm_school_point
 	  where amenity='kindergarten' OR amenity='school' OR amenity='university' OR amenity='college'
   ),
   
@@ -615,7 +614,7 @@ operator_email,
   NULLIF(CONCAT_WS('; ',b.contact_mobile, b.mobile, b.contact_phone, b.phone, b.phone_2),'') AS local_phone,
   NULLIF(CONCAT_WS('; ',b.website, b.contact_website),'') AS local_website,
 	b.operator_website,
-	b.type_kindergarten, b.type_primary, b.type_secondary, b.type_higher_education,b.type_special_needs, b.landuse_count, b.landuse_indicator,
+	b.type_kindergarten, b.type_primary, b.type_secondary, type_tertiary,b.type_special_needs, b.landuse_count, b.landuse_indicator,
 	  b.source,
      CASE 
 	    WHEN aggregation_id=osm_id THEN geometry
@@ -657,7 +656,7 @@ operator_email,
     max(s.type_kindergarten) AS type_kindergarten,
     max(s.type_primary) AS type_primary,
     max(s.type_secondary) AS type_secondary,
-    max(s.type_higher_education) AS type_higher_education,
+    max(type_tertiary) AS type_tertiary,
     max(s.type_special_needs) AS type_special_needs,
     MIN(j.niscode) as region,
 	STRING_AGG(DISTINCT s.source, '; ') AS source,
@@ -696,7 +695,7 @@ WHERE source!='point')
 	  'type_kindergarten',type_kindergarten,
 	  'type_primary',type_primary,
 	  'type_secondary',type_secondary,
-	  'type_higher_education',type_higher_education,
+	  'type_tertiary',type_tertiary,
 	  'type_special_needs',type_special_needs)	
   ) AS properties,
   addr_street AS addr_street,
@@ -709,8 +708,7 @@ WHERE source!='point')
   " DROP TABLE IF EXISTS tst.osm_school_polygon CASCADE;",
   " ALTER TABLE ingestion.osm_school_polygon
   DROP COLUMN REGION;",
-  "ALTER TABLE IF EXISTS ingestion.osm_school_polygon
-  OWNER to pgn_group_data_team_w;",
+  "ALTER TABLE IF EXISTS ingestion.osm_school_polygon OWNER to pgn_group_data_team_w;",
   "GRANT ALL ON TABLE ingestion.osm_school_polygon TO pgn_group_data_team_w;",
   "GRANT ALL ON TABLE ingestion.osm_school_polygon TO pgn_user_airflow;")
 
@@ -1078,7 +1076,7 @@ join <- join %>%
 join$type_kindergarten <- as.numeric(sapply(join$properties, extract_json_value, key = "type_kindergarten"))
 join$type_primary <- as.numeric(sapply(join$properties, extract_json_value, key = "type_primary"))
 join$type_secondary <- as.numeric(sapply(join$properties, extract_json_value, key = "type_secondary"))
-join$type_tertiary <- as.numeric(sapply(join$properties, extract_json_value, key = "type_higher_education"))
+join$type_tertiary <- as.numeric(sapply(join$properties, extract_json_value, key = "type_tertiary"))
 join$type_special_needs <- as.numeric(sapply(join$properties, extract_json_value, key = "type_special_needs"))
 
 join$off_kindergarten <- ifelse(grepl("Maternel", join$type_d_enseignement), 1, 0)
@@ -1639,7 +1637,7 @@ join <- join %>%
 join$type_kindergarten <- as.numeric(sapply(join$properties, extract_json_value, key = "type_kindergarten"))
 join$type_primary <- as.numeric(sapply(join$properties, extract_json_value, key = "type_primary"))
 join$type_secondary <- as.numeric(sapply(join$properties, extract_json_value, key = "type_secondary"))
-join$type_tertiary <- as.numeric(sapply(join$properties, extract_json_value, key = "type_higher_education"))
+join$type_tertiary <- as.numeric(sapply(join$properties, extract_json_value, key = "type_tertiary"))
 join$type_special_needs <- as.numeric(sapply(join$properties, extract_json_value, key = "type_special_needs"))
 
 join$off_kindergarten <- ifelse(grepl("kleuteronderwijs", join$poitype), 1, 0)
@@ -1853,9 +1851,9 @@ vla_summarized <- vla_summarized %>%
         municipality
       ),
       website_administrative = link1,
-      website = link2,
-      phone = telefoon,
-      email = email,
+      local_website = link2,
+      local_phone = telefoon,
+      local_email = email,
       school_types = poitype,
       type_kindergarten = type_kindergarten,
       type_primary = type_primary,
@@ -2210,7 +2208,7 @@ join <- join %>%
 join$type_kindergarten <- as.numeric(sapply(join$properties, extract_json_value, key = "type_kindergarten"))
 join$type_primary <- as.numeric(sapply(join$properties, extract_json_value, key = "type_primary"))
 join$type_secondary <- as.numeric(sapply(join$properties, extract_json_value, key = "type_secondary"))
-join$type_tertiary <- as.numeric(sapply(join$properties, extract_json_value, key = "type_higher_education"))
+join$type_tertiary <- as.numeric(sapply(join$properties, extract_json_value, key = "type_tertiary"))
 # NOTE: no special education defined in GER schools
 
 join$ger_kindergarten <- ifelse(join$type == "grundschule", 1, 0)
@@ -2387,7 +2385,7 @@ ger_summarized <- ger_summarized %>%
         address, ", ",
         postcode
       ),
-      email = email,
+      local_email = email,
       school_types = type,
       contact_person = contact_person,
       type_kindergarten = type_kindergarten,
@@ -2566,7 +2564,8 @@ all_regions <- all_regions %>%
     dut = 'school',
     fre = 'école',
     eng = 'school'
-  ), auto_unbox = TRUE))
+  ), auto_unbox = TRUE)) %>%
+  mutate(legend_item_id='6fda22de-818d-4f55-9093-a7aa560eb441')
 
 # add properties
 all_regions <- all_regions %>% 
@@ -2631,7 +2630,7 @@ print(paste0("The number of invalid, missing, empty geometries and geometrycolle
 # generate UUID & keep only relevant columns
 all_regions <- all_regions %>%
   mutate(id = uuid::UUIDgenerate()) %>%
-  select(id,original_id, name, legend_item, data_list_id, risk_level, properties, properties_secondary, created_at)
+  select(id,original_id, name, legend_item, legend_item_id, data_list_id, risk_level, properties, properties_secondary, created_at)
 
 
 
@@ -2686,22 +2685,23 @@ for (sql_command in sql) {
 # SQL statement to update the table structure
 sql_update_table <- "
 ALTER TABLE ingestion.schools 
-    ALTER COLUMN id SET DATA TYPE uuid USING id::uuid,
-    ALTER COLUMN id SET DEFAULT gen_random_uuid(),
-    ALTER COLUMN name SET DATA TYPE jsonb USING name::jsonb,
-    ALTER COLUMN legend_item SET DATA TYPE jsonb USING legend_item::jsonb,
-    ALTER COLUMN data_list_id SET DATA TYPE uuid USING data_list_id::uuid,
-    ALTER COLUMN risk_level SET DATA TYPE integer USING risk_level::integer,
-    ALTER COLUMN properties SET DATA TYPE jsonb USING properties::jsonb,
-    ALTER COLUMN properties_secondary SET DATA TYPE jsonb USING properties_secondary::jsonb,
-    ALTER COLUMN created_at SET DATA TYPE timestamp with time zone USING created_at::timestamp with time zone,
-    ADD COLUMN imported_at timestamp with time zone,
-    ADD COLUMN tags jsonb,
-    ADD COLUMN deleted_at timestamp with time zone,
-    ADD COLUMN updated_at timestamp with time zone,
-    ADD COLUMN created_by uuid,
-    ADD COLUMN updated_by uuid,
-    ALTER COLUMN geometry TYPE geometry(Geometry,4326) USING geometry::geometry(Geometry,4326);
+ALTER COLUMN id SET DATA TYPE uuid USING id::uuid,
+ALTER COLUMN id SET DEFAULT gen_random_uuid(),
+ALTER COLUMN name SET DATA TYPE jsonb USING name::jsonb,
+ALTER COLUMN legend_item SET DATA TYPE jsonb USING legend_item::jsonb,
+ALTER COLUMN legend_item_id SET DATA TYPE uuid USING legend_item_id::uuid,
+ALTER COLUMN data_list_id SET DATA TYPE uuid USING data_list_id::uuid,
+ALTER COLUMN risk_level SET DATA TYPE integer USING risk_level::integer,
+ALTER COLUMN properties SET DATA TYPE jsonb USING properties::jsonb,
+ALTER COLUMN properties_secondary SET DATA TYPE jsonb USING properties_secondary::jsonb,
+ALTER COLUMN created_at SET DATA TYPE timestamp with time zone USING created_at::timestamp with time zone,
+ADD COLUMN imported_at timestamp with time zone,
+ADD COLUMN tags jsonb,
+ADD COLUMN deleted_at timestamp with time zone,
+ADD COLUMN updated_at timestamp with time zone,
+ADD COLUMN created_by uuid,
+ADD COLUMN updated_by uuid,
+ALTER COLUMN geometry TYPE geometry(Geometry,4326) USING geometry::geometry(Geometry,4326);
 "
 
 # Execute the SQL statement

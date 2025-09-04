@@ -17,6 +17,13 @@
 # Load variables -----------------------------------------------------------
 #  """""""""""""""""" ----------------------
 
+data_list_id_embassy <- "ff7308f6-1aed-46d5-988d-354fd0cdc4f6"
+data_list_id_eu <- "300fde98-8679-4e47-815e-c2329c74abad"
+data_list_id_nato <- "e7f60861-e27a-4941-95b5-ad8c90135792"
+
+legend_item_id_embassy <- "ab76d65b-069f-419c-b6c8-7e76c22f8fba"
+legend_item_id_eu <- "24e767b8-03aa-4a99-a7ef-6cb8d4aaf7ca"
+legend_item_id_nato <- "a6d0692c-2481-45eb-90ba-9bb9afe25a8c"
 
 #readRenviron("C:/projects/pgn-data-airflow/.Renviron")
 
@@ -46,9 +53,7 @@ do_dry_run<-Sys.getenv("DO_DRY_RUN")
 do_dry_run<-ifelse(tolower(do_dry_run) == "true", TRUE, FALSE)
 
 
-data_list_id_embassy<-"ff7308f6-1aed-46d5-988d-354fd0cdc4f6"
-data_list_id_eu<- "300fde98-8679-4e47-815e-c2329c74abad"
-data_list_id_nato<- "e7f60861-e27a-4941-95b5-ad8c90135792"
+
 
 log_folder <- Sys.getenv("RSCRIPT_LOG_FOLDER")
 
@@ -240,7 +245,8 @@ CREATE TABLE IF NOT EXISTS ingestion.embassy
   original_id text,  
   name jsonb,
   legend_item jsonb,
-  data_list_id text,
+  legend_item_id uuid,
+  data_list_id uuid,
   risk_level integer,
   properties jsonb,
   properties_secondary jsonb,
@@ -300,14 +306,17 @@ CASE WHEN website IS NULL AND contact_website IS NULL THEN NULL
             geometry
             FROM raw_data.osm_embassy)
 INSERT INTO ingestion.embassy 
-(original_id, name, legend_item, data_list_id, risk_level, properties, geometry, created_at)
+(original_id, name, legend_item, legend_item_id, data_list_id, risk_level, properties, geometry, created_at)
 SELECT
 original_id,
 name,
 legend_item,
-CASE WHEN category='embassy' THEN'",data_list_id_embassy,"'
-WHEN category='EU institution' THEN'",data_list_id_eu,"'
-ELSE'",data_list_id_nato,"' END as data_list_id,
+CASE WHEN category='embassy' THEN'",legend_item_id_embassy,"'::uuid
+WHEN category='EU institution' THEN'",legend_item_id_eu,"'::uuid
+ELSE'",legend_item_id_nato,"'::uuid END as legend_item_id,
+CASE WHEN category='embassy' THEN'",data_list_id_embassy,"'::uuid
+WHEN category='EU institution' THEN'",data_list_id_eu,"'::uuid
+ELSE'",data_list_id_nato,"'::uuid END as data_list_id,
 1 as risk_level,
 JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
   'other_names', other_names,
@@ -322,54 +331,15 @@ JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
 )),
 geometry,
 CURRENT_DATE as created_at
-FROM cleaned;
-"),
-"ALTER TABLE IF EXISTS ingestion.bus_tram_metro_routes OWNER to pgn_group_data_team_w;",
-"GRANT ALL ON TABLE ingestion.bus_tram_metro_routes TO pgn_group_data_team_w;",
-"GRANT ALL ON TABLE ingestion.bus_tram_metro_routes TO pgn_user_airflow;"
-  )
-                            
-### Create transformation table ----
-transformation_table_sql <- c("
-DROP TABLE IF EXISTS transformation.embassy CASCADE;
-","
-CREATE TABLE IF NOT EXISTS transformation.embassy
-  (
-    id uuid NOT NULL DEFAULT gen_random_uuid(),
-    original_id text,    
-    name jsonb,
-    legend_item jsonb,
-	data_list_id uuid,
-	risk_level integer,
-    properties jsonb,
-	properties_secondary jsonb,
-	imported_at timestamptz,
-	tags jsonb,
-	deleted_at timestamptz,
-	updated_at timestamptz,
-	created_at timestamptz,
-	created_by uuid,
-	updated_by uuid,
-    geometry geometry(geometry, 4326),
-    CONSTRAINT embassy_pkey PRIMARY KEY (id)
-  );
-","
-INSERT INTO transformation.embassy
-(id, original_id, name, legend_item, data_list_id, properties, geometry, created_at)
-SELECT id, original_id, name, legend_item, data_list_id::uuid, properties, geometry, created_at FROM ingestion.embassy;
-")
-
-
-
-
-
-
+FROM cleaned;"),
+"ALTER TABLE IF EXISTS ingestion.embassy OWNER to pgn_group_data_team_w;",
+"GRANT ALL ON TABLE ingestion.embassy TO pgn_group_data_team_w;",
+"GRANT ALL ON TABLE ingestion.embassy TO pgn_user_airflow;")
 
 
 ### Execute the SQL commands ----
 
 create_ingestion_table <- function() {execute_sql_commands(ingestion_table_sql, "Ingestion table")}
-create_transformation_table <- function() {execute_sql_commands(transformation_table_sql, "Transformation table")}
 
 run_smart_update = function() {
   smart_update_process("embassy", 50, 100, 50, format(Sys.Date(), "%Y-%m-%d"), allow_update_even_if_checks_fail=overrule_checks, dry_run=do_dry_run,reuse_ingestion_data=reuse_ingestion_data)
