@@ -37,6 +37,11 @@ library(gdalUtilities) # workaround to get decent geometries from the WFS data
 # Load variables -----------------------------------------------------------
 #  """""""""""""""""" ----------------------
 
+# load external IDs
+data_list_id<-"49725a4e-91b9-40ae-b0c9-ffa72b91878a"
+legend_item_id <- "4b794e79-c233-4979-bd90-7d26fcdc3aa6"
+
+
 readRenviron("C:/projects/pgn-data-airflow/.Renviron")
 
 db_host_name <- Sys.getenv("POSTGRES_HOST_NAME")
@@ -44,7 +49,6 @@ postgres_user <- Sys.getenv("POSTGRES_USER")
 postgres_password <- Sys.getenv("POSTGRES_PASSWORD")
 db_name<- Sys.getenv("POSTGRES_DB_NAME_CURATED")
 
-data_list_id<-"49725a4e-91b9-40ae-b0c9-ffa72b91878a"
 log_folder <- "C:/temp/logs/"
 local_folder <- "C:/projects/proto-anchors/raw-data/"
 
@@ -192,17 +196,18 @@ CREATE TABLE IF NOT EXISTS ingestion.seaports
     original_id text,    
     name jsonb,
     legend_item jsonb,
-	data_list_id text,
-	risk_level integer,
+    legend_item_id uuid,
+	  data_list_id uuid,
+	  risk_level integer,
     properties jsonb,
-	properties_secondary jsonb,
-	imported_at timestamptz,
-	tags jsonb,
-	deleted_at timestamptz,
-	updated_at timestamptz,
-	created_at timestamptz,
-	created_by uuid,
-	updated_by uuid,
+  	properties_secondary jsonb,
+  	imported_at timestamptz,
+  	tags jsonb,
+  	deleted_at timestamptz,
+  	updated_at timestamptz,
+  	created_at timestamptz,
+  	created_by uuid,
+  	updated_by uuid,
     geometry geometry(geometry, 4326),
     CONSTRAINT seaports_pkey PRIMARY KEY (id)
   );
@@ -233,17 +238,21 @@ FROM raw_data.vlaio_bedrijventerreinen_seaports)
 
 
 INSERT INTO ingestion.seaports 
-(original_id, name, legend_item, data_list_id, risk_level, geometry, created_at)
+(original_id, name, legend_item, legend_item_id, data_list_id, risk_level, geometry, created_at)
 SELECT
 original_id,
 name,
 legend_item,
-'",data_list_id,"' as data_list_id,
+'",legend_item_id,"'::uuid as legend_item_id,
+'",data_list_id,"'::uuid as data_list_id,
 2 as risk_level,
 geometry,
 CURRENT_DATE as created_at
-FROM cleaned;
-"))
+FROM cleaned;"),
+"ALTER TABLE IF EXISTS ingestion.seaports OWNER to pgn_group_data_team_w;",
+"GRANT ALL ON TABLE ingestion.seaports TO pgn_group_data_team_w;",
+"GRANT ALL ON TABLE ingestion.seaports TO pgn_user_airflow;"
+)
 
 
 ### Create SQL for transformation table ----
@@ -278,43 +287,10 @@ SELECT original_id, name, legend_item, data_list_id::uuid, properties, geometry,
 
 
 
-### Create fdw views ----
-fdw_views_sql <- c("
-DROP VIEW IF EXISTS fdw.fdw_seaports CASCADE;
-","
-CREATE OR REPLACE VIEW fdw.fdw_seaports
-AS
-SELECT
-id,
-original_id,
-name,
-legend_item,
-NULL::uuid as best_address_id,
-NULL::uuid as capakey_id,
-data_list_id,
-risk_level,
-properties,
-properties_secondary,
-imported_at,
-tags,
-deleted_at,
-updated_at,
-created_at,
-created_by,
-updated_by,
-geometry,
-st_pointonsurface(geometry) AS geometry_pt
-FROM transformation.seaports;
-","
-GRANT SELECT ON TABLE fdw.fdw_seaports TO fdw4dev;
-")
-
-
 ### Execute the SQL commands ----
 
 create_ingestion_table <- function() {execute_sql_commands(ingestion_table_sql, "Ingestion table")}
 create_transformation_table <- function() {execute_sql_commands(transformation_table_sql, "Transformation table")}
-create_fdw_views <- function() {execute_sql_commands(fdw_views_sql, "FDW view")}
 
 
 

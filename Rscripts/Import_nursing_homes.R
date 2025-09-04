@@ -15,6 +15,11 @@
 # Load variables -----------------------------------------------------------
 #  """""""""""""""""" ----------------------
 
+# Set external IDs
+data_list_id<-"7db4a005-0186-4e72-8a7a-e82c2030508c"
+li_elderly_day_care <- "31f9c3fc-8a2f-4548-8f94-9ab9be35d0b3"
+li_wzc_combo <- "20eadaa3-ed0e-4ccc-8776-0b91bc8532ab"
+li_wzc <- "e24e5cbe-077f-44fe-81f7-5cbbf8dfe139"
 
 #readRenviron("C:/projects/pgn-data-airflow/.Renviron")
 
@@ -43,8 +48,7 @@ reuse_ingestion_data<-ifelse(tolower(reuse_ingestion_data) == "true", TRUE, FALS
 do_dry_run<-Sys.getenv("DO_DRY_RUN")
 do_dry_run<-ifelse(tolower(do_dry_run) == "true", TRUE, FALSE)
 
-# Set data list id
-data_list_id<-"7db4a005-0186-4e72-8a7a-e82c2030508c"
+
 
 # Set log folder
 log_folder <- Sys.getenv("RSCRIPT_LOG_FOLDER")
@@ -85,6 +89,7 @@ CREATE TABLE IF NOT EXISTS ingestion.nursing_homes
   original_id text,  
   name jsonb,
   legend_item jsonb,
+  legend_item_id uuid,
   data_list_id uuid,
   risk_level integer,
   properties jsonb,
@@ -273,73 +278,51 @@ jsonb_strip_nulls(jsonb_build_object(
 	jsonb_build_object(
   'dut',case when activity_type='1' then 'woonzorgcentrum'
   when activity_type='2' then 'centrum voor dagverzorging'
-  when activity_type='3' then 'RVT ziekenhuis'
-  when activity_type='4' then 'palliatief centrum' 
+  --when activity_type='3' then 'RVT ziekenhuis' -- removed because these do not exist in the data anymore
+  --when activity_type='4' then 'palliatief centrum' -- removed because they are not deemed relevant for Paragon
 	ELSE 'gecombineerd woonzorgcentrum' END,
   'fre',case when activity_type='1' then 'maison de repos'
   when activity_type='2' then 'centre de soins de jour'
-  when activity_type='3' then 'MRS hôpital'
-  when activity_type='4' then 'centre palliatif' 
+  --when activity_type='3' then 'MRS hôpital'
+  --when activity_type='4' then 'centre palliatif' 
 	ELSE 'maison de repos combiné' END,
   'ger',case when activity_type='1' then 'Altenheim'
   when activity_type='2' then 'Tagespflegezentrum'
-  when activity_type='3' then 'RVT Krankenhaus'
-  when activity_type='4' then 'Palliativzentrum' 
-	ELSE 'kombiniertes Altenheim' END
+  --when activity_type='3' then 'RVT Krankenhaus'
+  --when activity_type='4' then 'Palliativzentrum' 
+	ELSE 'kombiniertes Altenheim' END,
+	'eng', case when activity_type='1' then 'residential care center'
+  when activity_type='2' then 'day care center'
+  --when activity_type='3' then 'RVT hospital'
+  --when activity_type='4' then 'palliative center'
+  	ELSE 'combined residential care center' END
   ) as legend_item,
+  CASE WHEN activity_type='1' THEN '",li_wzc,"'::uuid
+  WHEN activity_type='2' THEN '",li_elderly_day_care,"'::uuid
+  ELSE '",li_wzc_combo,"'::uuid END as legend_item_id,
 	geometry
 from spatial_grouped)
 
 INSERT INTO ingestion.nursing_homes 
-(original_id, name, legend_item, data_list_id, risk_level, properties, geometry, created_at)
+(original_id, name, legend_item, legend_item_id, data_list_id, risk_level, properties, geometry, created_at)
 select original_id, 
 CASE when name='{}' then legend_item else name end as name, 
-legend_item, 
-'",data_list_id,"' as data_list_id,
+legend_item,
+legend_item_id,
+'",data_list_id,"'::uuid as data_list_id,
   risk_level,
 	properties,
 	ST_transform(geometry,4326) as geometry,
 	CURRENT_DATE as created_at
-from cleaned;"))
-
+from cleaned;"),
+"ALTER TABLE IF EXISTS ingestion.nursing_homes OWNER to pgn_group_data_team_w;",
+"GRANT ALL ON TABLE ingestion.nursing_homes TO pgn_group_data_team_w;",
+"GRANT ALL ON TABLE ingestion.nursing_homes TO pgn_user_airflow;")
                          
-                         
-### Create transformation table ----
-transformation_table_sql <- c("
-DROP TABLE IF EXISTS transformation.nursing_homes   CASCADE;
-","
-CREATE TABLE IF NOT EXISTS transformation.nursing_homes  
-  (
-    id uuid NOT NULL DEFAULT gen_random_uuid(),
-    original_id text,    
-    name jsonb,
-    legend_item jsonb,
-	data_list_id uuid,
-	risk_level integer,
-    properties jsonb,
-	properties_secondary jsonb,
-	imported_at timestamptz,
-	tags jsonb,
-	deleted_at timestamptz,
-	updated_at timestamptz,
-	created_at timestamptz,
-	created_by uuid,
-	updated_by uuid,
-    geometry geometry(geometry, 4326),
-    CONSTRAINT nursing_homes_pkey PRIMARY KEY (id)
-  );
-","
-INSERT INTO transformation.nursing_homes 
-(id, original_id, name, legend_item, data_list_id, geometry, created_at)
-SELECT id, original_id, name, legend_item, data_list_id, geometry, created_at FROM ingestion.nursing_homes;
-","
-ALTER TABLE IF EXISTS transformation.nursing_homes
-OWNER to pgn_group_data_team_w;")
-        
+            
 ### Execute the SQL commands ----
    
 create_ingestion_table <- function() {execute_sql_commands(ingestion_table_sql, "Ingestion table")}
-create_transformation_table <- function() {execute_sql_commands(transformation_table_sql, "Transformation table")}
 
 run_smart_update = function() {
   smart_update_process("nursing_homes", 50, 100, 50, format(Sys.Date(), "%Y-%m-%d"), allow_update_even_if_checks_fail=overrule_checks, dry_run=do_dry_run)
@@ -355,7 +338,6 @@ main_function = function() {
     create_ingestion_table()
   }
   run_smart_update()
-  #create_transformation_table()
 }
 
 

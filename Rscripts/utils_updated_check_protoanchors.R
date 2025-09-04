@@ -189,7 +189,7 @@ if (reuse_ingestion_data==FALSE) {
   
   ### Download new ingestion dataset ----
   con_pg <- get_con()
-  new_ingestion <- dbGetQuery(con_pg, paste("SELECT original_id,name,legend_item,data_list_id,risk_level,properties,properties_secondary,imported_at,tags,deleted_at,updated_at,created_at,created_by,updated_by,ST_AsText(geometry) as geometry FROM ingestion.", pgsql_table_name, sep = ""))
+  new_ingestion <- dbGetQuery(con_pg, paste("SELECT original_id,name,legend_item,legend_item_id,data_list_id,risk_level,properties,properties_secondary,imported_at,tags,deleted_at,updated_at,created_at,created_by,updated_by,ST_AsText(geometry) as geometry FROM ingestion.", pgsql_table_name, sep = ""))
   
   # also try for pt and pg geometry columns. We will add them to the data at the end, if needed.
   new_ingestion_extra_geom <- tryCatch({
@@ -206,14 +206,21 @@ if (reuse_ingestion_data==FALSE) {
 
   ### Download the old transformation dataset ----
   con_pg <- get_con()
-  old_transformation <- dbGetQuery(con_pg, paste("SELECT id, original_id,name,legend_item,data_list_id,risk_level,properties,properties_secondary,imported_at,tags,deleted_at,updated_at,created_at,created_by,updated_by,ST_AsText(geometry) as geometry FROM transformation.", pgsql_table_name, sep = ""))
+  old_transformation <- dbGetQuery(con_pg, paste("SELECT id, original_id,name,legend_item,legend_item_id,data_list_id,risk_level,properties,properties_secondary,imported_at,tags,deleted_at,updated_at,created_at,created_by,updated_by,ST_AsText(geometry) as geometry FROM transformation.", pgsql_table_name, sep = ""))
   dbDisconnect(con_pg)
   old_transformation<-st_as_sf(old_transformation, wkt="geometry")
   old_transformation$geometry <- st_set_crs(old_transformation$geometry, 4326)
 
 
   print("Downloaded data from Postgres")
-  print(paste("The old data contained", nrow(old_transformation[is.na(old_transformation$deleted_at),]), "records (that weren't previously deleted)"))
+  
+  # only keep cases from the old data if they have not been deleted yet!
+  old_transformation <- old_transformation %>%
+    filter(is.na(deleted_at))
+  # NOTE: this implies that if a data source accidentally deletes something, and we use it in an EP, that the link will never be fixed automatically. Option: if there are NEW objects, check them against previously deleted objects, and if they are the same, undelete them.
+  
+  
+  print(paste("The old data contained", nrow(old_transformation), "records (that weren't previously deleted)"))
   print(paste("The new data contains", nrow(new_ingestion), "records"))
   
 #st_write(old_transformation, paste0(log_folder,"/old_data.geojson"))
@@ -226,11 +233,7 @@ if (reuse_ingestion_data==FALSE) {
   # Make sure the "created_at" date is of the day of analysis
   new_ingestion$created_at <- Sys.Date()
   
-  # only keep cases from the old data if they have not been deleted yet!
-  old_transformation <- old_transformation %>%
-    filter(is.na(deleted_at))
-  # NOTE: this implies that if a data source accidentally deletes something, and we use it in an EP, that the link will never be fixed automatically. Option: if there are NEW objects, check them against previously deleted objects, and if they are the same, undelete them.
-  
+
   
   # isolate just the old metadata
   old_metadata <- as.data.frame(old_transformation)
@@ -327,7 +330,7 @@ if (reuse_ingestion_data==FALSE) {
           { # only calculate an intersection if there is actually one
           if (length(st_intersection(geometry_l, geometry_l_old)) != 0) {
             if (lengths(st_intersects(geometry_l, geometry_l_old))>0) {
-              st_area(st_union(st_intersection(geometry_l, geometry_l_old)))
+              as.numeric(st_area(st_union(st_intersection(geometry_l, geometry_l_old))))
             } else {NA}}
           else {NA}}
       else {NA}
@@ -341,15 +344,18 @@ if (reuse_ingestion_data==FALSE) {
   # calculate area
   unchanged <- unchanged %>%
     mutate(
-      area_new = if_else(!is.na(intersection), st_area(geometry_l), NA),
-      area_old = if_else(!is.na(intersection), st_area(geometry_l_old), NA)
+      area_new = if_else(!is.na(intersection), as.numeric(st_area(geometry_l)), NA_real_),
+      area_old = if_else(!is.na(intersection), as.numeric(st_area(geometry_l_old)), NA_real_)
     )
+  # NA_real_ instead of NA prevents following error:
+  # Caused by error in `if_else()`:
+  #   ! `false` must be a `units` object, not a logical vector.
   
   # intersection %s
   unchanged <- unchanged %>%
     mutate(
-      p_inter_new = units::drop_units(intersection / area_new),
-      p_inter_old = units::drop_units(intersection / area_old)
+      p_inter_new = (intersection / area_new),
+      p_inter_old = (intersection / area_old)
     )
   unchanged <- unchanged %>%
     mutate(max_p=if_else(p_inter_new>p_inter_old, p_inter_new, p_inter_old))
@@ -1071,7 +1077,7 @@ if (reuse_ingestion_data==FALSE) {
   
   # Get numbers from table_without_jsonb with total number of rows, number of deleted_at, created_at and updated_at today's date
   # Get number of cases with broken geometry or without a name
-  
+  ### NOTE: since we just compare the dates of the objects with today, we can get false detections if we run the same process twice in the same day. A simple solution could be to save all dates in transformation as exact timestamps, and then compare the dates here with the timestamp of the start of the process.
   table_without_jsonb_test<-table_without_jsonb
   table_without_jsonb_test$new     <- ifelse(is.na(table_without_jsonb_test$created_at), 0, ifelse(table_without_jsonb_test$created_at == Sys.Date(), 1, 0))
   table_without_jsonb_test$deleted <- ifelse(is.na(table_without_jsonb_test$deleted_at), 0, ifelse(table_without_jsonb_test$deleted_at == Sys.Date(), 1, 0))
@@ -1291,8 +1297,8 @@ print(paste0("Visualisation datasets created at ", filename_visualization))
     # query if three geometry fields are available
     UpdateTransformationsSQL <- c(
       paste0("INSERT INTO transformation.",pgsql_table_name,"
-             (id, original_id, name, legend_item, data_list_id, risk_level, properties, properties_secondary, imported_at, tags, deleted_at, updated_at, created_at, created_by, updated_by, geometry,geometry_pg,geometry_pt)",
-             "\n SELECT id::uuid, original_id,name::jsonb,legend_item::jsonb,data_list_id::uuid,
+             (id, original_id, name, legend_item, legend_item_id, data_list_id, risk_level, properties, properties_secondary, imported_at, tags, deleted_at, updated_at, created_at, created_by, updated_by, geometry,geometry_pg,geometry_pt)",
+             "\n SELECT id::uuid, original_id,name::jsonb,legend_item::jsonb,legend_item_id::uuid,data_list_id::uuid,
 risk_level,properties::jsonb,properties_secondary::jsonb,imported_at,tags::jsonb,
 deleted_at,updated_at,created_at,created_by::uuid,updated_by::uuid,geometry,geometry_pg,geometry_pt
 FROM tst.",pgsql_table_name, 
@@ -1301,6 +1307,7 @@ SET
 original_id = EXCLUDED.original_id,
 name = EXCLUDED.name,
 legend_item = EXCLUDED.legend_item,
+legend_item_id = EXCLUDED.legend_item_id,
 data_list_id = EXCLUDED.data_list_id,
 risk_level = EXCLUDED.risk_level,
 properties = EXCLUDED.properties,
@@ -1321,8 +1328,8 @@ geometry_pt = EXCLUDED.geometry_pt;"),
     # query if only one geometry field is available    
     UpdateTransformationsSQL <- c(
       paste0("INSERT INTO transformation.",pgsql_table_name,"
-             (id, original_id, name, legend_item, data_list_id, risk_level, properties, properties_secondary, imported_at, tags, deleted_at, updated_at, created_at, created_by, updated_by, geometry)",
-             "\n SELECT id::uuid, original_id,name::jsonb,legend_item::jsonb,data_list_id::uuid,
+             (id, original_id, name, legend_item, legend_item_id, data_list_id, risk_level, properties, properties_secondary, imported_at, tags, deleted_at, updated_at, created_at, created_by, updated_by, geometry)",
+             "\n SELECT id::uuid, original_id,name::jsonb,legend_item::jsonb,legend_item_id::uuid,data_list_id::uuid,
 risk_level,properties::jsonb,properties_secondary::jsonb,imported_at,tags::jsonb,
 deleted_at,updated_at,created_at,created_by::uuid,updated_by::uuid,geometry
 FROM tst.",pgsql_table_name, 
@@ -1331,6 +1338,7 @@ SET
 original_id = EXCLUDED.original_id,
 name = EXCLUDED.name,
 legend_item = EXCLUDED.legend_item,
+legend_item_id = EXCLUDED.legend_item_id,
 data_list_id = EXCLUDED.data_list_id,
 risk_level = EXCLUDED.risk_level,
 properties = EXCLUDED.properties,
@@ -1345,8 +1353,6 @@ updated_by = EXCLUDED.updated_by,
 geometry = EXCLUDED.geometry;"),
       paste0("DROP TABLE IF EXISTS tst.",pgsql_table_name,";"))
   }
-  
-  
   # create backup ----
   # for the time being, we create backups of the transformation table. This can be dropped in the future.
   BackupTransformationsSQL <- c(
@@ -1362,7 +1368,13 @@ BEGIN
   IF NOT EXISTS (SELECT 1 FROM tst.backups_transformation_",pgsql_table_name,") THEN
     -- If the table is empty, perform the initial insertion
     INSERT INTO tst.backups_transformation_",pgsql_table_name,"
-    SELECT *, CURRENT_TIMESTAMP AS backup_at FROM transformation.",pgsql_table_name,";
+    SELECT id, original_id,name,legend_item,data_list_id,risk_level,
+	properties,properties_secondary,imported_at,tags,deleted_at,updated_at,created_at,
+	created_by,updated_by,", if (exists("new_ingestion_extra_geom") && !is.null(new_ingestion_extra_geom)) {"geometry, geometry_pg, geometry_pt"} else {"geometry"},
+	", CURRENT_TIMESTAMP AS backup_at, legend_item_id FROM transformation.",pgsql_table_name,";
+	  ALTER TABLE IF EXISTS tst.backups_transformation_",pgsql_table_name," OWNER to pgn_group_data_team_w;
+    GRANT ALL ON TABLE tst.backups_transformation_",pgsql_table_name," TO pgn_group_data_team_w;
+    GRANT ALL ON TABLE tst.backups_transformation_",pgsql_table_name," TO pgn_user_airflow;
   ELSE
     -- If the table is not empty, check the most recent backup_at date
     DECLARE
@@ -1374,7 +1386,10 @@ BEGIN
       IF (CURRENT_TIMESTAMP - recent_backup_date) >= INTERVAL '3 days' THEN
         -- If the most recent date is at least three days old, perform the insertion
         INSERT INTO tst.backups_transformation_",pgsql_table_name,"
-        SELECT *, CURRENT_TIMESTAMP AS backup_at FROM transformation.",pgsql_table_name,";
+        SELECT id, original_id,name,legend_item,data_list_id,risk_level,
+	properties,properties_secondary,imported_at,tags,deleted_at,updated_at,created_at,
+	created_by,updated_by,", if (exists("new_ingestion_extra_geom") && !is.null(new_ingestion_extra_geom)) {"geometry, geometry_pg, geometry_pt"} else {"geometry"},
+	", CURRENT_TIMESTAMP AS backup_at, legend_item_id FROM transformation.",pgsql_table_name,";
       END IF;
     END;
   END IF;

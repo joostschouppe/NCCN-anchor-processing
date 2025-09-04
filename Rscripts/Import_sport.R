@@ -17,25 +17,61 @@
 # Load variables -----------------------------------------------------------
 #  """""""""""""""""" ----------------------
 
-readRenviron("C:/projects/pgn-data-airflow/.Renviron")
+# External IDs
+data_list_id<-"d883a115-05f7-45c1-8398-d555334102ae"
 
+li_sport_centre <- "be58439a-45c0-4610-a4ae-080b908c9e24"
+li_sport_golf <- "e1be3094-1b92-4000-8a6a-2beae0ffe6f3"
+li_sport_horse <- "dbfdfb29-e88a-4553-bb4f-7e63d729bf4d"
+li_sport_pitch <- "dcf3a220-a84b-4d8f-aac5-be8fb96f052d"
+li_sport_pool <- "6b88c984-7d6f-4361-8731-124deb7c04b1"
+li_sport_stadium <- "dc36d8d9-3774-4df3-934a-fbad4b8f86ec"
+li_sport_winter <- "95c1165b-a70f-4647-a82c-e9b766c6e35c"
+  
+
+
+#readRenviron("C:/projects/pgn-data-airflow/.Renviron")
+
+# connection details
 db_host_name <- Sys.getenv("POSTGRES_HOST_NAME")
 postgres_user <- Sys.getenv("POSTGRES_USER")
 postgres_password <- Sys.getenv("POSTGRES_PASSWORD")
 db_name<- Sys.getenv("POSTGRES_DB_NAME_CURATED")
 
-data_list_id<-"d883a115-05f7-45c1-8398-d555334102ae"
-log_folder <- "C:/temp/logs/"
+# run status
+run_status<-Sys.getenv("RUN_STATUS")
+## this is set to false and prevents any accidental changes to the database by switching off the main_function(). On Airflow, this is set to true.
+run_status<-ifelse(tolower(run_status) == "true", TRUE, FALSE)
+
+# overrule the checks
+overrule_checks<-Sys.getenv("OVERRULE_CHECKS")
+## Set to FALSE by default. That means we do not update the anchors if some tests fail. Those tests include "the data has grown or shrunk by a lot of objects". If, after review of the log, you decide that nothing is wrong, set this manually to TRUE.
+# If the input is not correctly understood as boolean, this will force it to it.
+overrule_checks<-ifelse(tolower(overrule_checks) == "true", TRUE, FALSE)
+
+
+# Do not run the main part of the processing, but just do an update based on the ingestion table already in the dbase
+reuse_ingestion_data<-Sys.getenv("REUSE_INGESTION_DATA")
+reuse_ingestion_data<-ifelse(tolower(reuse_ingestion_data) == "true", TRUE, FALSE)
+
+# Only run the comparison script & update the ingestion table, but do not attempt to update the transformation table
+do_dry_run<-Sys.getenv("DO_DRY_RUN")
+do_dry_run<-ifelse(tolower(do_dry_run) == "true", TRUE, FALSE)
+
+
+
+log_folder <- Sys.getenv("RSCRIPT_LOG_FOLDER")
 
 ### Load external functions ------
 
-rscript_folder <- "C:/projects/pgn-data-airflow/rscripts/"
-source(paste0(rscript_folder,"utils_updated_check_protoanchors.R"))
-source(paste0(rscript_folder,"utils.R"))
+rscript_folder <- Sys.getenv("LOCAL_RSCRIPT_PATH")
+source(paste0(rscript_folder,"/utils_updated_check_protoanchors.R"))
+source(paste0(rscript_folder,"/utils.R"))
 
 # Libraries -------------------------------
 # """""""""""""""""" ----------------------
-# all are loaded via the utils
+
+# everything loaded via utils
 
 
 
@@ -44,41 +80,26 @@ source(paste0(rscript_folder,"utils.R"))
 # EXTRACT ----
 # """""""""""""""""" ----
 
+# Function to download fresh data ----
+process_fresh_data <- function(){
+  # Default: download fresh data
+  if (reuse_ingestion_data==FALSE) {
 
 # Download OSM data ----
 ### OSM DOWNLOAD PARAMETERS ----
 
-# Define the list of features
-features_list_1 <- list("leisure" = "sports_centre")
-features_list_2 <- list("leisure" = "ice_rink", "leisure" = "horse_riding", "leisure" = "stadium", "landuse"="winter_sports", "leisure"="golf_course")
-features_list_3 <- list("leisure" = "sports_hall")
-features_list_4 <- list(
-  list(key = "leisure", value = "track"),
-  list(key = "name")
-)
-features_list_5 <- list(
-  list(key = "leisure", value = "pitch"),
-  list(key = "name")
-)
-features_list_6 <- list(
-  list(key = "leisure", value = "swimming_pool"),
-  list(key = "access", value = "private", negate = TRUE)
-)
 
-features_list_7 <- list(
-  list(key = "building", value = "sports_centre"),
-  list(key = "name"),
-  list(key = "leisure", key_does_not_exist = TRUE)
-)
-features_list_8 <- list(
-  list(key = "building", value = "sports_hall"),
-  list(key = "name"),
-  list(key = "leisure", key_does_not_exist = TRUE)
-)
+features_list_pp <- list(
+  "leisure" = "sports_centre", 
+  "leisure" = "ice_rink", "leisure" = "horse_riding", "leisure" = "stadium", "landuse"="winter_sports", "leisure"="golf_course",
+  "leisure" = "sports_hall", 
+  "leisure" = "pitch",
+  "leisure" = "swimming_pool",
+  "building" = "sports_centre",
+  "building" = "sports_hall")
 
+features_list_plp <- list("leisure" = "track")
 
-# If default server fails, set to TRUE to use mail.ru server (older data)
-alternative_overpass_server<-FALSE
 # Define extra tags to use as columns for properties
 extra_columns <- c("amenity", "sport", "access", "capacity", "community_centre", "description", "leisure", "building", "landuse")
 # Choose which datatypes are needed, as a list of datatypes, using any of "points", "lines", "mpolygons" (this is polygons+multipolygons together)
@@ -90,7 +111,7 @@ datatypes_lines_too <- c("points", "lines", "mpolygon")
 
 tryCatch({
   # Call the large function
-  osm_1<-download_osm_process(features_list_1, datatypes, extra_columns, alternative_overpass_server, keep_region=TRUE )
+  osm_pp<-download_osm_process(features_list_pp, datatypes, extra_columns, postgres=TRUE, keep_region=TRUE )
   print("OSM data downloaded & processes succesfully")
 }, error = function(e) {
   # Print error message
@@ -99,62 +120,7 @@ tryCatch({
 
 tryCatch({
   # Call the large function
-  osm_2<-download_osm_process(features_list_2, datatypes, extra_columns, alternative_overpass_server, keep_region=TRUE)
-  print("OSM data downloaded & processes succesfully")
-}, error = function(e) {
-  # Print error message
-  print(paste("Something went wrong:", e$message))
-})
-
-tryCatch({
-  # Call the large function
-  osm_3<-download_osm_process(features_list_3, datatypes, extra_columns, alternative_overpass_server, keep_region=TRUE)
-  print("OSM data downloaded & processes succesfully")
-}, error = function(e) {
-  # Print error message
-  print(paste("Something went wrong:", e$message))
-})
-
-
-tryCatch({
-  # Call the large function
-  osm_4<-download_osm_process(features_list_4, datatypes_lines_too, extra_columns, alternative_overpass_server, keep_region=TRUE, feature_tag_list=TRUE)
-  print("OSM data downloaded & processes succesfully")
-}, error = function(e) {
-  # Print error message
-  print(paste("Something went wrong:", e$message))
-})
-
-tryCatch({
-  # Call the large function
-  osm_5<-download_osm_process(features_list_5, datatypes, extra_columns, alternative_overpass_server, keep_region=TRUE, feature_tag_list=TRUE)
-  print("OSM data downloaded & processes succesfully")
-}, error = function(e) {
-  # Print error message
-  print(paste("Something went wrong:", e$message))
-})
-
-tryCatch({
-  # Call the large function
-  osm_6<-download_osm_process(features_list_6, datatypes, extra_columns, alternative_overpass_server, keep_region=TRUE, feature_tag_list=TRUE)
-  print("OSM data downloaded & processes succesfully")
-}, error = function(e) {
-  # Print error message
-  print(paste("Something went wrong:", e$message))
-})
-
-tryCatch({
-  # Call the large function
-  osm_7<-download_osm_process(features_list_7, datatypes, extra_columns, alternative_overpass_server, keep_region=TRUE, feature_tag_list=TRUE)
-  print("OSM data downloaded & processes succesfully")
-}, error = function(e) {
-  # Print error message
-  print(paste("Something went wrong:", e$message))
-})
-
-tryCatch({
-  # Call the large function
-  osm_8<-download_osm_process(features_list_8, datatypes, extra_columns, alternative_overpass_server, keep_region=TRUE, feature_tag_list=TRUE)
+  osm_plp<-download_osm_process(features_list_plp, datatypes_lines_too, extra_columns, postgres=TRUE, keep_region=TRUE, feature_tag_list=TRUE)
   print("OSM data downloaded & processes succesfully")
 }, error = function(e) {
   # Print error message
@@ -163,8 +129,17 @@ tryCatch({
 
 # we can consider throwing away all objects with a private tag, however often they do seem to be relevant features
 
+  
 # merge all layers
-osm_all <- bind_rows(osm_1, osm_2, osm_3, osm_4, osm_5, osm_6, osm_7, osm_8)
+osm_all <- bind_rows(osm_pp, osm_plp)
+
+osm_all <- osm_all %>%
+# remove private swimming pools
+  filter(!(leisure=="swimming_pool" & access=="private") | is.na(access)) %>%
+# remove things with no name if track or pitch
+  filter(!((leisure=="track" | leisure=="pitch") & is.na(name))) %>%
+# if building and no leisure, remove if no name
+  filter(!(!is.na(building) & is.na(leisure) & is.na(name)))
 
 
 # select only if amenity is null and not some things that make no sense or are already an anchor
@@ -291,7 +266,7 @@ aggregate_names <- function(df, names_to_aggregate) {
 }
 
 
-# Define your list of columns for name aggregation
+# Define list of columns for name aggregation
 names_to_aggregate <- c("name", "name_nl", "name_fr", "name_de", "alt_name", "short_name", "official_name", "old_name")
 
 # Call the function to aggregate names
@@ -356,16 +331,19 @@ join_filtered <- join_filtered %>%
   filter(object_type != "incomplete sports_centre")
 
 # extract a dataset for use in MapRoulette with incomplete swimming pools
-maproulette <- join_filtered %>%
-  filter(leisure == "swimming_pool" & !is.na(language)) %>%
-  select(osm_id,name)
+#maproulette <- join_filtered %>%
+#  filter(leisure == "swimming_pool" & !is.na(language)) %>%
+#  select(osm_id,name)
 #st_write(maproulette, paste0(log_folder,"maproulette_swimming_pools.geojson"))
 
 
 # Upload to raw data ----
+CreateImportTable(dataset = join_filtered, schema = "raw_data", table_name = "osm_sports") 
 
-# CreateImportTable is loaded via utils and called in the main function
-
+  } else {
+    print("No fresh data downloaded because user requested to re-use existing data")
+  }
+} # end process_fresh_data function
 
 
 
@@ -382,7 +360,8 @@ CREATE TABLE IF NOT EXISTS ingestion.sports
   original_id text,  
   name jsonb,
   legend_item jsonb,
-  data_list_id text,
+  legend_item_id uuid,
+  data_list_id uuid,
   risk_level integer,
   properties jsonb,
   properties_secondary jsonb,
@@ -414,6 +393,14 @@ cleaned as (SELECT
               'eng', CASE WHEN object_type='golf_course' THEN 'golf course' WHEN object_type='horse_riding' THEN 'horse riding' WHEN object_type='sports_centre' THEN 'sports centre' 
               WHEN object_type='sports_field' THEN 'sports field' WHEN object_type='stadium' THEN 'stadium' WHEN object_type='swimming_pool' THEN 'swimming pool' WHEN object_type='winter_sports' THEN 'winter sports' END)
               as legend_item,
+            CASE WHEN object_type='golf_course' THEN '",li_sport_golf,"'::uuid
+              WHEN object_type='horse_riding' THEN '",li_sport_horse,"'::uuid
+              WHEN object_type='sports_centre' THEN '",li_sport_centre,"'::uuid
+              WHEN object_type='sports_field' THEN '",li_sport_pitch,"'::uuid
+              WHEN object_type='stadium' THEN '",li_sport_stadium,"'::uuid
+              WHEN object_type='swimming_pool' THEN '",li_sport_pool,"'::uuid
+              WHEN object_type='winter_sports' THEN '",li_sport_winter,"'::uuid END
+              as legend_item_id,
            CASE WHEN short_name IS NULL AND official_name IS NULL AND alt_name IS NULL AND old_name IS NULL THEN NULL 
 	ELSE CONCAT_WS('; ',short_name, official_name, alt_name, old_name) END AS other_names,
 CASE WHEN addr_street IS NULL THEN NULL 
@@ -431,12 +418,13 @@ CASE WHEN website IS NULL AND contact_website IS NULL THEN NULL
 	sport, access, capacity,description,
 	geometry FROM raw_data.osm_sports)
 INSERT INTO ingestion.sports 
-(original_id, name, legend_item, data_list_id, risk_level, properties, geometry, created_at)
+(original_id, name, legend_item, legend_item_id, data_list_id, risk_level, properties, geometry, created_at)
 SELECT
 original_id,
 name,
 legend_item,
-'",data_list_id,"' as data_list_id,
+legend_item_id,
+'",data_list_id,"'::uuid as data_list_id,
 1 as risk_level,
 JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
   'other_names', other_names,
@@ -454,57 +442,26 @@ JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
 )),
 geometry,
 CURRENT_DATE as created_at
-FROM cleaned;
-"))
-                            
-### Create transformation table ----
-transformation_table_sql <- c("
-DROP TABLE IF EXISTS transformation.sports CASCADE;
-","
-CREATE TABLE IF NOT EXISTS transformation.sports
-  (
-    id uuid NOT NULL DEFAULT gen_random_uuid(),
-    original_id text,    
-    name jsonb,
-    legend_item jsonb,
-	data_list_id uuid,
-	risk_level integer,
-    properties jsonb,
-	properties_secondary jsonb,
-	imported_at timestamptz,
-	tags jsonb,
-	deleted_at timestamptz,
-	updated_at timestamptz,
-	created_at timestamptz,
-	created_by uuid,
-	updated_by uuid,
-    geometry geometry(geometry, 4326),
-    CONSTRAINT sports_pkey PRIMARY KEY (id)
-  );
-","
-INSERT INTO transformation.sports
-(id, original_id, name, legend_item, data_list_id, properties, geometry, created_at)
-SELECT id, original_id, name, legend_item, data_list_id::uuid, properties, geometry, created_at FROM ingestion.sports;
-")
-
-
+FROM cleaned;"),
+"ALTER TABLE IF EXISTS ingestion.sports OWNER to pgn_group_data_team_w;",
+"GRANT ALL ON TABLE ingestion.sports TO pgn_group_data_team_w;",
+"GRANT ALL ON TABLE ingestion.sports TO pgn_user_airflow;")
 
 ### Execute the SQL commands ----
 
 
 create_ingestion_table <- function() {execute_sql_commands(ingestion_table_sql, "Ingestion table")}
-create_transformation_table <- function() {execute_sql_commands(transformation_table_sql, "Transformation table")}
-
-
 
 
 # set to TRUE if you want to update the transformation table even if the checks fail. 
-update_even_if_checks_fail<-FALSE
-# Don't forget to also set checks_failed<-0 if there were already some issues in the base data
+update_even_if_checks_fail<-overrule_checks
+
+#do_dry_run <- TRUE
 
 run_smart_update = function() {
-  smart_update_process("sports", 50, 100, 50, format(Sys.Date(), "%Y-%m-%d"), update_even_if_checks_fail)
+  smart_update_process("sports", 50, 100, 50, format(Sys.Date(), "%Y-%m-%d"), allow_update_even_if_checks_fail=overrule_checks, dry_run=do_dry_run,reuse_ingestion_data=reuse_ingestion_data)
 }
+
 
 
 
@@ -512,12 +469,15 @@ run_smart_update = function() {
 # """"""""""""""""""""----
 
 main_function = function() {
-  CreateImportTable(dataset = join_filtered, schema = "raw_data", table_name = "osm_sports") 
-  create_ingestion_table()
+  if (!reuse_ingestion_data) {
+    process_fresh_data()
+    create_ingestion_table()
+  }
   run_smart_update()
-  #create_transformation_table()
 }
 
-if(F){
+if(run_status){
   main_function()
 }
+
+

@@ -12,8 +12,12 @@
 ## ---------------------------
 
 
-
+# Load environment ----
 #  """""""""""""""""" ----------------------
+
+# load external IDs
+data_list_id<-"6fdc8724-2b7f-48a2-a755-72bea03903b3"
+legend_item_id <- "2c7ed5dc-59ae-4dec-92c7-c40bfec1c683"
 
 readRenviron("C:/projects/pgn-data-airflow/.Renviron")
 
@@ -22,7 +26,7 @@ postgres_user <- Sys.getenv("POSTGRES_USER")
 postgres_password <- Sys.getenv("POSTGRES_PASSWORD")
 db_name<- Sys.getenv("POSTGRES_DB_NAME_CURATED")
 
-data_list_id<-"6fdc8724-2b7f-48a2-a755-72bea03903b3"
+
 log_folder <- "C:/temp/logs/"
 local_folder <- "C:/temp/"
 
@@ -132,6 +136,7 @@ CREATE TABLE IF NOT EXISTS ingestion.seaport_right_of_first_refusal
   original_id text,  
   name jsonb,
   legend_item jsonb,
+  legend_item_id uuid,
   data_list_id uuid,
   risk_level integer,
   properties jsonb,
@@ -157,23 +162,27 @@ WITH cleaned AS (
     'fre', 'port maritime (droit de préemption)',
     'ger', 'Seehafen (Vorkaufsrecht)'
   ) as legend_item,
+  '",legend_item_id,"'::uuid as legend_item_id,
   '",data_list_id,"'::uuid as data_list_id,
   1 as risk_level,
   geometry 
   FROM raw_data.vla_dv_havens)
 
 INSERT INTO ingestion.seaport_right_of_first_refusal 
-(original_id, name, legend_item, data_list_id, risk_level, geometry, created_at)
+(original_id, name, legend_item, legend_item_id, data_list_id, risk_level, geometry, created_at)
 SELECT
 original_id,
 name,
 legend_item,
+legend_item_id,
 data_list_id,
 1 as risk_level,
 geometry,
 CURRENT_DATE as created_at
-FROM cleaned;
-"))
+FROM cleaned;"),
+"ALTER TABLE IF EXISTS ingestion.seaport_right_of_first_refusal OWNER to pgn_group_data_team_w;",
+"GRANT ALL ON TABLE ingestion.seaport_right_of_first_refusal TO pgn_group_data_team_w;",
+"GRANT ALL ON TABLE ingestion.seaport_right_of_first_refusal TO pgn_user_airflow;")
 
 
 

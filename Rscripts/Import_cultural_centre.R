@@ -16,22 +16,51 @@
 # Load variables -----------------------------------------------------------
 #  """""""""""""""""" ----------------------
 
-readRenviron("C:/projects/pgn-data-airflow/.Renviron")
+data_list_id<-"b8fca5e6-fa2b-465e-b124-bb3b81fefff6"
+legend_item_id_cultural_centre <- "b009f733-8f0e-4c17-9b6a-bb1fe33f93d6"
+legend_item_id_cinema <- "0e5fdfbc-ce61-4119-865a-e9aaf7b19393"
+legend_item_id_concert_hall <- "e82946d3-0977-48be-9009-7ec42b38b97b"
+legend_item_id_theatre <- "f8d76589-001a-4b94-8b03-dbf8402d5ca1"
 
+
+
+#readRenviron("C:/projects/pgn-data-airflow/.Renviron")
+
+# connection details
 db_host_name <- Sys.getenv("POSTGRES_HOST_NAME")
 postgres_user <- Sys.getenv("POSTGRES_USER")
 postgres_password <- Sys.getenv("POSTGRES_PASSWORD")
 db_name<- Sys.getenv("POSTGRES_DB_NAME_CURATED")
 
-data_list_id<-"b8fca5e6-fa2b-465e-b124-bb3b81fefff6"
-log_folder <- "C:/temp/logs/"
+# run status
+run_status<-Sys.getenv("RUN_STATUS")
+## this is set to false and prevents any accidental changes to the database by switching off the main_function(). On Airflow, this is set to true.
+run_status<-ifelse(tolower(run_status) == "true", TRUE, FALSE)
+
+# overrule the checks
+overrule_checks<-Sys.getenv("OVERRULE_CHECKS")
+## Set to FALSE by default. That means we do not update the anchors if some tests fail. Those tests include "the data has grown or shrunk by a lot of objects". If, after review of the log, you decide that nothing is wrong, set this manually to TRUE.
+# If the input is not correctly understood as boolean, this will force it to it.
+overrule_checks<-ifelse(tolower(overrule_checks) == "true", TRUE, FALSE)
+
+
+# Do not run the main part of the processing, but just do an update based on the ingestion table already in the dbase
+reuse_ingestion_data<-Sys.getenv("REUSE_INGESTION_DATA")
+reuse_ingestion_data<-ifelse(tolower(reuse_ingestion_data) == "true", TRUE, FALSE)
+
+# Only run the comparison script & update the ingestion table, but do not attempt to update the transformation table
+do_dry_run<-Sys.getenv("DO_DRY_RUN")
+do_dry_run<-ifelse(tolower(do_dry_run) == "true", TRUE, FALSE)
+
+
+
+log_folder <- Sys.getenv("RSCRIPT_LOG_FOLDER")
 
 ### Load external functions ------
 
-rscript_folder <- "C:/projects/pgn-data-airflow/rscripts/"
-source(paste0(rscript_folder,"utils_updated_check_protoanchors.R"))
-source(paste0(rscript_folder,"utils.R"))
-
+rscript_folder <- Sys.getenv("LOCAL_RSCRIPT_PATH")
+source(paste0(rscript_folder,"/utils_updated_check_protoanchors.R"))
+source(paste0(rscript_folder,"/utils.R"))
 # Libraries -------------------------------
 # """""""""""""""""" ----------------------
 # all are loaded via the utils
@@ -42,6 +71,11 @@ source(paste0(rscript_folder,"utils.R"))
 # EXTRACT ----
 # """""""""""""""""" ----
 
+
+# Function to download fresh data ----
+process_fresh_data <- function(){
+  # Default: download fresh data
+  if (reuse_ingestion_data==FALSE) {
 
 # Download OSM data ----
 ### OSM DOWNLOAD PARAMETERS ----
@@ -64,11 +98,9 @@ datatypes <- c("points", "mpolygon")
 
 ### Actual OSM download & transformation ----
 
-
-
 tryCatch({
   # Call the large function
-  osm_1<-download_osm_process(features_list_1, datatypes, extra_columns, alternative_overpass_server, keep_region=TRUE )
+  osm_1<-download_osm_process(features_list_1, datatypes, extra_columns, postgres=TRUE, keep_region=TRUE )
   print("OSM data downloaded & processes succesfully")
 }, error = function(e) {
   # Print error message
@@ -77,7 +109,7 @@ tryCatch({
 
 tryCatch({
   # Call the large function
-  osm_2<-download_osm_process(features_list_2, datatypes, extra_columns, alternative_overpass_server, keep_region=TRUE)
+  osm_2<-download_osm_process(features_list_2, datatypes, extra_columns, postgres=TRUE, keep_region=TRUE)
   print("OSM data downloaded & processes succesfully")
 }, error = function(e) {
   # Print error message
@@ -86,7 +118,7 @@ tryCatch({
 
 tryCatch({
   # Call the large function
-  osm_3<-download_osm_process(features_list_3, datatypes, extra_columns, alternative_overpass_server, keep_region=TRUE)
+  osm_3<-download_osm_process(features_list_3, datatypes, extra_columns, postgres=TRUE, keep_region=TRUE)
   print("OSM data downloaded & processes succesfully")
 }, error = function(e) {
   # Print error message
@@ -96,7 +128,7 @@ tryCatch({
 
 tryCatch({
   # Call the large function
-  osm_4<-download_osm_process(features_list_4, datatypes, extra_columns, alternative_overpass_server, keep_region=TRUE)
+  osm_4<-download_osm_process(features_list_4, datatypes, extra_columns, postgres=TRUE, keep_region=TRUE)
   print("OSM data downloaded & processes succesfully")
 }, error = function(e) {
   # Print error message
@@ -105,7 +137,7 @@ tryCatch({
 
 tryCatch({
   # Call the large function
-  osm_5<-download_osm_process(features_list_5, datatypes, extra_columns, alternative_overpass_server, keep_region=TRUE)
+  osm_5<-download_osm_process(features_list_5, datatypes, extra_columns, postgres=TRUE, keep_region=TRUE)
   print("OSM data downloaded & processes succesfully")
 }, error = function(e) {
   # Print error message
@@ -114,7 +146,7 @@ tryCatch({
 
 tryCatch({
   # Call the large function
-  osm_6<-download_osm_process(features_list_6, datatypes, extra_columns, alternative_overpass_server, keep_region=TRUE)
+  osm_6<-download_osm_process(features_list_6, datatypes, extra_columns, postgres=TRUE, keep_region=TRUE)
   print("OSM data downloaded & processes succesfully")
 }, error = function(e) {
   # Print error message
@@ -136,6 +168,19 @@ osm_3<-osm_3 %>%
 
 # merge all
 osm_all<-rbind(osm_1,osm_2,osm_3,osm_4,osm_5,osm_6)
+
+# Data quality review: No name in OSM
+osm_all_problems<-osm_all %>% 
+  filter(is.na(name) & !is.na(amenity) & !is.na(language)) %>%
+  select(osm_id,amenity)
+# save as geojson
+if (nrow(osm_all_problems)>0){
+  filename_visualization<-paste0(log_folder,"/cc_no_name_osm", format(Sys.time(), "%Y%m%d_%H%M%S"), ".geojson")
+  st_write(osm_all_problems, filename_visualization, driver = "GeoJSON")
+  print(paste0("OSM data issues should be reviewed (CC without a name), check them at ", filename_visualization))
+} else {
+  print("OSM data quality check passed")
+}
 
 # remove if no name
 osm_all<-osm_all %>%
@@ -262,9 +307,13 @@ join_filtered <- join %>%
 join_filtered <- join_filtered %>%
   mutate(object_type = ifelse(count > 1 & object_type_agg != object_type, "cultural_centre", object_type))
 
+# make available outside the function
+join_filtered <<- join_filtered
 
-# save as geojson
-#st_write(join_filtered, paste0(log_folder,"cultural_centre.geojson"))
+  } else {
+    print("No fresh data downloaded because user requested to re-use existing data")
+  }
+} # end process_fresh_data function
 
 # Upload to raw data ----
 
@@ -286,7 +335,8 @@ CREATE TABLE IF NOT EXISTS ingestion.cultural_centre
   original_id text,  
   name jsonb,
   legend_item jsonb,
-  data_list_id text,
+  legend_item_id uuid,
+	data_list_id uuid,
   risk_level integer,
   properties jsonb,
   properties_secondary jsonb,
@@ -314,6 +364,11 @@ cleaned as (SELECT
               'ger', CASE WHEN object_type='concert_hall' THEN 'Konzertsaal' WHEN object_type='theatre' THEN 'Theater' WHEN object_type='cinema' THEN 'Kino' ELSE 'Kulturzentrum' END,
               'eng', CASE WHEN object_type='concert_hall' THEN 'concert hall' WHEN object_type='theatre' THEN 'theatre' WHEN object_type='cinema' THEN 'cinema' ELSE 'cultural centre' END) 
               as legend_item,
+              CASE WHEN object_type='concert_hall' THEN '",legend_item_id_concert_hall,"'::uuid
+              WHEN object_type='theatre' THEN '",legend_item_id_theatre,"'::uuid
+              WHEN object_type='cinema' THEN '",legend_item_id_cinema,"'::uuid
+              ELSE '",legend_item_id_cultural_centre,"'::uuid END
+              as legend_item_id,
            CASE WHEN short_name IS NULL AND official_name IS NULL AND alt_name IS NULL AND old_name IS NULL THEN NULL 
 	ELSE CONCAT_WS('; ',short_name, official_name, alt_name, old_name) END AS other_names,
 CASE WHEN addr_street IS NULL THEN NULL 
@@ -335,12 +390,13 @@ CASE WHEN website IS NULL AND contact_website IS NULL THEN NULL
 	theatre_type,
 	geometry FROM raw_data.osm_cultural_centre)
 INSERT INTO ingestion.cultural_centre 
-(original_id, name, legend_item, data_list_id, risk_level, properties, geometry, created_at)
+(original_id, name, legend_item, legend_item_id, data_list_id, risk_level, properties, geometry, created_at)
 SELECT
 original_id,
 name,
 legend_item,
-'",data_list_id,"' as data_list_id,
+legend_item_id,
+'",data_list_id,"'::uuid as data_list_id,
 1 as risk_level,
 JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
   'other_names', other_names,
@@ -358,60 +414,24 @@ JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
 )),
 geometry,
 CURRENT_DATE as created_at
-FROM cleaned;
-"))
-                            
-### Create transformation table ----
-transformation_table_sql <- c("
-DROP TABLE IF EXISTS transformation.cultural_centre CASCADE;
-","
-CREATE TABLE IF NOT EXISTS transformation.cultural_centre
-  (
-    id uuid NOT NULL DEFAULT gen_random_uuid(),
-    original_id text,    
-    name jsonb,
-    legend_item jsonb,
-	data_list_id uuid,
-	risk_level integer,
-    properties jsonb,
-	properties_secondary jsonb,
-	imported_at timestamptz,
-	tags jsonb,
-	deleted_at timestamptz,
-	updated_at timestamptz,
-	created_at timestamptz,
-	created_by uuid,
-	updated_by uuid,
-    geometry geometry(geometry, 4326),
-    CONSTRAINT cultural_centre_pkey PRIMARY KEY (id)
-  );
-","
-INSERT INTO transformation.cultural_centre
-(id, original_id, name, legend_item, data_list_id, properties, geometry, created_at)
-SELECT id, original_id, name, legend_item, data_list_id::uuid, properties, geometry, created_at FROM ingestion.cultural_centre;
-")
-
-
-
-
+FROM cleaned;"),
+"ALTER TABLE IF EXISTS ingestion.cultural_centre OWNER to pgn_group_data_team_w;",
+"GRANT ALL ON TABLE ingestion.cultural_centre TO pgn_group_data_team_w;",
+"GRANT ALL ON TABLE ingestion.cultural_centre TO pgn_user_airflow;")
 
 
 
 
 ### Execute the SQL commands ----
 
-
 create_ingestion_table <- function() {execute_sql_commands(ingestion_table_sql, "Ingestion table")}
-create_transformation_table <- function() {execute_sql_commands(transformation_table_sql, "Transformation table")}
-
-
 
 # set to TRUE if you want to update the transformation table even if the checks fail. 
-update_even_if_checks_fail<-FALSE
-# Don't forget to also set checks_failed<-0 if there were already some issues in the base data
+update_even_if_checks_fail<-overrule_checks
 
+#do_dry_run<-TRUE
 run_smart_update = function() {
-  smart_update_process("cultural_centre", 50, 100, 50, format(Sys.Date(), "%Y-%m-%d"), update_even_if_checks_fail)
+  smart_update_process("cultural_centre", 50, 100, 50, format(Sys.Date(), "%Y-%m-%d"), allow_update_even_if_checks_fail=overrule_checks, dry_run=do_dry_run,reuse_ingestion_data=reuse_ingestion_data)
 }
 
 
@@ -420,41 +440,24 @@ run_smart_update = function() {
 # """"""""""""""""""""----
 
 main_function = function() {
-  CreateImportTable(dataset = join_filtered, schema = "raw_data", table_name = "osm_cultural_centre") 
-  create_ingestion_table()
+  if (!reuse_ingestion_data) {
+    process_fresh_data()
+    CreateImportTable(dataset = join_filtered, schema = "raw_data", table_name = "osm_cultural_centre")
+    create_ingestion_table()
+  }
   run_smart_update()
-  #create_transformation_table()
 }
 
-if(F){
+
+if(run_status){
   main_function()
 }
 
 
-# OSM fixup
-## 1. Not in OSM, only in official data
-# download CC from Wallonia
-cc_wallonia <- st_read(httr::GET("https://www.odwb.be/api/explore/v2.1/catalog/datasets/centre-culturels-en-communaute-francaise/exports/geojson?lang=nl&timezone=Europe%2FBrussels"))
-
-osm_selected<-join_filtered %>%
-  select(osm_id,name)
-
-check_osm <- st_join(cc_wallonia, osm_selected, join = st_is_within_distance, dist = 50)
-check_osm <- check_osm %>% 
-  filter(is.na(osm_id)) %>%
-  select(-osm_id,-name,-enjeux)
-
-# save as geojson
-st_write(check_osm, paste0(log_folder,"official_cc_not_in_osm.geojson"))
 
 
-## 2. No name in OSM
-osm_all<-rbind(osm_1,osm_2,osm_3,osm_4,osm_5)
-osm_all<-osm_all %>% 
-  filter(is.na(name) & !is.na(amenity) & !is.na(language)) %>%
-  select(osm_id,amenity)
-# save as geojson
-st_write(osm_all, paste0(log_folder,"cc_no_name_osm.geojson"))
+
+
 
 
 

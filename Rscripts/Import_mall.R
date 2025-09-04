@@ -14,6 +14,9 @@
 # Load variables -----------------------------------------------------------
 #  """""""""""""""""" ----------------------
 
+data_list_id <- "236626f3-af57-42f9-8113-2d7c383bdfa2"
+legend_item_id <- "12f749c3-77c6-44ea-8792-052236e57aa3"
+
 #readRenviron("C:/projects/pgn-data-airflow/.Renviron")
 
 db_host_name <- Sys.getenv("POSTGRES_HOST_NAME")
@@ -65,7 +68,7 @@ source(paste0(rscript_folder,"/utils.R"))
 # EXTRACT ----
 # """""""""""""""""" ----
 
-=======
+
 DownloadOSM <- function(){
   tryCatch({
 
@@ -263,7 +266,8 @@ CREATE TABLE IF NOT EXISTS ingestion.mall
   original_id text,  
   name jsonb,
   legend_item jsonb,
-  data_list_id text,
+  legend_item_id uuid,
+  data_list_id uuid,
   risk_level integer,
   properties jsonb,
   properties_secondary jsonb,
@@ -306,12 +310,13 @@ operator_website,operator_wikidata,operator,
 min_level,max_level,
 	geometry FROM raw_data.osm_mall)
 INSERT INTO ingestion.mall 
-(original_id, name, legend_item, data_list_id, risk_level, properties, geometry, created_at)
+(original_id, name, legend_item, legend_item_id, data_list_id, risk_level, properties, geometry, created_at)
 SELECT
 original_id,
 name,
 legend_item,
-'",data_list_id,"' as data_list_id,
+'",legend_item_id,"'::uuid as legend_item_id,
+'",data_list_id,"'::uuid as data_list_id,
 1 as risk_level,
 JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
   'other_names', other_names,
@@ -327,52 +332,10 @@ JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
 )),
 geometry,
 CURRENT_DATE as created_at
-FROM cleaned;
-"),"
-ALTER TABLE IF EXISTS ingestion.mall
-    OWNER to pgn_group_data_team_w;
-","
-GRANT ALL ON TABLE ingestion.mall TO pgn_group_data_team_w;
-","
-GRANT ALL ON TABLE ingestion.mall TO pgn_user_airflow;")
-                            
-### Create transformation table ----
-transformation_table_sql <- c("
-DROP TABLE IF EXISTS transformation.mall CASCADE;
-","
-CREATE TABLE IF NOT EXISTS transformation.mall
-  (
-    id uuid NOT NULL DEFAULT gen_random_uuid(),
-    original_id text,    
-    name jsonb,
-    legend_item jsonb,
-	data_list_id uuid,
-	risk_level integer,
-    properties jsonb,
-	properties_secondary jsonb,
-	imported_at timestamptz,
-	tags jsonb,
-	deleted_at timestamptz,
-	updated_at timestamptz,
-	created_at timestamptz,
-	created_by uuid,
-	updated_by uuid,
-    geometry geometry(geometry, 4326),
-    CONSTRAINT mall_pkey PRIMARY KEY (id)
-  );
-","
-INSERT INTO transformation.mall
-(id, original_id, name, legend_item, data_list_id, properties, geometry, created_at)
-SELECT id, original_id, name, legend_item, data_list_id::uuid, properties, geometry, created_at FROM ingestion.mall;
-","
-ALTER TABLE IF EXISTS transformation.mall
-    OWNER to pgn_group_data_team_w;
-","
-GRANT ALL ON TABLE transformation.mall TO pgn_group_data_team_w;
-","
-GRANT ALL ON TABLE transformation.mall TO pgn_user_airflow;
-")
-
+FROM cleaned;"),
+"ALTER TABLE IF EXISTS ingestion.mall OWNER to pgn_group_data_team_w;",
+"GRANT ALL ON TABLE ingestion.mall TO pgn_group_data_team_w;",
+"GRANT ALL ON TABLE ingestion.mall TO pgn_user_airflow;")
 
 
 
@@ -380,7 +343,6 @@ GRANT ALL ON TABLE transformation.mall TO pgn_user_airflow;
 
 
 create_ingestion_table <- function() {execute_sql_commands(ingestion_table_sql, "Ingestion table")}
-create_transformation_table <- function() {execute_sql_commands(transformation_table_sql, "Transformation table")}
 
 run_smart_update = function() {
   smart_update_process("mall", 50, 100, 50, format(Sys.Date(), "%Y-%m-%d"), allow_update_even_if_checks_fail=overrule_checks, dry_run=do_dry_run,reuse_ingestion_data=reuse_ingestion_data)
@@ -397,7 +359,6 @@ main_function = function() {
     CreateImportTable(dataset = join_filtered, schema = "raw_data", table_name = "osm_mall")
     create_ingestion_table()
   }
-  #create_transformation_table()
   run_smart_update()
 }
 

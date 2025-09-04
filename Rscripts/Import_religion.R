@@ -15,6 +15,9 @@
 
 # Load variables -----------------------------------------------------------
 #  """""""""""""""""" ----------------------
+# External IDs
+data_list_id<-"45f9f964-4fe7-4966-8140-b622cb69d224"
+legend_item_id <- "3bbb2dbf-b13e-4a7d-a159-e64da468d3af"
 
 #readRenviron("C:/projects/pgn-data-airflow/.Renviron")
 
@@ -44,7 +47,7 @@ reuse_ingestion_data<-ifelse(tolower(reuse_ingestion_data) == "true", TRUE, FALS
 do_dry_run<-Sys.getenv("DO_DRY_RUN")
 do_dry_run<-ifelse(tolower(do_dry_run) == "true", TRUE, FALSE)
 
-data_list_id<-"45f9f964-4fe7-4966-8140-b622cb69d224"
+
 
 log_folder <- Sys.getenv("RSCRIPT_LOG_FOLDER")
 
@@ -94,6 +97,8 @@ tryCatch({
   print(paste("Something went wrong:", e$message))
 })
 
+# Create the import table in the database ----
+CreateImportTable(dataset = osm_all, schema = "raw_data", table_name = "osm_religion")  
 
   } else {
     print("No fresh data downloaded because user requested to re-use existing data")
@@ -123,7 +128,8 @@ ingestion_table_sql <- c("DROP TABLE IF EXISTS ingestion.place_of_worship CASCAD
   original_id text,    
   name jsonb,
   legend_item jsonb,
-  data_list_id text,
+  legend_item_id uuid,
+  data_list_id uuid,
   risk_level integer,
   properties jsonb,
   properties_secondary jsonb,
@@ -176,18 +182,19 @@ CASE WHEN services IS NULL AND service_times IS NULL THEN NULL
 	(building IS NULL OR (building != 'wayside_chapel' AND building != 'wayside_cross' AND building != 'wayside_shrine' AND building != 'chapel'))
 	AND (building_part IS NULL OR (building_part != 'wayside_chapel' AND building_part != 'wayside_cross' AND building_part != 'wayside_shrine' AND building_part != 'chapel'))
 	AND NOT (name IS NULL and religion IS NULL)
-	AND (place_of_worship IS NULL OR (place_of_worship!= 'wayside_chapel' AND place_of_worship!='wayside_shrine' AND place_of_worship!='lourdes_grotto'))
-	AND (place_of_worship_type IS NULL OR (place_of_worship_type != 'wayside_chapel' AND place_of_worship_type!= 'wayside_shrine' AND place_of_worship_type!= 'wayside_cross'))
+	AND (place_of_worship IS NULL OR (place_of_worship!= 'wayside_chapel' AND place_of_worship!='wayside_shrine' AND place_of_worship!='lourdes_grotto' AND place_of_worship!='cross' AND place_of_worship!='shrine' AND place_of_worship!='altar'))
+	AND (place_of_worship_type IS NULL OR (place_of_worship_type != 'wayside_chapel' AND place_of_worship_type!= 'wayside_shrine' AND place_of_worship_type!='wayside_cross' AND place_of_worship_type!= 'cross' AND place_of_worship_type!='shrine' AND place_of_worship_type!='altar'))
 	AND (historic IS NULL OR (historic != 'wayside_shrine' AND historic != 'wayside_cross' AND historic != 'wayside_chapel'))
 			)
 
 INSERT INTO ingestion.place_of_worship 
-(original_id, name, legend_item, data_list_id, risk_level, properties, geometry, created_at)
+(original_id, name, legend_item, legend_item_id, data_list_id, risk_level, properties, geometry, created_at)
 SELECT
 original_id,
 name,
 legend_item,
-'",data_list_id,"' as data_list_id,
+'",legend_item_id,"'::uuid as legend_item_id,
+'",data_list_id,"'::uuid as data_list_id,
 1 as risk_level,
 JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
   'other_names', other_names,
@@ -209,50 +216,16 @@ JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
 )),
 geometry,
 CURRENT_DATE as created_at
-FROM cleaned;
-"))
-
-### ONLY IF YOU NEED TO START FROM SCRATCH - Create SQL for transformation table ----
-transformation_table_sql <- c("
-DROP TABLE IF EXISTS transformation.place_of_worship CASCADE;
-","
-CREATE TABLE IF NOT EXISTS transformation.place_of_worship
-  (
-    id uuid NOT NULL DEFAULT gen_random_uuid(),
-    original_id text,    
-    name jsonb,
-    legend_item jsonb,
-	data_list_id uuid,
-	risk_level integer,
-    properties jsonb,
-	properties_secondary jsonb,
-	imported_at timestamptz,
-	tags jsonb,
-	deleted_at timestamptz,
-	updated_at timestamptz,
-	created_at timestamptz,
-	created_by uuid,
-	updated_by uuid,
-    geometry geometry(geometry, 4326),
-    CONSTRAINT place_of_worship_pkey PRIMARY KEY (id)
-  );
-","
-INSERT INTO transformation.place_of_worship 
-(id, original_id, name, legend_item, data_list_id, risk_level, properties, geometry, created_at)
-SELECT id, original_id, name, legend_item, data_list_id::uuid, risk_level, properties, geometry, created_at FROM ingestion.place_of_worship;
-")
-
-
-
+FROM cleaned;"),
+"ALTER TABLE IF EXISTS ingestion.place_of_worship OWNER to pgn_group_data_team_w;",
+"GRANT ALL ON TABLE ingestion.place_of_worship TO pgn_group_data_team_w;",
+"GRANT ALL ON TABLE ingestion.place_of_worship TO pgn_user_airflow;")
 
 
 
 ### Execute the SQL commands ----
 
 create_ingestion_table <- function() {execute_sql_commands(ingestion_table_sql, "Ingestion table")}
-create_transformation_table <- function() {execute_sql_commands(transformation_table_sql, "Transformation table")}
-
-
 
 
 
@@ -261,7 +234,7 @@ update_even_if_checks_fail<-overrule_checks
 
 
 run_smart_update = function() {
-  smart_update_process("place_of_worship", 50, 100, 50, format(Sys.Date(), "%Y-%m-%d"), update_even_if_checks_fail)
+  smart_update_process("place_of_worship", 50, 100, 50, format(Sys.Date(), "%Y-%m-%d"), allow_update_even_if_checks_fail=overrule_checks, dry_run=do_dry_run,reuse_ingestion_data=reuse_ingestion_data)
 }
 
 
@@ -272,11 +245,9 @@ run_smart_update = function() {
 main_function = function() {
   if (!reuse_ingestion_data) {
     process_fresh_data()
-    CreateImportTable(dataset = osm_all, schema = "raw_data", table_name = "osm_religion")  
     create_ingestion_table()
   }
   run_smart_update()
-  #create_transformation_table()
 }
 
 

@@ -15,36 +15,52 @@
 # Load variables -----------------------------------------------------------
 #  """""""""""""""""" ----------------------
 
-readRenviron("C:/projects/pgn-data-airflow/.Renviron")
+# data references
+data_list_id<-"2eb757ff-e4cd-46c8-aeba-c0b03f982ebf"
+legend_item_id<-"d7e4c3da-a5e1-45f5-b79e-926f7a354f10"
 
+#readRenviron("C:/projects/pgn-data-airflow/.Renviron")
+
+# connection details
 db_host_name <- Sys.getenv("POSTGRES_HOST_NAME")
 postgres_user <- Sys.getenv("POSTGRES_USER")
 postgres_password <- Sys.getenv("POSTGRES_PASSWORD")
 db_name<- Sys.getenv("POSTGRES_DB_NAME_CURATED")
 
-data_list_id<-"2eb757ff-e4cd-46c8-aeba-c0b03f982ebf"
-log_folder <- "C:/temp/logs/"
+# run status
+run_status<-Sys.getenv("RUN_STATUS")
+## this is set to false and prevents any accidental changes to the database by switching off the main_function(). On Airflow, this is set to true.
+run_status<-ifelse(tolower(run_status) == "true", TRUE, FALSE)
+
+# overrule the checks
+overrule_checks<-Sys.getenv("OVERRULE_CHECKS")
+## Set to FALSE by default. That means we do not update the anchors if some tests fail. Those tests include "the data has grown or shrunk by a lot of objects". If, after review of the log, you decide that nothing is wrong, set this manually to TRUE.
+# If the input is not correctly understood as boolean, this will force it to it.
+overrule_checks<-ifelse(tolower(overrule_checks) == "true", TRUE, FALSE)
+
+
+# Do not run the main part of the processing, but just do an update based on the ingestion table already in the dbase
+reuse_ingestion_data<-Sys.getenv("REUSE_INGESTION_DATA")
+reuse_ingestion_data<-ifelse(tolower(reuse_ingestion_data) == "true", TRUE, FALSE)
+
+# Only run the comparison script & update the ingestion table, but do not attempt to update the transformation table
+do_dry_run<-Sys.getenv("DO_DRY_RUN")
+do_dry_run<-ifelse(tolower(do_dry_run) == "true", TRUE, FALSE)
+
+
+
+log_folder <- Sys.getenv("RSCRIPT_LOG_FOLDER")
 
 ### Load external functions ------
 
-rscript_folder <- "C:/projects/pgn-data-airflow/rscripts/"
-source(paste0(rscript_folder,"utils_updated_check_protoanchors.R"))
-source(paste0(rscript_folder,"utils.R"))
+rscript_folder <- Sys.getenv("LOCAL_RSCRIPT_PATH")
+source(paste0(rscript_folder,"/utils_updated_check_protoanchors.R"))
+source(paste0(rscript_folder,"/utils.R"))
 
 # Libraries -------------------------------
 # """""""""""""""""" ----------------------
 
-library(sf)
-library(RPostgres)
-library(DBI)
-
-## Data processing libraries
-library(dplyr)
-
-
-## OSM library
-library(osmdata)
-
+# everything loaded via utils
 
 
 
@@ -52,51 +68,61 @@ library(osmdata)
 # EXTRACT ----
 # """""""""""""""""" ----
 
+# Function to download fresh data ----
+process_fresh_data <- function(){
+  # Default: download fresh data
+  if (reuse_ingestion_data==FALSE) {
+    
+    # Download OSM data ----
+    ### OSM DOWNLOAD PARAMETERS ----
+    
+    # Define the list of features
+    features_list <- list("generator:source" = "wind")
+    
+    # Define extra tags to use as columns for properties
+    extra_columns <- c("generator:output:electricity", "generator:type", "generator:model", "manufacturer", "manufacturer:ref","manufacturer:type",
+                       "manufacturer:url","model", "rotor:diameter", "diameter", "est_height:hub", "hub:height", 
+                       "height:hub", "height", "power","offshore","ref")
+    # Choose which datatypes are needed, as a list of datatypes, using any of "points", "lines", "mpolygons" (this is polygons+multipolygons together)
+    datatypes <- c("points", "mpolygon")
+    
+    
+    
+    ### Actual OSM download & transformation ----
+    
+    tryCatch({
+      # Call the large function
+      osm_all<-download_osm_process(features_list, datatypes, extra_columns, postgres=TRUE)
+      print("OSM data downloaded & processes succesfully")
+    }, error = function(e) {
+      # Print error message
+      print(paste("Something went wrong:", e$message))
+    })
+    
+    
+    
+    # remove if power=* is missing (this is usually because that tag has been used to archive the object with a lifecycle tag) or generator:output:electricity=small_installation
+    osm_all <- osm_all %>%
+      filter(!is.na(power)) %>%
+      filter(!(generator_output_electricity=='small_installation') | is.na(generator_output_electricity))
+    
+    # if generator_output_electricity contains kW or kw, create new numeric column output_kw
+    osm_all <- osm_all %>%
+      mutate(output_kw = ifelse(grepl("kW", generator_output_electricity, ignore.case = TRUE),
+                                as.numeric(gsub(" kW", "", generator_output_electricity, fixed = TRUE)),NA))
+    
+    # keep if output_kw>300 or output_kw is NA and make available outside the function
+    ## reasoning: we throw out 'small installations' and things with a very small production. We don't expect things written in MW to have a value of 0.3 MW or less. We also expect a lot of missing data, and assume it's a large installation when there is no data
+    osm_all <- osm_all %>%
+        filter(is.na(output_kw) | output_kw>300)
 
-# Download OSM data ----
-### OSM DOWNLOAD PARAMETERS ----
-
-# Define the list of features
-features_list <- list("generator:source" = "wind")
-# If default server fails, set to TRUE to use mail.ru server (older data)
-alternative_overpass_server<-FALSE
-# Define extra tags to use as columns for properties
-extra_columns <- c("generator:output:electricity", "generator:type", "generator:model", "manufacturer", "manufacturer:ref","manufacturer:type",
-                   "manufacturer:url","model", "rotor:diameter", "diameter", "est_height:hub", "hub:height", 
-                   "height:hub", "height", "power","offshore","ref")
-# Choose which datatypes are needed, as a list of datatypes, using any of "points", "lines", "mpolygons" (this is polygons+multipolygons together)
-datatypes <- c("points", "mpolygon")
-
-
-
-### Actual OSM download & transformation ----
-# This one has an alternative bbox to make sure to include the whole windfarm in the North Sea
-tryCatch({
-  # Call the large function
-  osm_all<-download_osm_process(features_list, datatypes, extra_columns, alternative_overpass_server, bbox = c(2.15,49.15,7.07,51.8))
-  print("OSM data downloaded & processes succesfully")
-}, error = function(e) {
-  # Print error message
-  print(paste("Something went wrong:", e$message))
-})
-
-
-
-
-# remove if power=* is missing (this is usually because that tag has been used to archive the object with a lifecycle tag) or generator:output:electricity=small_installation
-osm_all <- osm_all %>%
-  filter(!is.na(power)) %>%
-  filter(!(generator_output_electricity=='small_installation') | is.na(generator_output_electricity))
-
-# if generator_output_electricity contains kW or kw, create new numeric column output_kw
-osm_all <- osm_all %>%
-  mutate(output_kw = ifelse(grepl("kW", generator_output_electricity, ignore.case = TRUE),
-    as.numeric(gsub(" kW", "", generator_output_electricity, fixed = TRUE)),NA))
-
-# keep if output_kw>300 or output_kw is NA
-osm_all <- osm_all %>%
-  filter(is.na(output_kw) | output_kw>300)
-
+    CreateImportTable(dataset = osm_all, schema = "raw_data", table_name = "osm_wind_generators") 
+    
+    
+  } else {
+    print("No fresh data downloaded because user requested to re-use existing data")
+  }
+} # end process_fresh_data function
 
 
 # Upload to raw data ----
@@ -118,13 +144,14 @@ DROP TABLE IF EXISTS ingestion.wind_generators CASCADE;
 ","
 CREATE TABLE IF NOT EXISTS ingestion.wind_generators
   (
-    id uuid NOT NULL DEFAULT gen_random_uuid(),
-    original_id text,    
-    name jsonb,
-    legend_item jsonb,
-	data_list_id text,
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  original_id text,    
+  name jsonb,
+  legend_item jsonb,
+  legend_item_id uuid,
+	data_list_id uuid,
 	risk_level integer,
-    properties jsonb,
+  properties jsonb,
 	properties_secondary jsonb,
 	imported_at timestamptz,
 	tags jsonb,
@@ -175,13 +202,14 @@ geometry
 FROM raw_data.osm_wind_generators)
 
 INSERT INTO ingestion.wind_generators 
-(original_id, name, legend_item, data_list_id, risk_level, properties, geometry, created_at)
+(original_id, name, legend_item, legend_item_id, data_list_id, risk_level, properties, geometry, created_at)
 SELECT
 original_id,
 name,
 legend_item,
-'",data_list_id,"' as data_list_id,
-3 as risk_level,
+'",legend_item_id,"'::uuid as legend_item_id,
+'",data_list_id,"'::uuid as data_list_id,
+1 as risk_level,
 JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
 	'generator_output', generator_output,
 	'rotor_orientation', rotor_orientation,
@@ -205,89 +233,23 @@ JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
 	'image', image)) as properties,
 geometry,
 CURRENT_DATE as created_at
-FROM cleaned;
-"))
+FROM cleaned;"),
+"ALTER TABLE IF EXISTS ingestion.wind_generators OWNER to pgn_group_data_team_w;",
+"GRANT ALL ON TABLE ingestion.wind_generators TO pgn_group_data_team_w;",
+"GRANT ALL ON TABLE ingestion.wind_generators TO pgn_user_airflow;")
 
-
-
-### Create SQL for transformation table ----
-transformation_table_sql <- c("
-DROP TABLE IF EXISTS transformation.wind_generators CASCADE;
-","
-CREATE TABLE IF NOT EXISTS transformation.wind_generators
-  (
-    id uuid NOT NULL DEFAULT gen_random_uuid(),
-    original_id text,    
-    name jsonb,
-    legend_item jsonb,
-	data_list_id uuid,
-	risk_level integer,
-    properties jsonb,
-	properties_secondary jsonb,
-	imported_at timestamptz,
-	tags jsonb,
-	deleted_at timestamptz,
-	updated_at timestamptz,
-	created_at timestamptz,
-	created_by uuid,
-	updated_by uuid,
-    geometry geometry(geometry, 4326),
-    CONSTRAINT wind_generators_pkey PRIMARY KEY (id)
-  );
-","
-INSERT INTO transformation.wind_generators
-(original_id, name, legend_item, data_list_id, risk_level, properties, geometry, created_at)
-SELECT original_id, name, legend_item, data_list_id::uuid, risk_level, properties, geometry, created_at FROM ingestion.osm_wind_generators;
-")
-
-
-
-### Create fdw views ----
-fdw_views_sql <- c("
-CREATE OR REPLACE VIEW fdw.fdw_wind_generators
-AS
-SELECT id,
-original_id,
-name,
-legend_item,
-NULL::uuid as best_address_id,
-NULL::uuid as capakey_id,
-data_list_id,
-risk_level,
-properties,
-properties_secondary,
-imported_at,
-tags,
-deleted_at,
-updated_at,
-created_at,
-created_by,
-updated_by,
-geometry,
-st_pointonsurface(geometry) AS geometry_pt
-FROM transformation.wind_generators;
-","
-ALTER TABLE fdw.fdw_wind_generators
-OWNER TO paragon;
-","
-GRANT SELECT ON TABLE fdw.fdw_wind_generators TO fdw4dev;
-","
-GRANT ALL ON TABLE fdw.fdw_wind_generators TO paragon;
-")
 
 ### Execute the SQL commands ----
 
 create_ingestion_table <- function() {execute_sql_commands(ingestion_table_sql, "Ingestion table")}
-create_transformation_table <- function() {execute_sql_commands(transformation_table_sql, "Transformation table")}
-create_fdw_views <- function() {execute_sql_commands(fdw_views_sql, "FDW view")}
-
 
 # set to TRUE if you want to update the transformation table even if the checks fail. 
-update_even_if_checks_fail<-FALSE
-# Don't forget to also set checks_failed<-0 if there were already some issues in the base data
+update_even_if_checks_fail<-overrule_checks
+
+
 
 run_smart_update = function() {
-  smart_update_process("wind_generators", 50, 200, 100, format(Sys.Date(), "%Y-%m-%d"), update_even_if_checks_fail)
+  smart_update_process("wind_generators", 50, 200, 100, format(Sys.Date(), "%Y-%m-%d"), allow_update_even_if_checks_fail=overrule_checks, dry_run=do_dry_run,reuse_ingestion_data=reuse_ingestion_data)
 }
 
 
@@ -296,15 +258,15 @@ run_smart_update = function() {
 # """"""""""""""""""""----
 
 main_function = function() {
-  CreateImportTable(dataset = osm_all, schema = "raw_data", table_name = "osm_wind_generators")  
-  create_ingestion_table()
+  if (!reuse_ingestion_data) {
+    process_fresh_data()
+    create_ingestion_table()
+  }
   run_smart_update()
-  #create_transformation_table()
-  #create_fdw_views()
 }
 
 
-if(F){
+if(run_status){
   main_function()
 }
 

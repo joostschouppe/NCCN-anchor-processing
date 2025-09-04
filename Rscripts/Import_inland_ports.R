@@ -14,6 +14,10 @@
 # Load variables -----------------------------------------------------------
 #  """""""""""""""""" ----------------------
 
+# Load external IDs
+data_list_id<-"90cb62ad-6b6b-4bd4-90fd-e5e71f817c5b"
+legend_item_id <- "de5d47ca-7c0c-4f9b-9771-26dd58affed3"
+
 
 readRenviron("C:/Code base/RAirflow/pgn-data-airflow/.Renviron")
 
@@ -43,7 +47,6 @@ do_dry_run<-Sys.getenv("DO_DRY_RUN")
 do_dry_run<-ifelse(tolower(do_dry_run) == "true", TRUE, FALSE)
 
 
-data_list_id<-"90cb62ad-6b6b-4bd4-90fd-e5e71f817c5b" # make one for inland ports
 
 log_folder <- Sys.getenv("RSCRIPT_LOG_FOLDER")
 
@@ -139,7 +142,8 @@ CREATE TABLE IF NOT EXISTS ingestion.inland_ports
   original_id text,  
   name jsonb,
   legend_item jsonb,
-  data_list_id text,
+  legend_item_id uuid,
+  data_list_id uuid,
   risk_level integer,
   properties jsonb,
   properties_secondary jsonb,
@@ -167,46 +171,41 @@ cleaned as (SELECT
               'eng', 'inland port') AS legend_item,
               CASE WHEN \"altLabel\" IS NULL THEN NULL 
                 ELSE \"altLabel\" END AS other_names,
-              CASE WHEN street IS NULL THEN NULL
-                ELSE LTRIM(CONCAT(street, ' ' || \"postalCode\", ' ')) END AS address,
-              CASE WHEN \"locationLabel\" IS NULL THEN NULL
-                ELSE \"locationLabel\" END AS location,
-              \"territorialEntityLabel\" AS territorial_entity,
+              CASE WHEN street IS NULL THEN \"territorialEntityLabel\"
+                ELSE LTRIM(CONCAT(street, ' ' || \"postalCode\", ' ' || \"territorialEntityLabel\")) END AS address,
               CASE WHEN website IS NULL THEN NULL
                 ELSE website END AS website,
               CASE WHEN phone IS NULL THEN NULL
                 ELSE phone END AS phone,
               \"operatorLabel\" AS operator,
-              inception,
+              inception AS start_date,
               \"bodyOfWaterLabel\" AS body_of_water,
               coordinate AS geometry
               FROM raw_data.wikidata_inland_ports)
 INSERT INTO ingestion.inland_ports
-(original_id, name, legend_item, data_list_id, risk_level, properties, geometry, created_at)
+(original_id, name, legend_item, legend_item_id, data_list_id, risk_level, properties, geometry, created_at)
 SELECT
 original_id,
 name,
-legend_item,'",
-data_list_id, "' AS data_list_id,
+legend_item,
+'", legend_item_id, "'::uuid AS legend_item_id,
+'",data_list_id, "'::uuid AS data_list_id,
 1 AS risk_level,
 JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
-  'alt_label', alt_label,
+  'other_names', other_names,
   'address', address,
-  'location', location,
-  'territorial_entity', territorial_entity,
   'website', website,
 	'phone', phone,
 	'operator', operator,
-  'inception', inception,
+  'start_date', start_date,
   'body_of_water', body_of_water
 )),
 geometry,
 CURRENT_DATE as created_at
-FROM cleaned;
-"),
-  "ALTER TABLE IF EXISTS ingestion.inland_ports OWNER to pgn_group_data_team_w;",
-  "GRANT ALL ON TABLE ingestion.inland_ports TO pgn_group_data_team_w;",
-  "GRANT ALL ON TABLE ingestion.inland_ports TO pgn_user_airflow;"
+FROM cleaned;"),
+"ALTER TABLE IF EXISTS ingestion.inland_ports OWNER to pgn_group_data_team_w;",
+"GRANT ALL ON TABLE ingestion.inland_ports TO pgn_group_data_team_w;",
+"GRANT ALL ON TABLE ingestion.inland_ports TO pgn_user_airflow;"
 )
 
 # Create transformation table ----
@@ -267,12 +266,4 @@ main_function = function() {
 if(run_status){
   main_function()
 }
-
-
-
-
-
-
-
-
 

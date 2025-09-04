@@ -11,54 +11,70 @@
 ##
 ## ---------------------------
 
-
-
-
 # Load variables -----------------------------------------------------------
 #  """""""""""""""""" ----------------------
+# External IDs
+data_list_id <- "290fa28c-fe90-46e5-967d-b75c4d847608"
+legend_item_id <- "83416c0b-d13b-43f7-a528-3eb51cf8dcb9"
 
-readRenviron("C:/projects/pgn-data-airflow/.Renviron")
+#readRenviron("C:/projects/pgn-data-airflow/.Renviron")
 
+# connection details
 db_host_name <- Sys.getenv("POSTGRES_HOST_NAME")
 postgres_user <- Sys.getenv("POSTGRES_USER")
 postgres_password <- Sys.getenv("POSTGRES_PASSWORD")
 db_name<- Sys.getenv("POSTGRES_DB_NAME_CURATED")
 
-data_list_id<-"290fa28c-fe90-46e5-967d-b75c4d847608"
-log_folder <- "C:/temp/logs/"
+# run status
+run_status<-Sys.getenv("RUN_STATUS")
+## this is set to false and prevents any accidental changes to the database by switching off the main_function(). On Airflow, this is set to true.
+run_status<-ifelse(tolower(run_status) == "true", TRUE, FALSE)
+
+# overrule the checks
+overrule_checks<-Sys.getenv("OVERRULE_CHECKS")
+## Set to FALSE by default. That means we do not update the anchors if some tests fail. Those tests include "the data has grown or shrunk by a lot of objects". If, after review of the log, you decide that nothing is wrong, set this manually to TRUE.
+# If the input is not correctly understood as boolean, this will force it to it.
+overrule_checks<-ifelse(tolower(overrule_checks) == "true", TRUE, FALSE)
+
+# Do not run the main part of the processing, but just do an update based on the ingestion table already in the dbase
+reuse_ingestion_data<-Sys.getenv("REUSE_INGESTION_DATA")
+reuse_ingestion_data<-ifelse(tolower(reuse_ingestion_data) == "true", TRUE, FALSE)
+
+# Only run the comparison script & update the ingestion table, but do not attempt to update the transformation table
+do_dry_run<-Sys.getenv("DO_DRY_RUN")
+do_dry_run<-ifelse(tolower(do_dry_run) == "true", TRUE, FALSE)
+
+
+
+
+
+# Set log folder
+log_folder <- Sys.getenv("RSCRIPT_LOG_FOLDER")
 
 ### Load external functions ------
 
-rscript_folder <- "C:/projects/pgn-data-airflow/rscripts/"
-source(paste0(rscript_folder,"utils_updated_check_protoanchors.R"))
-source(paste0(rscript_folder,"utils.R"))
+rscript_folder <- Sys.getenv("LOCAL_RSCRIPT_PATH")
+source(paste0(rscript_folder,"/utils_updated_check_protoanchors.R"))
+source(paste0(rscript_folder,"/utils.R"))
+
 
 # Libraries -------------------------------
 # """""""""""""""""" ----------------------
 
-library(sf)
-library(RPostgres)
-library(DBI)
-
-library(stringr)
-library(dplyr)
 library(rvest)
-library(purrr)
-library(jsonlite)
-library(tidyr)
-
-## Geocoding libraries
-library(devtools)
-library(phacochr)
-phaco_setup_data()
-phacochr::phaco_best_data_update()
+library(tibble)
 
 
 # EXTRACT ----
 # """""""""""""""""" ----
 
-
-
+process_fresh_data <- function(){
+  ## Geocoding libraries
+  library(devtools)
+  library(phacochr)
+  phaco_setup_data()
+  phacochr::phaco_best_data_update()
+  
 # DOWNLOAD THE DATA ----
 
 # URL of the website
@@ -67,159 +83,106 @@ url <- "https://www.fedasil.be/nl/opvangcentra"
 # Read the HTML content
 webpage <- read_html(url)
 
-# Extract the script tags
-scripts <- webpage %>% html_nodes("script") %>% html_text()
 
-# Check the content of the scripts
-gmap<-scripts[grep("gmap", scripts)]  # Look for scripts related to the Google Map
 
-# Find the JSON string (you may need to extract it from a longer string)
-json_data <- as.data.frame(gmap[grep("markers", gmap)])
 
-markers_raw <- str_extract(json_data, "\\[\\{.*?\\}\\]")
-
-markers <- fromJSON(markers_raw)
-
-# Convert to a data frame
-markers_df <- as.data.frame(markers)
+# Read the page
+url <- "https://www.fedasil.be/nl/opvangcentra"
+webpage <- read_html(url)
 
 
 # TRANSFORM ----
 # """""""""""""""""" ----
 
+# Extract all map points
+locations <- html_elements(webpage, ".geolocation-location")
 
 
 
-# CLEAN THE DATA ----
-# Function to normalize and clean the HTML text
-normalize_text <- function(html_text) {
-  str_replace_all(html_text, "\\s+", " ") # Collapse all whitespace into single spaces
-}
-
-# Function to extract the first <p><p> content using regex
-extract_first_p <- function(html_text) {
-  # Normalize the text and remove extra spaces
-  cleaned_html <- normalize_text(html_text)
+parse_location_info <- function(loc) {
+  id <- html_attr(loc, "data-views-row-index") 
+  lat <- html_attr(loc, "data-lat")
+  lng <- html_attr(loc, "data-lng")
   
-  # Regex to capture content inside the first <p><p> block
-  match <- str_match(cleaned_html, "<p>\\s*<p>(.*?)</p>")
+  title_node <- loc %>% html_element("h4 a")
+  title <- title_node %>% html_text(trim = TRUE)
+  url <- title_node %>% html_attr("href") %>% paste0("https://www.fedasil.be", .)  # optional domain prepend
   
-  # Return the captured content, or NA if not found
-  if (!is.na(match[2])) {
-    return(match[2])
+  partner_type <- loc %>% html_element("h6.field-content") %>% html_text(trim = TRUE)
+  
+  # Extract and clean lines from <p>
+  desc_html <- loc %>% html_element(".field-content p")
+  desc_nodes <- xml2::xml_contents(desc_html)
+  lines <- purrr::map_chr(desc_nodes, function(x) {
+    if (xml2::xml_name(x) == "br") "\n" else xml2::xml_text(x)
+  }) %>%
+    paste(collapse = "") %>%
+    str_split("\n", simplify = FALSE) %>%
+    .[[1]] %>%
+    str_trim() %>%
+    discard(~ .x == "")
+  
+  # Handle name that may span two lines
+  if (length(lines) >= 2 && !str_detect(lines[2], "\\d")) {
+    name <- paste(lines[1], lines[2])
+    lines <- lines[-2]
   } else {
-    return(NA)
+    name <- lines[1]
   }
-}
-
-# Function to extract fields from the address block
-extract_fields <- function(address_block) {
-  # Split by <br /> and trim whitespace
-  parts <- str_split(address_block, "<br />")[[1]] %>% str_trim()
   
-  # Extract location name, street, and postcode
-  location_name <- ifelse(length(parts) >= 1, parts[1], NA)
-  street_housenumber <- ifelse(length(parts) >= 2, parts[2], NA)
-  postcode_municipality <- ifelse(length(parts) >= 3, parts[3], NA)
+  # Remaining fields (at least street and postcode+municipality will exist)
+  rest <- lines[-1]
   
-  # Return as a named list
-  list(
-    location_name = location_name,
+  street_housenumber <- rest[1] %||% NA_character_
+  postcode_municipality <- rest[2] %||% NA_character_
+  phone <- NA_character_
+  email <- NA_character_
+  
+  for (line in rest[-c(1,2)]) {
+    if (str_detect(line, "@")) {
+      email <- line
+    } else {
+      phone <- line
+    }
+  }
+  
+  tibble::tibble(
+    id = id,
+    partner_type = partner_type,
+    place = title,
+    url = url,
+    name = name,
     street_housenumber = street_housenumber,
-    postcode_municipality = postcode_municipality
-  )
-}
-
-# Function to extract the phone number and adjust the format
-adjust_phone <- function(phone_number) {
-  if (is.na(phone_number)) return(NA) # Return NA for missing values
-  if (startsWith(phone_number, "0")) {
-    phone_number <- sub("^0", "+32", phone_number) # Replace leading 0 with +32
-  } else {
-    phone_number <- paste0("+", phone_number) # Add + to other numbers
-  }
-  return(phone_number)
-}
-
-# Function to extract and clean the phone number
-extract_phone <- function(address_block) {
-  # Remove `/`, `.`, and spaces
-  cleaned_string <- str_replace_all(address_block, "[/\\.\\s]", "")
-  
-  # Extract any sequence of at least 8 digits
-  phone_match <- str_extract(cleaned_string, "\\d{8,}")
-  
-  # Adjust phone number format if found
-  if (!is.na(phone_match)) {
-    return(adjust_phone(phone_match))
-  } else {
-    return(NA)
-  }
-}
-
-# Function to parse the HTML text
-parse_html_text <- function(html_text) {
-  # Extract the div class value for "type"
-  parsed_html <- read_html(html_text)
-  type <- parsed_html %>% html_node("div.gmap-popup > div") %>% html_attr("class") %>%
-    str_remove_all("term_")
-  
-  # Extract title
-  title <- parsed_html %>% html_node("h3") %>% html_text(trim = TRUE)
-  
-  # Extract the first <p><p> block
-  address_block <- extract_first_p(html_text)
-  
-  # If address block is found, proceed to extract address fields
-  fields <- if (!is.na(address_block)) extract_fields(address_block) else list(
-    location_name = NA,
-    street_housenumber = NA,
-    postcode_municipality = NA
-  )
-  
-  # Extract email address
-  email <- parsed_html %>% html_node("a[href^='mailto']") %>% html_attr("href") %>% str_remove("mailto:")
-  
-  # Extract phone number
-  phone <- extract_phone(address_block)
-  
-  # Extract other links (read more, external)
-  read_more <- parsed_html %>% html_node("a.internal-link") %>% html_attr("href")
-  external_link <- parsed_html %>% html_node("a.external-link") %>% html_attr("href")
-  
-  # Return the parsed fields as a named list
-  list(
-    type = type,
-    title = title,
-    email = email,
+    postcode_municipality = postcode_municipality,
     phone = phone,
-    read_more = read_more,
-    external_link = external_link,
-    location_name = fields$location_name,
-    street_housenumber = fields$street_housenumber,
-    postcode_municipality = fields$postcode_municipality
+    email = email,
+    latitude = as.numeric(lat),
+    longitude = as.numeric(lng)
   )
 }
 
-# Apply parsing to the dataset (markers_df assumed)
-parsed_data <- markers_df %>%
-  mutate(parsed = map(text, parse_html_text)) %>%
-  unnest_wider(parsed)
 
-# if external link contains an @, set as NA
-parsed_data$external_link <- ifelse(str_detect(parsed_data$external_link, "@"), NA, parsed_data$external_link)
+map_data <- lapply(locations, parse_location_info) %>% bind_rows()
 
+map_data <- map_data %>%
+  mutate(
+    phone = phone %>%
+      str_remove_all("(?i)^tél\\s*:?[\\s]*|^tel\\s*:?[\\s]*|^t\\s*:?[\\s]*") %>%  # remove T, T:, Tél etc.
+      str_replace_all("[/.]", " ") %>%                          # replace slashes and dots with space
+      str_squish() %>%                                          # remove extra/multiple spaces
+      str_replace("^0", "+32 ")                                 # replace leading 0 with +32
+  )
 
-
-# SIMPLIFY THE DATA ----
-parsed_data <- parsed_data %>%
-  select(latitude, longitude, type, title, email, phone, read_more, external_link, location_name, street_housenumber, postcode_municipality)
+# change Partenaire into Partner
+map_data$partner_type <- map_data$partner_type %>%
+  str_replace_all("Partenaire", "Partner")
+table(map_data$partner_type)
 
 # turn into SF dataset
-parsed_data <- st_as_sf(parsed_data, coords = c("longitude", "latitude"), crs = 4326)
+parsed_data <- st_as_sf(map_data, coords = c("longitude", "latitude"), crs = 4326)
 
 
-# GEOCODE ----
+# Geocode the address (because the original locations are often not very exact) ----
 
 parsed_data <- parsed_data %>% mutate(ad_hoc_id = row_number())
 data_input_geocode <- as.data.frame(parsed_data) %>% select(ad_hoc_id, street_housenumber, postcode_municipality)
@@ -236,6 +199,32 @@ simple_geocode <- as.data.frame(simple_geocode) %>%
 parsed_data <- st_transform(parsed_data, crs = 31370)
 data_merged <- left_join(parsed_data, simple_geocode, by = "ad_hoc_id")
 
+
+data_merged <- data_merged %>%
+  group_by(geometry) %>%
+  summarise(
+    id = paste(unique(na.omit(id)), collapse = "; "),
+    partner_type = paste(unique(na.omit(partner_type)), collapse = "; "),
+    place = paste(unique(na.omit(place)), collapse = " / "),
+    url = paste(unique(na.omit(url)), collapse = "; "),
+    name = paste(unique(na.omit(name)), collapse = "; "),
+    street_housenumber = paste(unique(na.omit(street_housenumber)), collapse = " / "),
+    postcode_municipality = paste(unique(na.omit(postcode_municipality)), collapse = " / "),
+    phone = paste(unique(na.omit(phone)), collapse = "; "),
+    email = paste(unique(na.omit(email)), collapse = "; "),
+    geometry_geocoded = first(geometry_geocoded[!st_is_empty(geometry_geocoded)])
+  ) %>%
+  ungroup()
+
+
+
+
+#calculate distance beween geometry and geometry_geocoded
+data_merged <- data_merged %>%
+  rowwise() %>%
+  mutate(distance = as.numeric(st_distance(geometry, geometry_geocoded))) %>%
+  ungroup()
+
 # only if geocoding failed, use original coordinates
 data_merged <- data_merged %>%
   mutate(geometry_cleaned = ifelse(st_is_empty(geometry_geocoded), geometry, geometry_geocoded)) %>%
@@ -246,7 +235,13 @@ data_merged <- st_set_geometry(data_merged, "geometry_cleaned") %>%
 # make it clear geometry is 31370
 st_crs(data_merged) <- 31370
 #transform back to 4326
-data_merged <- st_transform(data_merged, crs = 4326)
+data_merged <<- st_transform(data_merged, crs = 4326)
+
+
+
+
+}
+
 
 # LOAD ----
 # """""""""""""""""" ----
@@ -263,7 +258,8 @@ ingestion_table_sql <- c("DROP TABLE IF EXISTS ingestion.asylum_reception_centre
     original_id text,  
     name jsonb,
     legend_item jsonb,
-    data_list_id text,
+	legend_item_id uuid,
+    data_list_id uuid,
     risk_level integer,
     properties jsonb,
     properties_secondary jsonb,
@@ -279,21 +275,21 @@ ingestion_table_sql <- c("DROP TABLE IF EXISTS ingestion.asylum_reception_centre
   );",paste0("
   WITH cleaned as (
     SELECT
-    read_more as original_id,
+    id as original_id,
     jsonb_strip_nulls(jsonb_build_object(
       'und', CASE 
-      WHEN location_name='Aanmeldcentrum' OR COUNT(*) OVER (PARTITION BY location_name) > 1 THEN location_name || ' ' || title
-      ELSE location_name END)) AS name,
+      WHEN name='Aanmeldcentrum' OR COUNT(*) OVER (PARTITION BY name) > 1 THEN name || ' ' || place
+      ELSE name END)) AS name,
     jsonb_build_object(
       'dut', 'opvangcentrum voor asielzoekers',
       'fre', 'centre d''accueil pour demandeurs d''asile',
       'eng', 'reception centre for asylum seekers')
     as legend_item,
     JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
+	  'asylum_centre_operator_type', partner_type,
       'email', email,
       'phone', phone,
-      'operator_website', 'https://www.fedasil.be' || read_more,
-      'website', external_link,
+      'website', url,
       'address', LTRIM(CONCAT(REPLACE(street_housenumber,',',''),', ',street_housenumber)))) as properties,
     2 as risk_level,
     geometry
@@ -301,70 +297,33 @@ ingestion_table_sql <- c("DROP TABLE IF EXISTS ingestion.asylum_reception_centre
     raw_data.fedasil_reception_parsed)
   
   INSERT INTO ingestion.asylum_reception_centres 
-  (original_id, name, legend_item, data_list_id, risk_level, properties, geometry, created_at)
+  (original_id, name, legend_item, legend_item_id, data_list_id, risk_level, properties, geometry, created_at)
   SELECT
   original_id,
   name,
   legend_item,
-  '",data_list_id,"' as data_list_id,
+  '",legend_item_id,"'::uuid as legend_item_id,
+  '",data_list_id,"'::uuid as data_list_id,
   risk_level,
   properties,
   geometry,
   CURRENT_DATE as created_at
-  FROM cleaned;
-"))
-                         
-### Create transformation table ----
-transformation_table_sql <- c("
-DROP TABLE IF EXISTS transformation.asylum_reception_centres CASCADE;
-","
-CREATE TABLE IF NOT EXISTS transformation.asylum_reception_centres
-  (
-    id uuid NOT NULL DEFAULT gen_random_uuid(),
-    original_id text,    
-    name jsonb,
-    legend_item jsonb,
-	data_list_id uuid,
-	risk_level integer,
-    properties jsonb,
-	properties_secondary jsonb,
-	imported_at timestamptz,
-	tags jsonb,
-	deleted_at timestamptz,
-	updated_at timestamptz,
-	created_at timestamptz,
-	created_by uuid,
-	updated_by uuid,
-    geometry geometry(geometry, 4326),
-    CONSTRAINT asylum_reception_centres_pkey PRIMARY KEY (id)
-  );
-","
-INSERT INTO transformation.asylum_reception_centres
-(id, original_id, name, legend_item, data_list_id, properties, geometry, created_at)
-SELECT id, original_id, name, legend_item, data_list_id::uuid, properties, geometry, created_at FROM ingestion.asylum_reception_centres;
-","
-ALTER TABLE IF EXISTS transformation.asylum_reception_centres
-OWNER to pgn_group_data_team_w;")
-
-
+  FROM cleaned;"),
+"ALTER TABLE IF EXISTS ingestion.asylum_reception_centres OWNER to pgn_group_data_team_w;",
+"GRANT ALL ON TABLE ingestion.asylum_reception_centres TO pgn_group_data_team_w;",
+"GRANT ALL ON TABLE ingestion.asylum_reception_centres TO pgn_user_airflow;")
 
 
 ### Execute the SQL commands ----
-
-
 create_ingestion_table <- function() {execute_sql_commands(ingestion_table_sql, "Ingestion table")}
-create_transformation_table <- function() {execute_sql_commands(transformation_table_sql, "Transformation table")}
-create_fdw_views <- function() {execute_sql_commands(fdw_views_sql, "FDW view")}
 
 
+# Main function -----------------------------------------------------------
+# """"""""""""""""""""----
 
-
-# set to TRUE if you want to update the transformation table even if the checks fail. 
-update_even_if_checks_fail<-FALSE
-# Don't forget to also set checks_failed<-0 if there were already some issues in the base data
 
 run_smart_update = function() {
-  smart_update_process("asylum_reception_centres", 50, 100, 50, format(Sys.Date(), "%Y-%m-%d"), update_even_if_checks_fail)
+  smart_update_process("asylum_reception_centres", 150, 175, 150, format(Sys.Date(), "%Y-%m-%d"), allow_update_even_if_checks_fail=overrule_checks, dry_run=do_dry_run,reuse_ingestion_data=reuse_ingestion_data)
 }
 
 
@@ -373,12 +332,15 @@ run_smart_update = function() {
 # """"""""""""""""""""----
 
 main_function = function() {
-  CreateImportTable(dataset = data_merged, schema = "raw_data", table_name = "fedasil_reception_parsed")
-  create_ingestion_table()
+  if (!reuse_ingestion_data) {
+    process_fresh_data()
+    CreateImportTable(dataset = data_merged, schema = "raw_data", table_name = "fedasil_reception_parsed")
+    create_ingestion_table()
+  }
   run_smart_update()
-  #create_transformation_table()
 }
 
-if(F){
+
+if(run_status){
   main_function()
 }

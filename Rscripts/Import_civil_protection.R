@@ -15,43 +15,56 @@
 # Load variables -----------------------------------------------------------
 #  """""""""""""""""" ----------------------
 
-readRenviron("C:/projects/pgn-data-airflow/.Renviron")
+data_list_id <- "0154689a-078a-4b65-9b07-3e2476a31e12"
+legend_item_id <- "d02288fb-513a-4504-abf3-d7cb19d12fd3"
 
+
+#readRenviron("C:/projects/pgn-data-airflow/.Renviron")
+
+# connection details
 db_host_name <- Sys.getenv("POSTGRES_HOST_NAME")
 postgres_user <- Sys.getenv("POSTGRES_USER")
 postgres_password <- Sys.getenv("POSTGRES_PASSWORD")
 db_name<- Sys.getenv("POSTGRES_DB_NAME_CURATED")
 
-data_list_id<-"0154689a-078a-4b65-9b07-3e2476a31e12"
-log_folder <- "C:/temp/logs/"
+# run status
+run_status<-Sys.getenv("RUN_STATUS")
+## this is set to false and prevents any accidental changes to the database by switching off the main_function(). On Airflow, this is set to true.
+run_status<-ifelse(tolower(run_status) == "true", TRUE, FALSE)
+
+# overrule the checks
+overrule_checks<-Sys.getenv("OVERRULE_CHECKS")
+## Set to FALSE by default. That means we do not update the anchors if some tests fail. Those tests include "the data has grown or shrunk by a lot of objects". If, after review of the log, you decide that nothing is wrong, set this manually to TRUE.
+# If the input is not correctly understood as boolean, this will force it to it.
+overrule_checks<-ifelse(tolower(overrule_checks) == "true", TRUE, FALSE)
+
+
+# Do not run the main part of the processing, but just do an update based on the ingestion table already in the dbase
+reuse_ingestion_data<-Sys.getenv("REUSE_INGESTION_DATA")
+reuse_ingestion_data<-ifelse(tolower(reuse_ingestion_data) == "true", TRUE, FALSE)
+
+# Only run the comparison script & update the ingestion table, but do not attempt to update the transformation table
+do_dry_run<-Sys.getenv("DO_DRY_RUN")
+do_dry_run<-ifelse(tolower(do_dry_run) == "true", TRUE, FALSE)
+
+
+
+log_folder <- Sys.getenv("RSCRIPT_LOG_FOLDER")
 
 ### Load external functions ------
 
-rscript_folder <- "C:/projects/pgn-data-airflow/rscripts/"
-source(paste0(rscript_folder,"utils_updated_check_protoanchors.R"))
-source(paste0(rscript_folder,"utils.R"))
-
-# Libraries -------------------------------
-# """""""""""""""""" ----------------------
-
-library(sf)
-library(RPostgres)
-library(DBI)
-
-## Data processing libraries
-library(dplyr)
-
-
-## OSM library
-library(osmdata)
-
-
+rscript_folder <- Sys.getenv("LOCAL_RSCRIPT_PATH")
+source(paste0(rscript_folder,"/utils_updated_check_protoanchors.R"))
+source(paste0(rscript_folder,"/utils.R"))
 
 
 
 # EXTRACT ----
 # """""""""""""""""" ----
-
+# Function to download fresh data ----
+process_fresh_data <- function(){
+  # Default: download fresh data
+  if (reuse_ingestion_data==FALSE) {
 
 # Download OSM data ----
 ### OSM DOWNLOAD PARAMETERS ----
@@ -70,7 +83,7 @@ datatypes <- c("points", "mpolygon")
 
 tryCatch({
   # Call the large function
-  osm_all<-download_osm_process(features_list, datatypes, extra_columns, keep_region=TRUE, postgres=TRUE)
+  osm_all<<-download_osm_process(features_list, datatypes, extra_columns, keep_region=TRUE, postgres=TRUE)
   print("OSM data downloaded & processes succesfully")
 }, error = function(e) {
   # Print error message
@@ -78,6 +91,10 @@ tryCatch({
 })
 
 
+  } else {
+    print("No fresh data downloaded because user requested to re-use existing data")
+  }
+} # end process_fresh_data function
 
 
 
@@ -104,7 +121,8 @@ CREATE TABLE IF NOT EXISTS ingestion.emergency_response
     original_id text,    
     name jsonb,
     legend_item jsonb,
-	data_list_id text,
+  legend_item_id uuid,
+	data_list_id uuid,
 	risk_level integer,
     properties jsonb,
 	properties_secondary jsonb,
@@ -145,12 +163,13 @@ geometry
 FROM raw_data.osm_emergency_response)
 
 INSERT INTO ingestion.emergency_response 
-(original_id, name, legend_item, data_list_id, risk_level, properties, geometry, created_at)
+(original_id, name, legend_item, legend_item_id, data_list_id, risk_level, properties, geometry, created_at)
 SELECT
 original_id,
 name,
 legend_item,
-'",data_list_id,"' as data_list_id,
+'",legend_item_id,"'::uuid as legend_item_id,
+'",data_list_id,"'::uuid as data_list_id,
 0 as risk_level,
 JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
 	'other_names', other_names,
@@ -165,96 +184,24 @@ JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
 	'image', image)) as properties,
 geometry,
 CURRENT_DATE as created_at
-FROM cleaned;
-"))
-
-
-
-### Create SQL for transformation table ----
-transformation_table_sql <- c("
-DROP TABLE IF EXISTS transformation.emergency_response CASCADE;
-","
-CREATE TABLE IF NOT EXISTS transformation.emergency_response
-  (
-    id uuid NOT NULL DEFAULT gen_random_uuid(),
-    original_id text,    
-    name jsonb,
-    legend_item jsonb,
-	data_list_id uuid,
-	risk_level integer,
-    properties jsonb,
-	properties_secondary jsonb,
-	imported_at timestamptz,
-	tags jsonb,
-	deleted_at timestamptz,
-	updated_at timestamptz,
-	created_at timestamptz,
-	created_by uuid,
-	updated_by uuid,
-    geometry geometry(geometry, 4326),
-    CONSTRAINT emergency_response_pkey PRIMARY KEY (id)
-  );
-","
-INSERT INTO transformation.emergency_response
-(original_id, name, legend_item, data_list_id, risk_level, properties, geometry, created_at)
-SELECT original_id, name, legend_item, data_list_id::uuid, risk_level, properties, geometry, created_at FROM ingestion.emergency_response;
-")
-
-
-
-### Create fdw views ----
-fdw_views_sql <- c("
-DROP VIEW IF EXISTS fdw.fdw_emergency_response;",
-"CREATE OR REPLACE VIEW fdw.fdw_emergency_response
- AS
- SELECT id,
-    row_number() OVER () AS gid,
-    original_id,
-    name,
-    legend_item,
-    NULL::uuid AS best_address_id,
-    NULL::uuid AS capakey_id,
-    data_list_id,
-    risk_level,
-    properties,
-    properties_secondary,
-    imported_at,
-    tags,
-    deleted_at,
-    updated_at,
-    created_at,
-    created_by,
-    updated_by,
-    st_reduceprecision(geometry, 0.000001::double precision) AS geometry,
-    st_reduceprecision(st_pointonsurface(geometry), 0.000001::double precision) AS geometry_pt,
-        CASE
-            WHEN st_geometrytype(geometry) = ANY (ARRAY['ST_Point'::text, 'ST_LineString'::text]) THEN st_reduceprecision(st_transform(st_buffer(st_transform(geometry, 31370), 20::double precision), 4326), 0.000001::double precision)
-            ELSE geometry
-        END AS geometry_pg,
-    st_reduceprecision(st_simplifypreservetopology(geometry, ln(st_area(geometry) + 1::double precision) * 0.0025::double precision), 0.000001::double precision) AS geometry_s
-   FROM transformation.emergency_response
-  WHERE st_within(geometry, ( SELECT anchor_spatial_filter.geometry
-           FROM raw_data.anchor_spatial_filter));",
-"ALTER TABLE fdw.fdw_emergency_response
-    OWNER TO pgn_group_data_team_w;",
-"GRANT SELECT ON TABLE fdw.fdw_emergency_response TO pgn_group_acces2curation;",
-"GRANT ALL ON TABLE fdw.fdw_emergency_response TO pgn_group_data_team_w;",
-"GRANT SELECT ON TABLE fdw.fdw_emergency_response TO pgn_user_vectortiles;"
+FROM cleaned;"),
+"ALTER TABLE IF EXISTS ingestion.emergency_response OWNER to pgn_group_data_team_w;",
+"GRANT ALL ON TABLE ingestion.emergency_response TO pgn_group_data_team_w;",
+"GRANT ALL ON TABLE ingestion.emergency_response TO pgn_user_airflow;"
 )
+
 
 ### Execute the SQL commands ----
 
 create_ingestion_table <- function() {execute_sql_commands(ingestion_table_sql, "Ingestion table")}
-create_transformation_table <- function() {execute_sql_commands(transformation_table_sql, "Transformation table")}
-create_fdw_views <- function() {execute_sql_commands(fdw_views_sql, "FDW view")}
 
 
 # set to TRUE if you want to update the transformation table even if the checks fail. 
-update_even_if_checks_fail<-FALSE
-# Don't forget to also set checks_failed<-0 if there were already some issues in the base data
+update_even_if_checks_fail<-overrule_checks
+
 
 run_smart_update = function() {
-  smart_update_process("emergency_response", 50, 200, 100, format(Sys.Date(), "%Y-%m-%d"), update_even_if_checks_fail)
+  smart_update_process("emergency_response", 50, 200, 100, format(Sys.Date(), "%Y-%m-%d"), allow_update_even_if_checks_fail=overrule_checks, dry_run=do_dry_run,reuse_ingestion_data=reuse_ingestion_data)
 }
 
 
@@ -263,15 +210,18 @@ run_smart_update = function() {
 # """"""""""""""""""""----
 
 main_function = function() {
-  CreateImportTable(dataset = osm_all, schema = "raw_data", table_name = "osm_emergency_response")  
-  create_ingestion_table()
+  if (!reuse_ingestion_data) {
+    process_fresh_data()
+    CreateImportTable(dataset = osm_all, schema = "raw_data", table_name = "osm_emergency_response")
+    create_ingestion_table()
+  }
   run_smart_update()
-  #create_transformation_table()
-  #create_fdw_views()
 }
 
 
-if(F){
+if(run_status){
   main_function()
 }
+
+
 

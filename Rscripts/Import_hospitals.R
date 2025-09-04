@@ -17,6 +17,15 @@
 # Load variables -----------------------------------------------------------
 #  """""""""""""""""" ----------------------
 
+# External IDs
+data_list_id_osm<-"bd623971-34e3-4518-a220-eb8d26d757ad"
+data_list_id_helipad<-"14d5bc60-ffb0-4565-b132-fc4bd9dd156d"
+data_list_id_emergency_entrance<-"6f0fbe5c-7731-40e7-b50b-33c4aecd16a5"
+
+legend_item_hospital <- "9018a8e4-d69b-4447-8012-760999f68f68"
+legend_item_hospital_helipad <- "8d3feb4d-be49-4760-abb9-ac0741481e25"
+legend_item_hospital_emergency <- "926d3794-da66-4708-883e-7dce4997db4b"
+
 
 #readRenviron("C:/projects/pgn-data-airflow/.Renviron")
 
@@ -45,10 +54,6 @@ reuse_ingestion_data<-ifelse(tolower(reuse_ingestion_data) == "true", TRUE, FALS
 do_dry_run<-Sys.getenv("DO_DRY_RUN")
 do_dry_run<-ifelse(tolower(do_dry_run) == "true", TRUE, FALSE)
 
-# Data list IDs
-data_list_id_osm<-"bd623971-34e3-4518-a220-eb8d26d757ad"
-data_list_id_helipad<-"14d5bc60-ffb0-4565-b132-fc4bd9dd156d"
-data_list_id_emergency_entrance<-"6f0fbe5c-7731-40e7-b50b-33c4aecd16a5"
 
 
 # Set log folder
@@ -309,6 +314,7 @@ CREATE TABLE IF NOT EXISTS ingestion.hospitals
   original_id text,    
   name jsonb,
   legend_item jsonb,
+  legend_item_id uuid,
   data_list_id uuid,
   risk_level integer,
   properties jsonb,
@@ -363,7 +369,7 @@ jsonb_strip_nulls(jsonb_build_object(
   geometry
   FROM raw_data.osm_hospitals)
 
-INSERT INTO ingestion.hospitals (original_id, name, legend_item, data_list_id, risk_level, properties, geometry, created_at)
+INSERT INTO ingestion.hospitals (original_id, name, legend_item, legend_item_id, data_list_id, risk_level, properties, geometry, created_at)
 SELECT
 osm_id as original_id,
 name,
@@ -373,6 +379,7 @@ JSONB_BUILD_OBJECT(
   'ger', 'krankenhaus',
   'eng', 'hospital'
 ) as legend_item,
+'",legend_item_hospital,"'::uuid as legend_item_id,
 '",data_list_id_osm,"'::uuid as data_list_id,
 risk_level as risk_level,
 JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
@@ -382,7 +389,7 @@ JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
   'emergency_ward_type', emergency_ward_type,
   'fps_health_recognition', fps_health_recognition,
   'fps_health_campus', fps_health_campus,
-  'healthcare speciality', healthcare_speciality,
+  'healthcare_speciality', healthcare_speciality,
   'image', image_url,
   'opening_hours', opening_hours,
   'operator', operator,
@@ -391,11 +398,12 @@ JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
   'other_names',other_names)) as properties,
 geometry,
 CURRENT_DATE as created_at
-FROM simplified;
-"))
-  
-                         
-                         
+FROM simplified;"),
+"ALTER TABLE IF EXISTS ingestion.hospitals OWNER to pgn_group_data_team_w;",
+"GRANT ALL ON TABLE ingestion.hospitals TO pgn_group_data_team_w;",
+"GRANT ALL ON TABLE ingestion.hospitals TO pgn_user_airflow;")
+
+
 ingestion_table_helipad_sql <- c("
 DROP TABLE IF EXISTS ingestion.hospital_helipads CASCADE;
 ","
@@ -405,6 +413,7 @@ CREATE TABLE IF NOT EXISTS ingestion.hospital_helipads
   original_id text,    
   name jsonb,
   legend_item jsonb,
+  legend_item_id uuid,
   data_list_id uuid,
   risk_level integer,
   properties jsonb,
@@ -449,7 +458,7 @@ WITH simplified as (
   geometry
   FROM raw_data.osm_helipad)
 
-INSERT INTO ingestion.hospital_helipads (original_id, name, legend_item, risk_level, data_list_id, properties, geometry, created_at)
+INSERT INTO ingestion.hospital_helipads (original_id, name, legend_item, legend_item_id, risk_level, data_list_id, properties, geometry, created_at)
 SELECT
 original_id,
 name,
@@ -459,6 +468,7 @@ JSONB_BUILD_OBJECT(
   'ger', 'krankenhaus hubschrauberlandeplatz',
   'eng', 'hospital helipad'
 ) as legend_item,
+'",legend_item_hospital_helipad,"'::uuid as legend_item_id,
 risk_level,
 '",data_list_id_helipad,"'::uuid as data_list_id,
 JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
@@ -479,10 +489,12 @@ JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
   )) as properties,
 geometry,
 CURRENT_DATE as created_at
-FROM simplified;"))
+FROM simplified;"),
+"ALTER TABLE IF EXISTS ingestion.hospital_helipads OWNER to pgn_group_data_team_w;",
+"GRANT ALL ON TABLE ingestion.hospital_helipads TO pgn_group_data_team_w;",
+"GRANT ALL ON TABLE ingestion.hospital_helipads TO pgn_user_airflow;")
 
-                                 
-                                 
+
 ingestion_table_emergency_sql <- c("
 DROP TABLE IF EXISTS ingestion.hospital_emergency CASCADE;
 ","
@@ -492,6 +504,7 @@ CREATE TABLE IF NOT EXISTS ingestion.hospital_emergency
   original_id text,    
   name jsonb,
   legend_item jsonb,
+  legend_item_id uuid,
   data_list_id uuid,
   risk_level integer,
   properties jsonb,
@@ -535,7 +548,7 @@ WITH simplified as (
   geometry
   FROM raw_data.osm_emergency_entrance)
 
-INSERT INTO ingestion.hospital_emergency (original_id, name, legend_item, risk_level, data_list_id, properties, geometry, created_at)
+INSERT INTO ingestion.hospital_emergency (original_id, name, legend_item, legend_item_id, risk_level, data_list_id, properties, geometry, created_at)
 SELECT
 original_id,
 name,
@@ -545,6 +558,7 @@ JSONB_BUILD_OBJECT(
   'ger', 'Notaufnahme',
   'eng', 'emergencies entrance'
 ) as legend_item,
+'",legend_item_hospital_emergency,"'::uuid as legend_item_id,
 risk_level,
 '",data_list_id_emergency_entrance,"'::uuid as data_list_id,
 JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
@@ -558,99 +572,11 @@ JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
   )) as properties,
 geometry,
 CURRENT_DATE as created_at
-FROM simplified;"))
-                                                                  
-
-                                                                  
-### Create transformation table ----
-transformation_table_hospitals_sql <- c("
-DROP TABLE IF EXISTS transformation.hospitals CASCADE;
-","
-CREATE TABLE IF NOT EXISTS transformation.hospitals
-  (
-    id uuid NOT NULL DEFAULT gen_random_uuid(),
-    original_id text,    
-    name jsonb,
-    legend_item jsonb,
-	data_list_id uuid,
-	risk_level integer,
-    properties jsonb,
-	properties_secondary jsonb,
-	imported_at timestamptz,
-	tags jsonb,
-	deleted_at timestamptz,
-	updated_at timestamptz,
-	created_at timestamptz,
-	created_by uuid,
-	updated_by uuid,
-    geometry geometry(geometry, 4326),
-    CONSTRAINT hospitals_pkey PRIMARY KEY (id)
-  );
-","
-INSERT INTO transformation.hospitals
-(id, original_id, name, legend_item, data_list_id, properties, geometry, created_at)
-SELECT id, original_id, name, legend_item, data_list_id, properties, geometry, created_at FROM ingestion.hospitals;
-")
-
-transformation_table_helipads_sql <- c("
-DROP TABLE IF EXISTS transformation.hospital_helipads CASCADE;
-","
-CREATE TABLE IF NOT EXISTS transformation.hospital_helipads
-  (
-    id uuid NOT NULL DEFAULT gen_random_uuid(),
-    original_id text,    
-    name jsonb,
-    legend_item jsonb,
-	data_list_id uuid,
-	risk_level integer,
-    properties jsonb,
-	properties_secondary jsonb,
-	imported_at timestamptz,
-	tags jsonb,
-	deleted_at timestamptz,
-	updated_at timestamptz,
-	created_at timestamptz,
-	created_by uuid,
-	updated_by uuid,
-    geometry geometry(geometry, 4326),
-    CONSTRAINT hospital_helipads_pkey PRIMARY KEY (id)
-  );
-","
-INSERT INTO transformation.hospital_helipads
-(id, original_id, name, legend_item, data_list_id, properties, geometry, created_at)
-SELECT id, original_id, name, legend_item, data_list_id, properties, geometry, created_at FROM ingestion.hospital_helipads;
-")
-
-transformation_table_emergency_sql <- c("
-DROP TABLE IF EXISTS transformation.hospital_emergency CASCADE;
-","
-CREATE TABLE IF NOT EXISTS transformation.hospital_emergency
-  (
-    id uuid NOT NULL DEFAULT gen_random_uuid(),
-    original_id text,    
-    name jsonb,
-    legend_item jsonb,
-	data_list_id uuid,
-	risk_level integer,
-    properties jsonb,
-	properties_secondary jsonb,
-	imported_at timestamptz,
-	tags jsonb,
-	deleted_at timestamptz,
-	updated_at timestamptz,
-	created_at timestamptz,
-	created_by uuid,
-	updated_by uuid,
-    geometry geometry(geometry, 4326),
-    CONSTRAINT hospital_emergency_pkey PRIMARY KEY (id)
-  );
-","
-INSERT INTO transformation.hospital_emergency
-(id, original_id, name, legend_item, data_list_id, properties, geometry, created_at)
-SELECT id, original_id, name, legend_item, data_list_id, properties, geometry, created_at FROM ingestion.hospital_emergency;
-")
-
-
+FROM simplified;"),
+"ALTER TABLE IF EXISTS ingestion.hospital_emergency OWNER to pgn_group_data_team_w;",
+"GRANT ALL ON TABLE ingestion.hospital_emergency TO pgn_group_data_team_w;",
+"GRANT ALL ON TABLE ingestion.hospital_emergency TO pgn_user_airflow;")
+ 
 
 
 # LOAD ----
@@ -662,10 +588,6 @@ SELECT id, original_id, name, legend_item, data_list_id, properties, geometry, c
 create_ingestion_table_hospitals <- function() {execute_sql_commands(ingestion_table_hospital_sql, "Hospital Ingestion table")}
 create_ingestion_table_helipads <- function() {execute_sql_commands(ingestion_table_helipad_sql, "Helipad Ingestion table")}
 create_ingestion_table_emergencies <- function() {execute_sql_commands(ingestion_table_emergency_sql, "Emergency Ingestion table")}
-create_transformation_table_hospitals <- function() {execute_sql_commands(transformation_table_hospitals_sql, "Hospital Transformation table")}
-create_transformation_table_helipads <- function() {execute_sql_commands(transformation_table_helipads_sql, "Helipad Transformation table")}
-create_transformation_table_emergencies <- function() {execute_sql_commands(transformation_table_emergency_sql, "Emergency Transformation table")}
-
 
 
 # Main function -----------------------------------------------------------
