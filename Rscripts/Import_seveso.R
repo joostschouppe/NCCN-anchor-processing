@@ -61,21 +61,21 @@ legend_item_id <- "70088593-ec60-42c0-952d-81968e3b273f"
 data_list_id <- "ccd8ec1f-d624-47dd-b24b-1df1e371c4b2"
 
 readRenviron("C:/projects/pgn-data-airflow/.Renviron")
-local_folder <- "C:/projects/proto-anchors/raw-data/seveso/"
+local_folder <- "C:/projects/pgn-data-airflow/data/seveso/be/"
 
 log_folder <- "C:/temp/logs/"
 rscript_folder <- "C:/projects/pgn-data-airflow/rscripts/"
 
 # Update every time!
-xlsx_output_filename <- "seveso_sites_08_25"
-new_table <- "seveso_08_25"
+xlsx_output_filename <- "seveso_sites_09_25"
+new_table <- "seveso_09_25"
 
 # Update if new files received
-fedlink_filename <- "seveso ACR 20250811.xlsx"
-flanders_filename <- "20250805_VlaamsGewest.xlsx"
-flanders_linkfile <- "20240704_Seveso_exploitant-vergunning.xlsx"
+fedlink_filename <- "seveso ACR 20250908.xlsx"
+flanders_filename <- "20250902_VlaamsGewest.xlsx"
+flanders_linkfile <- "20250904_Seveso_exploitant-vergunning.xlsx"
 # note: doublecheck for "Seveso status"=0
-wallonia_filename <- "wallonia_20250818.xlsx"
+wallonia_filename <- "04 - Région Wallonne_ septembre 2025.xlsx"
 brussels_filename <- "LIST_20231214_GegevensBedrijven.xlsx"
 
 
@@ -822,16 +822,16 @@ GisgovMV <- function() {
 # add link on Paragon Support
 # OR BETTER YET: do not write an excel here, but let it be done by "the generic process" to export geojson to file
 # save an Excel for Communications ----
-excel <- new_merge %>%
-  select(id,name,type,street,nr,zip,city,commune,province,region,act_all_nl,act_all_fr,act_all_de,act_all_en,date_inspection)
-excel <- as.data.frame(st_drop_geometry(excel))
+#excel <- new_merge %>%
+#  select(id,name,type,street,nr,zip,city,commune,province,region,act_all_nl,act_all_fr,act_all_de,act_all_en,date_inspection)
+#excel <- as.data.frame(st_drop_geometry(excel))
 
-write.xlsx(excel, file = paste0(local_folder,"outputs/",xlsx_output_filename,".xlsx"))
+#write.xlsx(excel, file = paste0(local_folder,"outputs/",xlsx_output_filename,".xlsx"))
 
 
 # save a CSV for the police ----
-csv <- as.data.frame(st_drop_geometry(new_merge))
-write.csv(csv, file = paste0(local_folder,"outputs/",xlsx_output_filename,".csv"), row.names = FALSE)
+#csv <- as.data.frame(st_drop_geometry(new_merge))
+#write.csv(csv, file = paste0(local_folder,"outputs/",xlsx_output_filename,".csv"), row.names = FALSE)
 
 
 

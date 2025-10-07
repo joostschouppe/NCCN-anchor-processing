@@ -92,7 +92,7 @@ process_fresh_data <- function(){
 # SOKA Loop through pages and content ------------------------------------------
 
 # function that hardcodes the page size
-## max allowed: 2000. Use either very high or very low (default=20) value
+## max allowed: 200. Use either very high or very low (default=20) value
 ## checks new page records against already known records
 ## should give a warning if the number of records retrieved is not the same as the expected number
 
