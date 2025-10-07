@@ -1358,7 +1358,8 @@ geometry = EXCLUDED.geometry;"),
   BackupTransformationsSQL <- c(
     paste0("-- create an empty table if it does not exist yet
 CREATE TABLE IF NOT EXISTS tst.backups_transformation_",pgsql_table_name," AS
-SELECT *, CURRENT_TIMESTAMP AS backup_at FROM transformation.",pgsql_table_name,"
+SELECT id, original_id,name,legend_item,data_list_id,risk_level,properties,properties_secondary,
+imported_at,tags,deleted_at,updated_at,created_at,created_by,updated_by,geometry, CURRENT_TIMESTAMP AS backup_at, legend_item_id FROM transformation.",pgsql_table_name,"
 WITH NO DATA;
 "),
     paste0("-- make a backup 
@@ -1456,7 +1457,7 @@ dbExecute(con_pg,paste0("GRANT ALL ON TABLE ",table_id_t," TO pgn_user_airflow;"
 dbDisconnect(con_pg) 
 
 
-print(paste0("Dataset to visualize the (proposed) changes available at ",paste0(log_folder,"/", filename , ".gpkg")))  
+print(paste0("Dataset to visualize the (proposed) changes available at ",paste0(filename , ".gpkg")))  
 }
 
 } else {

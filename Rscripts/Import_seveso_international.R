@@ -416,9 +416,9 @@ jsonb_build_object('address', LTRIM(CONCAT(streetname, ', ' || zip, ' ' || city)
 CURRENT_DATE as created_at,
 geometry
 FROM raw_data.seveso_international;"),
-                         "ALTER TABLE ingestion.seveso_international OWNER to pgn_group_data_team_w;",
-                         "GRANT ALL ON TABLE ingestion.seveso_international TO pgn_group_data_team_w;",
-                         "GRANT ALL ON TABLE ingestion.seveso_international TO pgn_user_airflow;")
+"ALTER TABLE ingestion.seveso_international OWNER to pgn_group_data_team_w;",
+"GRANT ALL ON TABLE ingestion.seveso_international TO pgn_group_data_team_w;",
+"GRANT ALL ON TABLE ingestion.seveso_international TO pgn_user_airflow;")
 
 
 ### Execute the SQL commands ----
