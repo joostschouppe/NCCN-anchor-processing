@@ -137,15 +137,10 @@ datatypes <- c("points", "mpolygon")
 
 ### Actual OSM download & transformation for embassy and EU ----
 
-tryCatch({
-  # Call the large function
-  osm_all<-download_osm_process(features_list, datatypes, extra_columns, postgres=TRUE)
-  print("OSM data downloaded & processes succesfully")
-}, error = function(e) {
-  # Print error message
-  print(paste("Something went wrong:", e$message))
-})
-
+osm_all <- run_process(
+  download_osm_process(features_list, datatypes, extra_columns, postgres=TRUE),
+  paste0("OSM download & processing for ", paste(paste(names(features_list), unlist(features_list), sep = "="), collapse = ", "), collapse = ", ")
+)
 
 # remove flagpoles
 osm_all <- osm_all %>% filter(man_made != "flagpole" | is.na(man_made) )
@@ -200,15 +195,10 @@ datatypes <- c("points", "mpolygon")
 
 ### Actual OSM download & transformation for embassy and EU ----
 
-tryCatch({
-  # Call the large function
-  osm_nato<-download_osm_process(features_list, datatypes, extra_columns, postgres=TRUE)
-  print("OSM data downloaded & processes succesfully")
-}, error = function(e) {
-  # Print error message
-  print(paste("Something went wrong:", e$message))
-})
-
+osm_nato <<- run_process(
+  download_osm_process(features_list, datatypes, extra_columns, postgres=TRUE),
+  paste0("OSM download & processing for ", paste(paste(names(features_list), unlist(features_list), sep = "="), collapse = ", "), collapse = ", ")
+)
 
 # remove parking
 osm_nato <- osm_nato %>% filter(amenity != "parking" | is.na(amenity) )

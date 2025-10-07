@@ -139,16 +139,10 @@ process_fresh_data <- function(){
     
     
     ### Actual OSM download & transformation ----
-    
-    
-    tryCatch({
-      # Call the large function
-      osm_all<<-download_osm_process(features_list, datatypes, extra_columns, postgres=TRUE, keep_region=TRUE)
-      print("OSM data downloaded & processes succesfully")
-    }, error = function(e) {
-      # Print error message
-      print(paste("Something went wrong:", e$message))
-    })
+	osm_all <<- run_process(
+		download_osm_process(features_list, datatypes, extra_columns, keep_region=TRUE, postgres=TRUE),
+		paste0("OSM download & processing for ", paste(paste(names(features_list), unlist(features_list), sep = "="), collapse = ", "), collapse = ", ")
+	)
     
     
     # Test the quality: if it is in Belgium, it should have an operator_type, and if it is emergency_zone it should have an operator_wikidata tag
@@ -161,9 +155,10 @@ process_fresh_data <- function(){
     
     # if osm_all_problems has records, save them to log as geojson
     if (nrow(osm_all_problems)>0){
-      filename_visualization<-paste0(log_folder,"fire_station_problems", format(Sys.time(), "%Y%m%d_%H%M%S"), ".geojson")
+      filename_visualization<-file.path(log_folder, paste0("fire_station_problems", format(Sys.time(), "%Y%m%d_%H%M%S"), ".geojson"))
       st_write(osm_all_problems, filename_visualization, driver = "GeoJSON")
       print(paste0("OSM data issues need to be fixed first, check them at ", filename_visualization))
+      print(paste0("Affected OSM ids:",osm_all_problems$osm_id))
     } else {
       print("OSM data quality check passed")
     }

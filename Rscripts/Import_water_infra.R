@@ -92,33 +92,20 @@ datatypes_dam <- c("lines", "mpolygon")
 
 ### Actual OSM download & transformation ----
 
+osm_lock <- run_process(
+  download_osm_process(features_lock, datatypes_lock, extra_columns, postgres=TRUE),
+  paste0("OSM download & processing for ", paste(paste(names(features_lock), unlist(features_lock), sep = "="), collapse = ", "), collapse = ", ")
+)
 
+osm_boatlift <- run_process(
+  download_osm_process(features_boatlift, datatypes_boatlift, extra_columns, postgres=TRUE),
+  paste0("OSM download & processing for ", paste(paste(names(features_boatlift), unlist(features_boatlift), sep = "="), collapse = ", "), collapse = ", ")
+)
 
-tryCatch({
-  # Call the OSM function
-  osm_lock<-download_osm_process(features_lock, datatypes_lock, extra_columns, postgres=TRUE)
-  print("OSM data downloaded & processes succesfully")
-}, error = function(e) {
-  # Print error message
-  print(paste("Something went wrong:", e$message))
-})
-tryCatch({
-  # Call the OSM function
-  osm_boatlift<-download_osm_process(features_boatlift, datatypes_boatlift, extra_columns, postgres=TRUE)
-  print("OSM data downloaded & processes succesfully")
-}, error = function(e) {
-  # Print error message
-  print(paste("Something went wrong:", e$message))
-})
-tryCatch({
-  # Call the OSM function
-  osm_dam<-download_osm_process(features_dam, datatypes_dam, extra_columns, postgres=TRUE)
-  print("OSM data downloaded & processes succesfully")
-}, error = function(e) {
-  # Print error message
-  print(paste("Something went wrong:", e$message))
-})
-
+osm_dam <- run_process(
+  download_osm_process(features_dam, datatypes_dam, extra_columns, postgres=TRUE),
+  paste0("OSM download & processing for ", paste(paste(names(features_dam), unlist(features_dam), sep = "="), collapse = ", "), collapse = ", ")
+)
 
 
 #LOCK:only if line & NOT also boat-lift

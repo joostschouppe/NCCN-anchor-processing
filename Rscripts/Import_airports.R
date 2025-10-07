@@ -100,26 +100,18 @@ datatypes <- c("points", "mpolygon")
 ### Actual OSM download & transformation ----
 
 # download international airports
-tryCatch({
-  # Call the large function
-  osm_international<-download_osm_process(features_international, datatypes, extra_columns, postgres=TRUE)
-  print("OSM data downloaded & processed succesfully")
-}, error = function(e) {
-  # Print error message
-  print(paste("Something went wrong:", e$message))
-})
+osm_all <- run_process(
+  download_osm_process(features_international, datatypes, extra_columns, postgres=TRUE),
+  paste0("OSM download & processing for ", paste(paste(names(features_international), unlist(features_international), sep = "="), collapse = ", "), collapse = ", ")
+)
 
 osm_international <- osm_international %>% mutate(object_type = "international airport")
 
 # download military airports
-tryCatch({
-  # Call the large function
-  osm_military<-download_osm_process(features_military, datatypes, extra_columns, postgres=TRUE)
-  print("OSM data downloaded & processed succesfully")
-}, error = function(e) {
-  # Print error message
-  print(paste("Something went wrong:", e$message))
-})
+osm_military <- run_process(
+  download_osm_process(features_military, datatypes, extra_columns, postgres=TRUE),
+  paste0("OSM download & processing for ", paste(paste(names(features_military), unlist(features_military), sep = "="), collapse = ", "), collapse = ", ")
+)
 
 osm_military <- osm_military %>% mutate(object_type = "military airbase")
 

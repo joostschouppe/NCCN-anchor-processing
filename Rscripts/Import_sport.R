@@ -95,8 +95,10 @@ features_list_pp <- list(
   "leisure" = "sports_hall", 
   "leisure" = "pitch",
   "leisure" = "swimming_pool",
+  "leisure" = "swimming_area",
   "building" = "sports_centre",
   "building" = "sports_hall")
+
 
 features_list_plp <- list("leisure" = "track")
 
@@ -109,23 +111,16 @@ datatypes_lines_too <- c("points", "lines", "mpolygon")
 
 ### Actual OSM download & transformation ----
 
-tryCatch({
-  # Call the large function
-  osm_pp<-download_osm_process(features_list_pp, datatypes, extra_columns, postgres=TRUE, keep_region=TRUE )
-  print("OSM data downloaded & processes succesfully")
-}, error = function(e) {
-  # Print error message
-  print(paste("Something went wrong:", e$message))
-})
+osm_pp <- run_process(
+  download_osm_process(features_list_pp, datatypes, extra_columns, postgres=TRUE, keep_region=TRUE),
+  paste0("OSM download & processing for ", paste(names(features_list_pp), collapse = ", "))
+)
 
-tryCatch({
-  # Call the large function
-  osm_plp<-download_osm_process(features_list_plp, datatypes_lines_too, extra_columns, postgres=TRUE, keep_region=TRUE, feature_tag_list=TRUE)
-  print("OSM data downloaded & processes succesfully")
-}, error = function(e) {
-  # Print error message
-  print(paste("Something went wrong:", e$message))
-})
+osm_plp <- run_process(
+  download_osm_process(features_list_plp, datatypes, extra_columns, postgres=TRUE, keep_region=TRUE),
+  paste0("OSM download & processing for ", paste(names(features_list_plp), collapse = ", "))
+)
+
 
 # we can consider throwing away all objects with a private tag, however often they do seem to be relevant features
 
@@ -149,7 +144,7 @@ osm_all <- osm_all %>%
 # add object type
 osm_all<-osm_all %>%
   mutate(object_type=case_when(
-    leisure=='swimming_pool' | sport=='swimming' ~ 'swimming_pool',
+    leisure=='swimming_pool' | sport=='swimming' | leisure=='swimming_area' ~ 'swimming_pool',
     leisure=='sports_centre' | leisure=='sports_hall'  ~ 'sports_centre',
     leisure=='ice_rink' | landuse=='winter_sports'  ~ 'winter_sports',
     leisure=='horse_riding'  ~ 'horse_riding',
