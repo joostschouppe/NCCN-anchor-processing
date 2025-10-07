@@ -291,7 +291,7 @@ get_azure_access_token()
 #bbox <- c(2.15,49.15,7.07,51.8) #(or simply paste bbox=c(2.15,49.15,7.07,51.8) when you call the function )
 #bbox <- c(1.32,48.77,10.55,54.42)
 # Optionally, keep the language of the area as a columns (default set to FALSE)
-keep_region <- TRUE
+#keep_region <- TRUE
 # required if you want to use the feature_tag_list
 ## feature_tag_list<-TRUE
 # optional key to use the postgres database
@@ -547,15 +547,16 @@ download_osm_process <- function(
     ## Function to extract multiple key-value pairs from tags into new columns
     add_columns <- function(data, keys) {
       for (key in keys) {
-        # Create the regex pattern for the current key
-        pattern <- paste0("\"", key, "\"=>\"([^\"]+)\"")
+        # Match the key and capture everything up to the next unescaped quote
+        pattern <- paste0("\"", key, "\"=>\"(.*?)\"(?=,|$)")
         
-        # Check if the column does not already exist
         if (!key %in% names(data)) {
           data <- data %>%
-            mutate(!!sym(key) := str_extract(tags, pattern) %>%
-                     str_replace(paste0("\"", key, "\"=>\""), "") %>%
-                     str_replace("\"", ""))
+            mutate(!!sym(key) := {
+              extracted <- str_match(tags, pattern)[, 2]
+              # Unescape any escaped quotes
+              str_replace_all(extracted, "\\\\\"", "\"")
+            })
         }
       }
       return(data)
@@ -858,9 +859,13 @@ ELSE 'und' END as language, nameger, namefre, namedut, ST_AsText(shape) as geome
   ngi_muni$geometry <- st_set_crs(ngi_muni$geometry, 4326)
   ngi_muni_cleaned<<-ngi_muni
   }
-  
-  # spatial join to osm data
-  osm_all <- st_join(osm_all, ngi_muni, join = st_within)
+ 
+  # spatial join to osm data (the "first" object it touches, so objects on a border get a random value assigned)
+  osm_all <- osm_all %>%
+    st_join(ngi_muni, join = st_intersects) %>% 
+    group_by(osm_id) %>%
+    slice(1) %>%
+    ungroup()
   
   # localise names where possible; add city to the address where missing
   osm_all <- osm_all %>%
@@ -883,3 +888,404 @@ ELSE 'und' END as language, nameger, namefre, namedut, ST_AsText(shape) as geome
 }
 
 
+# Run a process with stop or success message ----
+
+run_process <- function(expr, process_name) {
+  tryCatch(
+    {
+      result <- expr
+      message(paste("Process", process_name, "ran successfully"))
+      return(result)
+    },
+    error = function(e) {
+      stop(paste("Error in process", process_name, ":", e$message))
+    }
+  )
+}
+
+
+# Join a dataset interesting because of its attributes to a dataset interesting for its geometry, based on distance, name and address notation ----
+
+merge_to_external_polygons <- function(
+    attribute_features, # name of the dataset with the interesting attributes
+    geom_features, # name of the dataset with the interesting geometries
+    attr_id_col, # name of the unique identifier in the attribute dataset
+    geom_id_col, # name of the unique identifier in the geometry dataset 
+    attr_name_col, # name of the name field (attr)
+    geom_name_col, # name of the name field (geom)
+    attr_street_col, # name of the streetname column (attr)
+    attr_hnr_col, # name of the house number column (attr)
+    geom_street_col,# name of the streetname column (geom)
+    geom_hnr_col, # name of the house number column (geom)
+    distance_matched_threshold = 50, # distance where we consider something "quite closeby"
+    distance_raw_threshold = 250, # remotest distance where we want to look for possible candidates
+    patterns_to_remove # a list of strings that should be removed from the name, because they are meaningless in the context (e.g. the word "school" should not help make a match better if the dataset is about schools and lots of records include that word in the name
+) {
+  
+  start_time <- Sys.time()
+  
+  attr_df_name<-deparse(substitute(attribute_features))
+  geom_df_name<-deparse(substitute(geom_features))
+  
+  print(paste0("Merging the records in ",attr_df_name," to the objects in ",geom_df_name," based on distance, name similarity and address notation similarity"))
+  
+  # stop if not both datasets are in 31370
+  if (st_crs(attribute_features)$epsg != 31370) {
+    stop("Geometry of the features providing attributes should be in EPSG:31370")
+  }
+  if (st_crs(geom_features)$epsg != 31370) {
+    stop("Geometry of the features providing a geometry should be in EPSG:31370")
+  }
+  
+  clean_string <- function(x) {
+    # Remove all characters except numbers, letters, hyphens, and semicolons
+    gsub("[^0-9a-zA-Z;-]", "", x)
+  }
+  
+  
+  # Prepare attribute_features
+  attr_features <- attribute_features %>%
+    mutate(
+      attr_id = .data[[attr_id_col]],
+      name_attr = .data[[attr_name_col]],
+      street_attr = .data[[attr_street_col]],
+      hnr_attr = .data[[attr_hnr_col]]
+    )
+  
+  # Prepare geom_features
+  geom_features <- geom_features %>%
+    mutate(
+      geom_id = .data[[geom_id_col]],
+      name_geom = .data[[geom_name_col]],
+      street_geom = .data[[geom_street_col]],
+      hnr_geom = .data[[geom_hnr_col]]
+    )
+  
+  # create attr_features as sf with the original geometry
+  st_geometry(attr_features) <- "off_geometry"
+  st_geometry(geom_features) <- "geometry"
+  
+  # limit attributes to just the needed things
+  attr_features <- attr_features %>%
+    select(attr_id, name_attr, street_attr, hnr_attr)
+  
+  # limit geom to just needed things
+  geom_features <- geom_features %>%
+    select(geom_id, name_geom, street_geom, hnr_geom)
+  
+  
+  
+  # join nearby objects from both datasets
+  join <- st_join(attr_features, geom_features, join = st_is_within_distance, dist = distance_raw_threshold)
+  join <- as.data.frame(join)
+  
+  # add the geometry from the osm objects
+  geom_features_geo<-geom_features %>% select(geom_id, geometry)
+  geom_features_geo<-as.data.frame(geom_features_geo)
+  join <- left_join(join, geom_features_geo, by = "geom_id")
+  
+  # Calculate distance between potential matches
+  #join$distance <- mapply(calculate_distance, join$geometry, join$off_geometry)
+  # we use euclidian distance, as our default Hausdorf distance isn't great for point vs polygon comparisons (de facto it gives the furthest point from the nearby polygons)
+  join$distance <- mapply(calculate_eucl_distance, join$geometry, join$off_geometry)
+  
+  
+  # status message
+  join_time<-Sys.time()
+  joining_time <- round(as.numeric(difftime(join_time, start_time, units = "secs")), 2)
+  print(paste0("Joined attr_features data to OSM (took ",joining_time," seconds), now preparing choosing which links to keep"))
+  
+  
+  # keep only the records with a link to an OSM geometry
+  join <- join %>% filter(!is.na(geom_id))
+  
+  # acceptance elements:
+  ### 1. name similarity ----
+  
+  #set names to lowercase
+  join$name_attr<-tolower(join$name_attr)
+  join$name_geom<-tolower(join$name_geom)
+  
+  # remove accents
+  join <- join %>%
+    mutate(
+      name_attr=stri_trans_general(name_attr, "Latin-ASCII"),
+      name_geom=stri_trans_general(name_geom, "Latin-ASCII")
+    )
+  
+  # check for identical names
+  join <- join %>%
+    mutate(
+      same_name = ifelse(name_attr==name_geom, 1, 0)
+    )
+  
+  
+  
+  # apply to these columns:
+  columns_to_clean <- c("name_geom", "name_attr")
+  
+  # default removals
+  default_patterns_to_remove <- c("\"", "”", "“", "´")
+  join <- string_removal(join, columns_to_clean, default_patterns_to_remove)
+  # string_removal is a function defined in utils.R
+  
+  # remove words specific to the context
+  
+  join <- string_removal(join, columns_to_clean, patterns_to_remove)
+  
+  
+  # remove leading and trailing whitespaces
+  join <- join %>%
+    mutate(
+      name_attr = trimws(name_attr),
+      name_geom = trimws(name_geom)
+    )
+  
+  # find the longest common substring
+  join <- join %>%
+    rowwise() %>%
+    mutate(lcs=LCSn(c(tolower(name_attr), tolower(name_geom)))) %>%
+    mutate(longest_common_str_length=nchar(lcs))
+  
+  # shorten name before calculating length
+  join$length_name<-nchar(join$name_attr)
+  
+  
+  
+  
+  
+  # Decide when we consider the names to be the same (length should de significant)
+  join <- join %>%
+    mutate(
+      same_name = ifelse(
+        ((longest_common_str_length > 10 | (longest_common_str_length > 4 & longest_common_str_length <= 10 & longest_common_str_length > length_name / 2)) |        name_attr==name_geom | same_name==1),
+        1,
+        0
+      )
+    )
+  
+  
+  join <- join %>%
+    select(-lcs, -longest_common_str_length, -length_name)
+  
+  
+  ### 2. street similarity ----
+  
+  # set hnr as missing if identical to street name
+  join <- join %>%
+    mutate(hnr_geom = ifelse(hnr_geom == street_geom, NA, hnr_geom))
+  
+  
+  # SIMPLIFY STREET NAMES
+  
+  # remove accents
+  join <- join %>%
+    mutate(
+      street_geom = tolower(stri_trans_general(street_geom, "Latin-ASCII")),
+      street_attr = tolower(stri_trans_general(street_attr, "Latin-ASCII"))
+    )
+  
+  
+  
+  # deal with common abbreviations; remove usual additions to only compare the core of the street name
+  replacements <- c(
+    "rue de ", "",
+    "rue des ", "",
+    "rue du ", "",
+    "rue", "",
+    "st\\.", "sint",
+    "^\\b(st)\\b(?=\\s|\\.)", "sint",
+    "^\\b(bd)\\b(?=\\s|\\.)", "boulevard",
+    "straat", "",
+    "boulevard", "",
+    "avenue", "",
+    "-", " ",
+    "straße", "",
+    "strasse", "",
+    "laan", "",
+    "\\s+$", "",
+    "^\\s+", ""
+  )
+  # Define the columns to clean
+  columns_to_clean <- c("street_geom", "street_attr")
+  join <- string_replacement(join, columns_to_clean, replacements)
+  # string_replacement is a function defined in utils.R
+  
+  # remove leading and trailing whitespaces
+  join <- join %>%
+    mutate(
+      street_geom = trimws(street_geom),
+      street_attr = trimws(street_attr)
+    )
+  
+  
+  # if result is empty string, replace with NA
+  join <- join %>%
+    mutate(
+      street_geom = ifelse(street_geom == "", NA, street_geom),
+      street_attr = ifelse(street_attr == "", NA, street_attr)
+    )
+  # END SIMPLIFY STREET NAMES
+  
+  # make sure the result is still text
+  join$street_geom <- as.character(join$street_geom)
+  join$street_attr <- as.character(join$street_attr)
+  
+  
+  # calculate string distance between streets in both datasets
+  join <- join %>%
+    mutate(streetsim = stringsim(street_geom,street_attr))
+  
+  # check if the street on one side is a substring of street on the other side
+  join <- join %>%
+    mutate(
+      condition = nchar(street_geom) > 3 & nchar(street_attr) > 3,
+      substring_left_check = ifelse(condition, str_detect(street_attr, street_geom), FALSE),
+      substring_right_check = ifelse(condition, str_detect(street_geom, street_attr), FALSE),
+      streetsim = ifelse((substring_left_check | substring_right_check) & streetsim<0.9, 0.9, streetsim)
+    ) %>%
+    select(-condition, -substring_right_check, -substring_left_check)
+  
+  join <- join %>%
+    mutate(
+      hnr_geom = clean_string(hnr_geom),
+      hnr_attr = clean_string(hnr_attr)
+    )
+  # make sure the housenumber is text
+  join$hnr_geom <- as.character(join$hnr_geom)
+  join$hnr_attr <- as.character(join$hnr_attr)
+  
+  join <- join %>%
+    mutate(hnr_sim = stringsim(as.character(hnr_geom), as.character(hnr_attr)))
+  
+  
+  # check if the housenumber on one side is a substring of housenumber on the other side, if the number is at least two digits
+  join <- join %>%
+    mutate(
+      condition = nchar(as.character(hnr_attr)) > 1 & nchar(as.character(hnr_geom)) > 1,
+      substring_left_check = ifelse(condition, str_detect(as.character(hnr_attr), as.character(hnr_geom)), FALSE),
+      substring_right_check = ifelse(condition, str_detect(as.character(hnr_geom), as.character(hnr_attr)), FALSE),
+      hnr_sim = ifelse((substring_left_check | substring_right_check) & hnr_sim<0.9 , 0.9, hnr_sim)
+    ) %>%
+    select(-condition, -substring_right_check, -substring_left_check)
+  
+  join <- join %>%
+    mutate(
+      hnr_sim = if_else(
+        !is.na(as.numeric(hnr_geom)) & !is.na(as.numeric(hnr_attr)),
+        ifelse(abs(as.numeric(hnr_geom) - as.numeric(hnr_attr)) < 10 & hnr_sim<0.9, 0.9, hnr_sim),
+        hnr_sim
+      )
+    )
+  
+  
+  
+  ## end street similarity
+  
+  
+  
+  ## combine choice elements
+  
+  # calculate address certainty
+  join<- join %>%
+    mutate(address_certainty = case_when(
+      streetsim == 1 & hnr_sim == 1 ~ 1,
+      streetsim == 1 & is.na(hnr_sim) ~ 0.95,
+      streetsim >= 0.9 & hnr_sim >= 0.9 ~ 0.93,
+      streetsim >= 0.9 & is.na(hnr_sim) ~ 0.92,
+      streetsim >= 0.9 & hnr_sim < 0.9 ~ 0.85,
+      TRUE ~ 0
+    ))
+  
+  # status message
+  choice_prep_time<-Sys.time()
+  choice_prepping_time <- round(as.numeric(difftime(choice_prep_time, join_time, units = "secs")), 2)
+  print(paste0("Prepared for choosing which links to keep (took ",choice_prepping_time," seconds), now making choices"))
+  
+  
+  
+  ### Make choices ----
+  # SELECT only if certain quality thresholds met
+  join <- join %>%
+    filter(distance < distance_matched_threshold | address_certainty >= 0.85 | same_name ==1)
+  
+  # order by distance
+  join <- join %>%
+    group_by(attr_id) %>% 
+    arrange(distance) %>%
+    mutate(distance_id = row_number()) %>%
+    ungroup()
+  
+  # order by address certainty
+  join <- join %>%
+    group_by(attr_id) %>% 
+    arrange(desc(address_certainty)) %>%
+    mutate(address_certainty_id = row_number()) %>%  
+    ungroup()
+  
+  # create scoring variable:
+  # the closest object gets 1 point if it is within threshold, 0.75 if it is within 2x treshold. Further objects get 0.65 points if they are within the raw distance threshold
+  # the best address gets 0.75 points, other addresses with a decent score get 0.5 points
+  # if the names are the same, the object gets 1 point
+  join <- join %>%
+    mutate(same_name=ifelse(is.na(same_name), 0, same_name)) %>%
+    mutate(
+      score = 
+        ifelse(distance_id == 1 & distance < distance_matched_threshold, 1, 0) +
+        ifelse(distance_id == 1 & distance > distance_matched_threshold & distance < 2*distance_matched_threshold, 0.75, 0) +
+        ifelse(distance_id >1 & distance < distance_matched_threshold, 0.65, 0) +
+        ifelse(address_certainty>0 & address_certainty_id == 1, 0.75, 0) + ifelse(address_certainty>0 & address_certainty_id > 1, 0.5, 0) +
+        ifelse(same_name == 1, 1, 0)
+    )
+  
+  
+  
+  # keep only the cases where the score equals the max score for the ogc_fid
+  join <- join %>%
+    group_by(attr_id) %>% 
+    filter(score == max(score)) %>%
+    ungroup()
+  
+  # if there's still more than one, keep the one with the closest distance (prepare filter)
+  join <- join %>%
+    group_by(attr_id) %>% 
+    arrange(distance) %>%
+    mutate(
+      count=n(),
+      distance_id = row_number()
+    ) %>%
+    ungroup()
+  # filter
+  join <- join %>%
+    filter(count == 1 | (count>1 & distance_id == 1))
+  
+  
+  # Minimum threshold to keep a link: if score<1.75 & distance > threshold, delete the row
+  join <- join %>%
+    filter(score >= 1.75 | distance < distance_matched_threshold)
+  
+  
+  # simplify data
+  join_simplified <- join %>%
+    select(attr_id, geom_id) %>%
+    distinct()
+  
+  # status message
+  choice_time<-Sys.time()
+  choosing_time <- round(as.numeric(difftime(choice_time, choice_prep_time, units = "secs")), 2)
+  print(paste0("Choices made (took ",choosing_time," seconds), now summarizing data"))
+  
+  # enrich original data
+  print("Adding the geom IDs to the attribute dataset. Don't forget to add geometries, attributes and summarize, as well as potentially adding the unused records from the geometry dataset later")
+  attr_features <- left_join(attribute_features, join_simplified, by = setNames("attr_id", attr_id_col))
+  
+  # count number of succesful matches
+  print(paste0("From the ",nrow(attr_features)," records in ",attr_df_name," a total of ",sum(!is.na(attr_features$geom_id))," were matched to a record of the ",geom_df_name," dataset"))
+
+  # rename the added column back to its original value
+  attr_features <- attr_features %>%
+    rename(!!geom_id_col := geom_id)
+  
+  return(attr_features)
+  
+}
