@@ -98,60 +98,36 @@ datatypes <- c("points", "mpolygon")
 
 ### Actual OSM download & transformation ----
 
-tryCatch({
-  # Call the large function
-  osm_1<-download_osm_process(features_list_1, datatypes, extra_columns, postgres=TRUE, keep_region=TRUE )
-  print("OSM data downloaded & processes succesfully")
-}, error = function(e) {
-  # Print error message
-  print(paste("Something went wrong:", e$message))
-})
+osm_1 <- run_process(
+  download_osm_process(features_list_1, datatypes, extra_columns, keep_region=TRUE, postgres=TRUE),
+  paste0("OSM download & processing for ", paste(paste(names(features_list_1), unlist(features_list_1), sep = "="), collapse = ", "), collapse = ", ")
+)
 
-tryCatch({
-  # Call the large function
-  osm_2<-download_osm_process(features_list_2, datatypes, extra_columns, postgres=TRUE, keep_region=TRUE)
-  print("OSM data downloaded & processes succesfully")
-}, error = function(e) {
-  # Print error message
-  print(paste("Something went wrong:", e$message))
-})
+osm_2 <- run_process(
+  download_osm_process(features_list_2, datatypes, extra_columns, keep_region=TRUE, postgres=TRUE),
+  paste0("OSM download & processing for ", paste(paste(names(features_list_2), unlist(features_list_2), sep = "="), collapse = ", "), collapse = ", ")
+)
 
-tryCatch({
-  # Call the large function
-  osm_3<-download_osm_process(features_list_3, datatypes, extra_columns, postgres=TRUE, keep_region=TRUE)
-  print("OSM data downloaded & processes succesfully")
-}, error = function(e) {
-  # Print error message
-  print(paste("Something went wrong:", e$message))
-})
+osm_3 <- run_process(
+  download_osm_process(features_list_3, datatypes, extra_columns, keep_region=TRUE, postgres=TRUE),
+  paste0("OSM download & processing for ", paste(paste(names(features_list_3), unlist(features_list_3), sep = "="), collapse = ", "), collapse = ", ")
+)
 
+osm_4 <- run_process(
+  download_osm_process(features_list_4, datatypes, extra_columns, keep_region=TRUE, postgres=TRUE),
+  paste0("OSM download & processing for ", paste(paste(names(features_list_4), unlist(features_list_4), sep = "="), collapse = ", "), collapse = ", ")
+)
 
-tryCatch({
-  # Call the large function
-  osm_4<-download_osm_process(features_list_4, datatypes, extra_columns, postgres=TRUE, keep_region=TRUE)
-  print("OSM data downloaded & processes succesfully")
-}, error = function(e) {
-  # Print error message
-  print(paste("Something went wrong:", e$message))
-})
+osm_5 <- run_process(
+  download_osm_process(features_list_5, datatypes, extra_columns, keep_region=TRUE, postgres=TRUE),
+  paste0("OSM download & processing for ", paste(paste(names(features_list_5), unlist(features_list_5), sep = "="), collapse = ", "), collapse = ", ")
+)
 
-tryCatch({
-  # Call the large function
-  osm_5<-download_osm_process(features_list_5, datatypes, extra_columns, postgres=TRUE, keep_region=TRUE)
-  print("OSM data downloaded & processes succesfully")
-}, error = function(e) {
-  # Print error message
-  print(paste("Something went wrong:", e$message))
-})
+osm_6 <- run_process(
+  download_osm_process(features_list_6, datatypes, extra_columns, keep_region=TRUE, postgres=TRUE),
+  paste0("OSM download & processing for ", paste(paste(names(features_list_6), unlist(features_list_6), sep = "="), collapse = ", "), collapse = ", ")
+)
 
-tryCatch({
-  # Call the large function
-  osm_6<-download_osm_process(features_list_6, datatypes, extra_columns, postgres=TRUE, keep_region=TRUE)
-  print("OSM data downloaded & processes succesfully")
-}, error = function(e) {
-  # Print error message
-  print(paste("Something went wrong:", e$message))
-})
 
 
 # from osm_1, throw away if theatre_type=open_air

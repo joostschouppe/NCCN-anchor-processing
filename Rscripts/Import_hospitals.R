@@ -100,14 +100,10 @@ datatypes <- c("points", "mpolygon")
 
 ### Actual OSM download & transformation ----
 
-tryCatch({
-  # Call the large function
-  osm_all<-download_osm_process(features_list, datatypes, extra_columns, keep_region=TRUE, postgres=TRUE)
-  print("OSM data downloaded & processes succesfully")
-}, error = function(e) {
-  # Print error message
-  print(paste("Something went wrong:", e$message))
-})
+osm_all <- run_process(
+  download_osm_process(features_list, datatypes, extra_columns, keep_region=TRUE, postgres=TRUE),
+  paste0("OSM download & processing for ", paste(paste(names(features_list), unlist(features_list), sep = "="), collapse = ", "), collapse = ", ")
+)
 
 # remove objects that do NOT actually have a hospital tag (this is an artifact from the site relation)
 osm_all <- osm_all %>%
@@ -163,14 +159,11 @@ datatypes <- c("points", "mpolygon")
 
 ### Actual OSM download & transformation ----
 
-tryCatch({
-  # Call the large function
-  osm_helipad<-download_osm_process(features_list, datatypes, extra_columns, keep_region=TRUE, postgres=TRUE)
-  print("OSM data downloaded & processes succesfully")
-}, error = function(e) {
-  # Print error message
-  print(paste("Something went wrong:", e$message))
-})
+
+osm_helipad <- run_process(
+  download_osm_process(features_list, datatypes, extra_columns, keep_region=TRUE, postgres=TRUE),
+  paste0("OSM download & processing for ", paste(paste(names(features_list), unlist(features_list), sep = "="), collapse = ", "), collapse = ", ")
+)
 
 # remove non-helipad objects
 osm_helipad <- osm_helipad %>%
@@ -214,15 +207,10 @@ if (nrow(osm_heliport_bbox) > 1) {
 
 ## download any helipad within the bbox
 ### do NOT set postgres to TRUE, becuase we're using a very small BBOX here - and that gets overruled by utils.R for now
-features_list <-list("aeroway"="helipad")
-tryCatch({
-  # Call the large function
-  osm_helipad_within<-download_osm_process(features_list, datatypes, extra_columns, bbox=bbox_numeric, keep_region=TRUE, postgres=FALSE)
-  print("OSM data downloaded & processes succesfully")
-}, error = function(e) {
-  # Print error message
-  print(paste("Something went wrong:", e$message))
-})
+osm_helipad_within <- run_process(
+  download_osm_process(features_list, datatypes, extra_columns, bbox=bbox_numeric, keep_region=TRUE, postgres=FALSE),
+  paste0("OSM download & processing for ", paste(paste(names(features_list), unlist(features_list), sep = "="), collapse = ", "), collapse = ", ")
+)
 
 if (nrow(osm_helipad_within) > 1) {
   stop("More than one row in osm_helipad_within - please adapt script to deal with this")
@@ -257,16 +245,10 @@ extra_columns <- c("emergency_ward_entrance")
 datatypes <- c("points")
 
 ### Actual OSM download & transformation ----
-
-tryCatch({
-  # Call the large function
-  osm_emergency_entrance<-download_osm_process(features_list, datatypes, extra_columns, keep_region=TRUE, postgres=TRUE)
-  print("OSM data downloaded & processes succesfully")
-}, error = function(e) {
-  # Print error message
-  print(paste("Something went wrong:", e$message))
-})
-
+osm_emergency_entrance <- run_process(
+  download_osm_process(features_list, datatypes, extra_columns, keep_region=TRUE, postgres=TRUE),
+  paste0("OSM download & processing for ", paste(paste(names(features_list), unlist(features_list), sep = "="), collapse = ", "), collapse = ", ")
+)
 
 # Select core hospital data (multipolygon only)
 hospitals <- osm_all %>%

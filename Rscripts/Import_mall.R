@@ -88,24 +88,15 @@ datatypes <- c("points", "mpolygon")
 
 ### Actual OSM download & transformation ----
 
+osm_mall <- run_process(
+  download_osm_process(features_list_1, datatypes, extra_columns, postgres=TRUE),
+  paste0("OSM download & processing for ", paste(paste(names(features_list_1), unlist(features_list_1), sep = "="), collapse = ", "), collapse = ", ")
+)
 
-tryCatch({
-  # Call the large function
-  osm_mall<-download_osm_process(features_list_1, datatypes, extra_columns, postgres=TRUE)
-  print("OSM data downloaded & processes succesfully")
-}, error = function(e) {
-  # Print error message
-  print(paste("Something went wrong:", e$message))
-})
-
-tryCatch({
-  # Call the large function
-  osm_dept<-download_osm_process(features_list_2, datatypes, extra_columns, postgres=TRUE)
-  print("OSM data downloaded & processes succesfully")
-}, error = function(e) {
-  # Print error message
-  print(paste("Something went wrong:", e$message))
-})
+osm_dept <- run_process(
+  download_osm_process(features_list_2, datatypes, extra_columns, postgres=TRUE),
+  paste0("OSM download & processing for ", paste(paste(names(features_list_2), unlist(features_list_2), sep = "="), collapse = ", "), collapse = ", ")
+)
 
 # remove if no name and remove artefacts from download
 osm_dept<-osm_dept %>%

@@ -90,15 +90,10 @@ process_fresh_data <- function(){
     
     ### Actual OSM download & transformation ----
     
-    tryCatch({
-      # Call the large function
-      osm_all<-download_osm_process(features_list, datatypes, extra_columns, postgres=TRUE)
-      print("OSM data downloaded & processes succesfully")
-    }, error = function(e) {
-      # Print error message
-      print(paste("Something went wrong:", e$message))
-    })
-    
+    osm_all <- run_process(
+    download_osm_process(features_list, datatypes, extra_columns, postgres=TRUE),
+    paste0("OSM download & processing for ", paste(paste(names(features_list), unlist(features_list), sep = "="), collapse = ", "), collapse = ", ")
+  )
     
     
     # remove if power=* is missing (this is usually because that tag has been used to archive the object with a lifecycle tag) or generator:output:electricity=small_installation
