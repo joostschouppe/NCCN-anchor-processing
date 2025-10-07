@@ -155,8 +155,6 @@ return(geojson_vl)
 
 }
 
-
-
 ### French community ----
 
 DownloadBRWA <- function(){ 
@@ -223,57 +221,49 @@ features_list_4 <- list("landuse" = "education")
 features_list_5 <- list("amenity" = "college")
 
 # Define extra tags to use as columns for properties
-extra_columns <- c("amenity","landuse","faculty","grades","isced:level","max_age","min_age","operator:type","pedagogy","religion","school:language","language:nl","language:de","language:fr","school")
+extra_columns <- c("amenity","landuse","faculty","grades","isced:level","max_age","min_age","operator:type","pedagogy","religion","school:language","language:nl","language:de","language:fr","school", "school:special_needs",
+"special_needs:intellectual_disability",
+"special_needs:emotional_behavioural_disorder",
+"special_needs:physical_disability",
+"special_needs:blind",
+"special_needs:deaf",
+"special_needs:language_disorder",
+"special_needs:autism",
+"special_needs:learning_disabilities",
+"special_needs:intellectually_gifted")
+
 # Choose which datatypes are needed, as a list of datatypes, using any of "points", "lines", "mpolygons" (this is polygons+multipolygons together)
 datatypes <- c("points", "mpolygon")
 
 
 ### Actual OSM download & transformation ----
 
-tryCatch({
-  # Call the large function
-  osm_1<-download_osm_process(features_list_1, datatypes, extra_columns, keep_region=TRUE, postgres=TRUE)
-  print("OSM data downloaded & processes succesfully")
-}, error = function(e) {
-  # Print error message
-  print(paste("Something went wrong:", e$message))
-})
+osm_1 <- run_process(
+  download_osm_process(features_list_1, datatypes, extra_columns, keep_region=TRUE, postgres=TRUE),
+  paste0("OSM download & processing for ", paste(paste(names(features_list_1), unlist(features_list_1), sep = "="), collapse = ", "), collapse = ", ")
+)
 
-tryCatch({
-  # Call the large function
-  osm_2<-download_osm_process(features_list_2, datatypes, extra_columns, keep_region=TRUE, postgres=TRUE)
-  print("OSM data downloaded & processes succesfully")
-}, error = function(e) {
-  # Print error message
-  print(paste("Something went wrong:", e$message))
-})
+osm_2 <- run_process(
+  download_osm_process(features_list_2, datatypes, extra_columns, keep_region=TRUE, postgres=TRUE),
+  paste0("OSM download & processing for ", paste(paste(names(features_list_2), unlist(features_list_2), sep = "="), collapse = ", "), collapse = ", ")
+)
 
-tryCatch({
-  # Call the large function
-  osm_3<-download_osm_process(features_list_3, datatypes, extra_columns, keep_region=TRUE, postgres=TRUE)
-  print("OSM data downloaded & processes succesfully")
-}, error = function(e) {
-  # Print error message
-  print(paste("Something went wrong:", e$message))
-})
+osm_3 <- run_process(
+  download_osm_process(features_list_3, datatypes, extra_columns, keep_region=TRUE, postgres=TRUE),
+  paste0("OSM download & processing for ", paste(paste(names(features_list_3), unlist(features_list_3), sep = "="), collapse = ", "), collapse = ", ")
+)
 
-tryCatch({
-  # Call the large function
-  osm_4<-download_osm_process(features_list_4, datatypes, extra_columns, extra_columns, keep_region=TRUE, postgres=TRUE)
-  print("OSM data downloaded & processes succesfully")
-}, error = function(e) {
-  # Print error message
-  print(paste("Something went wrong:", e$message))
-})
+osm_4 <- run_process(
+  download_osm_process(features_list_4, datatypes, extra_columns, keep_region=TRUE, postgres=TRUE),
+  paste0("OSM download & processing for ", paste(paste(names(features_list_4), unlist(features_list_4), sep = "="), collapse = ", "), collapse = ", ")
+)
 
-tryCatch({
-  # Call the large function
-  osm_5<-download_osm_process(features_list_5, datatypes, extra_columns, extra_columns, keep_region=TRUE, postgres=TRUE)
-  print("OSM data downloaded & processes succesfully")
-}, error = function(e) {
-  # Print error message
-  print(paste("Something went wrong:", e$message))
-})
+osm_5 <- run_process(
+  download_osm_process(features_list_5, datatypes, extra_columns, keep_region=TRUE, postgres=TRUE),
+  paste0("OSM download & processing for ", paste(paste(names(features_list_5), unlist(features_list_5), sep = "="), collapse = ", "), collapse = ", ")
+)
+
+
 
 # remove duplicates: landuse=education can also be amenity like school
 osm_4 <- osm_4 %>% filter((amenity!='kindergarten' & amenity!='school' & amenity!='university' & amenity!='college') | is.na(amenity))
@@ -295,7 +285,10 @@ osm_all <- osm_all %>%
          type_primary = ifelse((grepl("primary", osm_all$school, ignore.case = TRUE) | grepl("1", osm_all$isced_level, ignore.case = TRUE)), 1, 0),
          type_secondary = ifelse((grepl("secondary", osm_all$school, ignore.case = TRUE)| grepl("2", osm_all$isced_level, ignore.case = TRUE) | grepl("3", osm_all$isced_level, ignore.case = TRUE)), 1, 0),
          type_tertiary = ifelse((amenity=='university' | amenity=='college'), 1, 0),
-         type_special_needs = ifelse(grepl("special_education_needs", osm_all$school, ignore.case = TRUE), 1, 0))
+         type_special_needs = ifelse(
+           grepl("special_education_needs", osm_all$school, ignore.case = TRUE) |
+             school_special_needs %in% c('yes', 'only', 'mixed', 'separated'),
+           1, 0))
 
 
 # filter points with a name
@@ -397,6 +390,7 @@ FROM raw_data.ngi_ign_region r, raw_data.osm_school_point osm
 WHERE ST_Intersects(r.shape,osm.geometry) AND (osm.amenity='kindergarten' OR osm.amenity='school' OR osm.amenity='university' OR osm.amenity='college')
 ),
 
+
 -- prepare data and filter just the data outside of Belgium
 final_table AS (
   SELECT
@@ -413,6 +407,15 @@ operator_email,
 	b.operator_website,
 	j.niscode as region,
 	b.type_kindergarten, b.type_primary, b.type_secondary, b.type_tertiary, b.type_special_needs,
+	b.special_needs_intellectual_disability,
+b.special_needs_emotional_behavioural_disorder,
+b.special_needs_physical_disability,
+b.special_needs_blind,
+b.special_needs_deaf,
+b.special_needs_language_disorder,
+b.special_needs_autism,
+b.special_needs_learning_disabilities,
+b.special_needs_intellectually_gifted,
 	b.geometry as geometry
 FROM raw_data.osm_school_point b 
 LEFT JOIN join_region j ON b.osm_id=j.id
@@ -442,7 +445,16 @@ jsonb_strip_nulls(jsonb_build_object(
 			'type_primary',type_primary,
 			'type_secondary',type_secondary,
 			'type_tertiary',type_tertiary,
-			'type_special_needs',type_special_needs)	
+			'type_special_needs',type_special_needs,
+			'special_needs_intellectual_disability',special_needs_intellectual_disability,
+			'special_needs_emotional_behavioural_disorder',special_needs_emotional_behavioural_disorder,
+			'special_needs_physical_disability',special_needs_physical_disability,
+			'special_needs_blind',special_needs_blind,
+			'special_needs_deaf',special_needs_deaf,
+			'special_needs_language_disorder',special_needs_language_disorder,
+			'special_needs_autism',special_needs_autism,
+			'special_needs_learning_disabilities',special_needs_learning_disabilities,
+			'special_needs_intellectually_gifted',special_needs_intellectually_gifted)	
     	) AS properties,
     geometry,
 	CURRENT_DATE as created_at
@@ -538,9 +550,9 @@ sql_commands_osm_polygons <- c(
 
   -- we prepare a big attribute table from both points & polygons
   attributes AS (
-  	select osm_id,name,name_nl,operator_wikidata,operator,operator_type,addr_city,addr_housenumber,addr_street,addr_postcode,short_name,alt_name,contact_email,email,website,contact_website,phone,contact_phone,opening_hours,check_date,image,wikidata,amenity,faculty,religion,name_fr,name_de,nohousenumber,old_name,official_name,phone_2,mobile,contact_mobile,alt_website,operator_email,operator_website,landuse,grades,isced_level,max_age,min_age,pedagogy,school_language,language_nl,language_de,language_fr,school,language,type_kindergarten,type_primary,type_secondary,type_tertiary,type_special_needs,geometry, 'poly' AS source FROM raw_data.osm_school_polygon
+  	select osm_id,name,name_nl,operator_wikidata,operator,operator_type,addr_city,addr_housenumber,addr_street,addr_postcode,short_name,alt_name,contact_email,email,website,contact_website,phone,contact_phone,opening_hours,check_date,image,wikidata,amenity,faculty,religion,name_fr,name_de,nohousenumber,old_name,official_name,phone_2,mobile,contact_mobile,alt_website,operator_email,operator_website,landuse,grades,isced_level,max_age,min_age,pedagogy,school_language,language_nl,language_de,language_fr,school,language,type_kindergarten,type_primary,type_secondary,type_tertiary,type_special_needs,special_needs_intellectual_disability,special_needs_emotional_behavioural_disorder,special_needs_physical_disability,special_needs_blind,special_needs_deaf,special_needs_language_disorder,special_needs_autism,special_needs_learning_disabilities,special_needs_intellectually_gifted,geometry, 'poly' AS source FROM raw_data.osm_school_polygon
 	  UNION ALL
-    select osm_id,name,name_nl,operator_wikidata,operator,operator_type,addr_city,addr_housenumber,addr_street,addr_postcode,short_name,alt_name,contact_email,email,website,contact_website,phone,contact_phone,opening_hours,check_date,image,wikidata,amenity,faculty,religion,name_fr,name_de,nohousenumber,old_name,official_name,phone_2,mobile,contact_mobile,alt_website,operator_email,operator_website,landuse,grades,isced_level,max_age,min_age,pedagogy,school_language,language_nl,language_de,language_fr,school,language,type_kindergarten,type_primary,type_secondary,type_tertiary,type_special_needs,geometry, 'point' AS source FROM raw_data.osm_school_point
+    select osm_id,name,name_nl,operator_wikidata,operator,operator_type,addr_city,addr_housenumber,addr_street,addr_postcode,short_name,alt_name,contact_email,email,website,contact_website,phone,contact_phone,opening_hours,check_date,image,wikidata,amenity,faculty,religion,name_fr,name_de,nohousenumber,old_name,official_name,phone_2,mobile,contact_mobile,alt_website,operator_email,operator_website,landuse,grades,isced_level,max_age,min_age,pedagogy,school_language,language_nl,language_de,language_fr,school,language,type_kindergarten,type_primary,type_secondary,type_tertiary,type_special_needs,special_needs_intellectual_disability,special_needs_emotional_behavioural_disorder,special_needs_physical_disability,special_needs_blind,special_needs_deaf,special_needs_language_disorder,special_needs_autism,special_needs_learning_disabilities,special_needs_intellectually_gifted,geometry, 'point' AS source FROM raw_data.osm_school_point
 	  where amenity='kindergarten' OR amenity='school' OR amenity='university' OR amenity='college'
   ),
   
@@ -614,7 +626,17 @@ operator_email,
   NULLIF(CONCAT_WS('; ',b.contact_mobile, b.mobile, b.contact_phone, b.phone, b.phone_2),'') AS local_phone,
   NULLIF(CONCAT_WS('; ',b.website, b.contact_website),'') AS local_website,
 	b.operator_website,
-	b.type_kindergarten, b.type_primary, b.type_secondary, type_tertiary,b.type_special_needs, b.landuse_count, b.landuse_indicator,
+	b.type_kindergarten, b.type_primary, b.type_secondary, type_tertiary,b.type_special_needs, b.special_needs_intellectual_disability,
+b.special_needs_emotional_behavioural_disorder,
+b.special_needs_physical_disability,
+b.special_needs_blind,
+b.special_needs_deaf,
+b.special_needs_language_disorder,
+b.special_needs_autism,
+b.special_needs_learning_disabilities,
+b.special_needs_intellectually_gifted,
+b.landuse_count, 
+b.landuse_indicator,
 	  b.source,
      CASE 
 	    WHEN aggregation_id=osm_id THEN geometry
@@ -656,8 +678,17 @@ operator_email,
     max(s.type_kindergarten) AS type_kindergarten,
     max(s.type_primary) AS type_primary,
     max(s.type_secondary) AS type_secondary,
-    max(type_tertiary) AS type_tertiary,
+    max(s.type_tertiary) AS type_tertiary,
     max(s.type_special_needs) AS type_special_needs,
+    MAX(CASE WHEN s.special_needs_intellectual_disability = 'yes' THEN 'yes' END) AS special_needs_intellectual_disability,
+    MAX(CASE WHEN s.special_needs_emotional_behavioural_disorder = 'yes' THEN 'yes' END) AS special_needs_emotional_behavioural_disorder,
+    MAX(CASE WHEN s.special_needs_physical_disability = 'yes' THEN 'yes' END) AS special_needs_physical_disability,
+    MAX(CASE WHEN s.special_needs_blind = 'yes' THEN 'yes' END) AS special_needs_blind,
+    MAX(CASE WHEN s.special_needs_deaf = 'yes' THEN 'yes' END) AS special_needs_deaf,
+    MAX(CASE WHEN s.special_needs_language_disorder = 'yes' THEN 'yes' END) AS special_needs_language_disorder,
+    MAX(CASE WHEN s.special_needs_autism = 'yes' THEN 'yes' END) AS special_needs_autism,
+    MAX(CASE WHEN s.special_needs_learning_disabilities = 'yes' THEN 'yes' END) AS special_needs_learning_disabilities,
+    MAX(CASE WHEN s.special_needs_intellectually_gifted = 'yes' THEN 'yes' END) AS special_needs_intellectually_gifted,
     MIN(j.niscode) as region,
 	STRING_AGG(DISTINCT s.source, '; ') AS source,
     MIN(s.geometry) as geometry
@@ -696,7 +727,16 @@ WHERE source!='point')
 	  'type_primary',type_primary,
 	  'type_secondary',type_secondary,
 	  'type_tertiary',type_tertiary,
-	  'type_special_needs',type_special_needs)	
+	  'type_special_needs',type_special_needs,
+	  'special_needs_intellectual_disability',special_needs_intellectual_disability,
+		'special_needs_emotional_behavioural_disorder',special_needs_emotional_behavioural_disorder,
+		'special_needs_physical_disability',special_needs_physical_disability,
+		'special_needs_blind',special_needs_blind,
+		'special_needs_deaf',special_needs_deaf,
+		'special_needs_language_disorder',special_needs_language_disorder,
+		'special_needs_autism',special_needs_autism,
+		'special_needs_learning_disabilities',special_needs_learning_disabilities,
+		'special_needs_intellectually_gifted',special_needs_intellectually_gifted)	
   ) AS properties,
   addr_street AS addr_street,
   addr_housenumber AS addr_housenumber,
@@ -1770,12 +1810,11 @@ choosing_time <- round(as.numeric(difftime(choice_time, choice_prep_time, units 
 print(paste0("Choices made (took ",choosing_time," seconds), now summarizing data"))
 
 # create the school types again
-
 vla_joined$type_kindergarten <- ifelse(grepl("kleuteronderwijs", vla_joined$poitype), 1, 0)
 vla_joined$type_primary <- ifelse(grepl("lager onderwijs", vla_joined$poitype), 1, 0)
 vla_joined$type_secondary <- ifelse(vla_joined$categorie == "Secundair onderwijs", 1, 0)
 vla_joined$type_tertiary <- ifelse(vla_joined$categorie == "Hoger onderwijs", 1, 0)
-vla_joined$type_special_needs <- ifelse(vla_joined$categorie == "Buitengewoon", 1, 0)
+vla_joined$type_special_needs <- ifelse(grepl("Buitengewoon", vla_joined$poitype), 1, 0)
 
 # prepare addresses
 # Step 1: Prepare Address Data (prep_add0)
@@ -2710,6 +2749,7 @@ dbExecute(con_pg, sql_update_table)
 
 # Close the connection
 dbDisconnect(con_pg)
+
 
 
   }, 

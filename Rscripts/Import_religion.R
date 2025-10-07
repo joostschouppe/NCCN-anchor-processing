@@ -88,14 +88,10 @@ datatypes <- c("points", "mpolygon")
 
 ### Actual OSM download & transformation ----
 
-tryCatch({
-  # Call the large function
-  osm_all<-download_osm_process(features_list, datatypes, extra_columns, postgres=TRUE)
-  print("OSM data downloaded & processes succesfully")
-}, error = function(e) {
-  # Print error message
-  print(paste("Something went wrong:", e$message))
-})
+osm_all <- run_process(
+  download_osm_process(features_list, datatypes, extra_columns, postgres=TRUE),
+  paste0("OSM download & processing for ", paste(paste(names(features_list), unlist(features_list), sep = "="), collapse = ", "), collapse = ", ")
+)
 
 # Create the import table in the database ----
 CreateImportTable(dataset = osm_all, schema = "raw_data", table_name = "osm_religion")  
