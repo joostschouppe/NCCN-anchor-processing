@@ -64,21 +64,13 @@ calculate_distance_integrated <- function(geometry1, geometry2) {
   return(distance)
 }
 
-# Function to calculate the percentage of overlap between two bounding boxes
-bbox_overlap <- function(bbox1, bbox2) {
-  intersect_area <- max(0, min(bbox1["xmax"], bbox2["xmax"]) - max(bbox1["xmin"], bbox2["xmin"])) *
-    max(0, min(bbox1["ymax"], bbox2["ymax"]) - max(bbox1["ymin"], bbox2["ymin"]))
-  bbox1_area <- (bbox1["xmax"] - bbox1["xmin"]) * (bbox1["ymax"] - bbox1["ymin"])
-  intersect_area / bbox1_area
-}
-
 
 # Dataset check function ----
 perform_check <- function(dataset, name, geom, check_results, result_column_name=NULL) {
   n_invalid <- sum(!st_is_valid(geom))
   n <- nrow(dataset)
   n_missing_geom <- sum(is.na(geom)) + sum(st_is_empty(geom))
-  bbox_area <- st_area(st_transform(st_as_sfc(st_bbox(dataset)), 31370)) / 1e6
+  bbox_area <- round(st_area(st_transform(st_as_sfc(st_bbox(dataset)), 31370)) / 1e6)
   
   # Create a dataframe to store the results
   results_df <- data.frame(
@@ -146,10 +138,23 @@ perform_check <- function(dataset, name, geom, check_results, result_column_name
 # By default, the function will actually update the table. If you want to generate the geopackages for visual inspection of the output without updating the transformation table, set this to TRUE.
 #dry_run<-TRUE
 
+## Setting the threshold to 1 means that all original_id's need to be unique for the id to be considered unchanged
+# By default we remove original_ids that are "far from unique". This throws out for example "none provided" in some cases. If there are many of these cases, it creates a giant dataframe in unchanged cases. However, in smaller datasets where distances between objects are large, throwing out all "none provided" means that an object would never be defined as "unchanged" when it clearly is the same record. Therefor we use a relatively large number
+#original_id_threshold<-2500
+
+# When comparing lines, we buffer them and treat them the same way as polygons. The default buffer is 5 meters
+#same_id_line_buffer <- 5
+#different_id_line_buffer <- 5
+
 #By default, replacement polygons should overlap at least 90% (when comparing to either the old or the new geometry), even when their Hausdorff distance is more than the same_id_distance_threshold.
 #same_id_overlap_threshold<-0.9
 # Same for different ID polygons
 #different_id_overlap_threshold<-0.9
+
+# OSM polygons tend to be remapped as a larger version (e.g. a sports field becomes part of a sports centre). However we do not want to link objects that become way bigger. E.g. a very small line segment should not be linked to a much much longer line segment
+# same_id_size_factor <- 5
+# different_id_size_factor <- 5
+
 
 # Do name comparison to help find best match
 #do_name_comparison <- FALSE
@@ -158,8 +163,12 @@ perform_check <- function(dataset, name, geom, check_results, result_column_name
 
 #ignore_in_name <- c("college","instituts","institut","communale","fondamentale","fondamental","enseignement","provinciale", "provincial","specialize", "ecole","athenee","secondair","secondaire","instituut","gemeentelijke","gemeentelijk","basisschool","vrije ","lagere school","kleuterschool","onderwijs", "atheneum","middenschool","school","stedelijke","campus","college","basisonderwijs", "provinciaal","gemeindegrundschule","gemeindeschule","schule")
 
-# Optional parameter: if TRUE, the function will generate a gpkg file with the changes that were made. This can be useful for debugging.
+# Optional parameter: if visualise_changes is TRUE, the function will generate a gpkg file with the changes that were made. This can be useful for debugging.
 #visualise_changes<-FALSE
+
+
+
+
 
 # BEGIN SMART UPDATE FUNCTION ----
 ### Note: this assumes you have a table ready for use in ingestion, which has the exact same name as the transformation table
@@ -170,13 +179,19 @@ smart_update_process <- function(
     different_id_distance_unique_threshold,
     source_identifier,
     allow_update_even_if_checks_fail,
+    original_id_threshold=2500,
+    same_id_line_buffer=5,
+    different_id_line_buffer=5,
     same_id_overlap_threshold = 0.9,
+    same_id_size_factor = 5,
     different_id_overlap_threshold = 0.9,
+    different_id_size_factor = 5,
     do_name_comparison = FALSE,
     ignore_in_name = NULL,
     dry_run=FALSE,
     visualise_changes=FALSE,
-    reuse_ingestion_data=FALSE)
+    reuse_ingestion_data=FALSE
+)
 {
 
 if (reuse_ingestion_data==FALSE) {
@@ -189,35 +204,58 @@ if (reuse_ingestion_data==FALSE) {
   
   ### Download new ingestion dataset ----
   con_pg <- get_con()
-  new_ingestion <- dbGetQuery(con_pg, paste("SELECT original_id,name,legend_item,legend_item_id,data_list_id,risk_level,properties,properties_secondary,imported_at,tags,deleted_at,updated_at,created_at,created_by,updated_by,ST_AsText(geometry) as geometry FROM ingestion.", pgsql_table_name, sep = ""))
+  new_ingestion <- dbGetQuery(con_pg, paste("SELECT original_id,name,legend_item,legend_item_id,data_list_id,risk_level,properties,properties_secondary,imported_at,tags,deleted_at,updated_at,created_at::date as created_at,created_by,updated_by,ST_AsHEXEWKB(geometry) as geometry FROM ingestion.", pgsql_table_name, sep = ""))
   
   # also try for pt and pg geometry columns. We will add them to the data at the end, if needed.
-  new_ingestion_extra_geom <- tryCatch({
-    dbGetQuery(con_pg, paste("SELECT original_id, ST_AsText(geometry_pt) as geometry_pt, ST_AsText(geometry_pg) as geometry_pg FROM ingestion.", pgsql_table_name, sep = ""))
-  }, error = function(e) {
-    # Suppress the error message by returning NULL without any logging
-    return(NULL)
-  })
-  dbDisconnect(con_pg)
-  new_ingestion<-st_as_sf(new_ingestion, wkt="geometry")
+    new_ingestion_extra_geom <- tryCatch({
+      dbGetQuery(con_pg, paste0("SELECT original_id, ST_AsHEXEWKB(geometry_pt) as geometry_pt, ST_AsHEXEWKB(geometry_pg) as geometry_pg FROM ingestion.", pgsql_table_name))
+    }, error = function(e) {
+      # Suppress the error message by returning NULL without any logging
+      return(NULL)
+    })
+    dbDisconnect(con_pg)
+    if (!is.null(new_ingestion_extra_geom)) {
+      if (any(duplicated(new_ingestion_extra_geom$original_id))) {
+        stop("This dataset has more than one geometry field (both point & polygon). Later on, we would merge them to the rest of the data based on original_id. However, it turns out the original_id is not unique in this dataset! Change the utils_updated_check_protoanchors.R script to be able to deal with this.")
+      }
+    }
+  new_ingestion$geometry <- st_as_sfc(structure(new_ingestion$geometry, class = "WKB"), EWKB = TRUE)
   new_ingestion$geometry <- st_set_crs(new_ingestion$geometry, 4326)
+  new_ingestion <- st_as_sf(new_ingestion)
+  new_ingestion <- st_make_valid(new_ingestion)
 
+  new_ingestion$name <- as.character(new_ingestion$name)
+  new_ingestion$legend_item <- as.character(new_ingestion$legend_item)
+  new_ingestion$properties <- as.character(new_ingestion$properties)
+  new_ingestion$properties_secondary <- as.character(new_ingestion$properties_secondary)
+  new_ingestion$tags <- as.character(new_ingestion$tags)
 
 
   ### Download the old transformation dataset ----
   con_pg <- get_con()
-  old_transformation <- dbGetQuery(con_pg, paste("SELECT id, original_id,name,legend_item,legend_item_id,data_list_id,risk_level,properties,properties_secondary,imported_at,tags,deleted_at,updated_at,created_at,created_by,updated_by,ST_AsText(geometry) as geometry FROM transformation.", pgsql_table_name, sep = ""))
+  old_transformation <- dbGetQuery(con_pg, paste0("SELECT id, original_id,name,legend_item,legend_item_id,data_list_id,risk_level,properties,properties_secondary,imported_at,tags,deleted_at,updated_at,created_at,created_by,updated_by,ST_AsHEXEWKB(geometry) as geometry FROM transformation.", pgsql_table_name," WHERE deleted_at IS NULL"))
+    # also try for pt and pg geometry columns. We use these to compare to the new geometries and detect changes.
+  old_transformation_extra_geom <- tryCatch({
+      dbGetQuery(con_pg, paste0("SELECT id, ST_AsHEXEWKB(geometry_pt) as geometry_pt_old, ST_AsHEXEWKB(geometry_pg) as geometry_pg_old FROM transformation.", pgsql_table_name," WHERE deleted_at IS NULL"))
+    }, error = function(e) {
+      # Suppress the error message by returning NULL without any logging
+      return(NULL)
+    })
   dbDisconnect(con_pg)
-  old_transformation<-st_as_sf(old_transformation, wkt="geometry")
+  old_transformation$geometry <- st_as_sfc(structure(old_transformation$geometry, class = "WKB"), EWKB = TRUE)
   old_transformation$geometry <- st_set_crs(old_transformation$geometry, 4326)
-
-
+  old_transformation <- st_as_sf(old_transformation)
+  old_transformation <- st_make_valid(old_transformation)
+  
+  old_transformation$name <- as.character(old_transformation$name)
+  old_transformation$legend_item <- as.character(old_transformation$legend_item)
+  old_transformation$properties <- as.character(old_transformation$properties)
+  old_transformation$properties_secondary <- as.character(old_transformation$properties_secondary)
+  old_transformation$tags <- as.character(old_transformation$tags)
+  
   print("Downloaded data from Postgres")
   
-  # only keep cases from the old data if they have not been deleted yet!
-  old_transformation <- old_transformation %>%
-    filter(is.na(deleted_at))
-  # NOTE: this implies that if a data source accidentally deletes something, and we use it in an EP, that the link will never be fixed automatically. Option: if there are NEW objects, check them against previously deleted objects, and if they are the same, undelete them.
+  # NOTE: since we don't download deleted objects, this implies that if a data source accidentally deletes something, and we use it in an EP, that the link will never be fixed automatically. Option: if there are NEW objects, check them against previously deleted objects, and if they are the same, undelete them.
   
   
   print(paste("The old data contained", nrow(old_transformation), "records (that weren't previously deleted)"))
@@ -225,7 +263,7 @@ if (reuse_ingestion_data==FALSE) {
   
 #st_write(old_transformation, paste0(log_folder,"/old_data.geojson"))
   
-  bbox_old_transformation <- as.numeric(st_area(st_transform(st_as_sfc(st_bbox(old_transformation)), 31370)) / 1e6)
+  bbox_old_transformation <- round(as.numeric(st_area(st_transform(st_as_sfc(st_bbox(old_transformation)), 31370)) / 1e6))
   
   
   
@@ -257,7 +295,14 @@ if (reuse_ingestion_data==FALSE) {
   
   ## make a copy of the old, with uuid, original id and geometry
   old_limited <- old_transformation %>%
-    select(id, original_id)
+    select(id, original_id, 
+           properties_old=properties, 
+           properties_secondary_old=properties_secondary, 
+           name_old=name,
+           data_list_id_old=data_list_id,
+           legend_item_old=legend_item,
+           legend_item_id_old=legend_item_id,
+           risk_level_old=risk_level)
   old_limited <- st_set_geometry(old_limited, "geometry_old")
   
   
@@ -266,8 +311,33 @@ if (reuse_ingestion_data==FALSE) {
   unchanged <- as.data.frame(new_ingestion)
   
   
-  ## keep only cases with a match
-  unchanged <- inner_join(unchanged, old_limited, by = "original_id", relationship = "many-to-many")
+  ## keep only cases with a match - this only makes sense to try for records that share an ID with the other dataset and where the id has a likelihood to be somewhat unique. Default threshold is set when running the function but this is overruled with a parameter when running the function
+  perform_filtered_join <- function(unchanged, old_limited, id_col = "original_id", threshold = original_id_threshold) {
+    # Helper function to filter out IDs that appear too frequently
+    filter_frequent_ids <- function(df, id_col, threshold) {
+      id_counts <- count(df, !!sym(id_col), name = "n")
+      frequent_ids <- id_counts %>% filter(n > threshold) %>% pull(!!sym(id_col))
+      df %>% filter(!(!!sym(id_col) %in% frequent_ids))
+    }
+    
+    # Filter both datasets to remove frequent IDs
+    unchanged_filtered <- filter_frequent_ids(unchanged, id_col, threshold)
+    old_limited_filtered <- filter_frequent_ids(old_limited, id_col, threshold)
+    
+    # Get common IDs between the filtered datasets
+    common_ids <- intersect(unchanged_filtered[[id_col]], old_limited_filtered[[id_col]])
+    
+    # Filter again to only include common IDs
+    unchanged_filtered <- unchanged_filtered %>% filter(!!sym(id_col) %in% common_ids)
+    old_limited_filtered <- old_limited_filtered %>% filter(!!sym(id_col) %in% common_ids)
+    
+    # Perform the join
+    inner_join(unchanged_filtered, old_limited_filtered, by = id_col, relationship = "many-to-many")
+  }
+  ## run the function
+  unchanged <- perform_filtered_join(unchanged, old_limited, id_col = "original_id", threshold = original_id_threshold)
+  
+
   
   
   
@@ -281,7 +351,7 @@ if (reuse_ingestion_data==FALSE) {
   
 
   # Apply the distance calculation to the dataframe and show the time elapsed
-  print(paste0("Start calculating distances between objects with same original_ID: ",format(Sys.time(), "%a %b %d %X %Y")))
+  print(paste0("Start calculating distances between ",nrow(unchanged)," object combinations with same original_ID: ",format(Sys.time(), "%a %b %d %X %Y")))
   start_time <- Sys.time()
   unchanged$distance <- mapply(calculate_distance_integrated, unchanged$geometry_l, unchanged$geometry_l_old)
   time_elapsed <- round(as.numeric(difftime(Sys.time(), start_time, units = "secs")),2)
@@ -315,6 +385,27 @@ if (reuse_ingestion_data==FALSE) {
   ## since this is relatively rare, the script is not adapted to this situation, and we will just throw out the duplicates
   ## and in fact, if the distance is greater, it will still be merged in the next step
   
+  # for lines: transform to polygon
+  ## Function to buffer only line/multiline geometries. Default is 5, but it is overruled by the provided parameter (if any)
+  buffer_if_line <- function(geom, distance = 5) {
+    if (inherits(geom, "sfc")) {
+      # Check if the geometry is a line or multiline
+      is_line <- st_geometry_type(geom) %in% c("LINESTRING", "MULTILINESTRING")
+      if (any(is_line)) {
+        geom[is_line] <- st_buffer(geom[is_line], dist = distance)
+      }
+      return(geom)
+    } else {
+      return(geom)
+    }
+  }
+  ## Apply buffering to both geometry columns
+  unchanged <- unchanged %>%
+    mutate(
+      geometry_l = buffer_if_line(geometry_l, same_id_line_buffer),
+      geometry_l_old = buffer_if_line(geometry_l_old, same_id_line_buffer)
+    )
+
 
   if (nrow(unchanged) == 0) {
     unchanged$intersection <- numeric(0)
@@ -339,31 +430,27 @@ if (reuse_ingestion_data==FALSE) {
   }
 
   
-  
-    
+
   # calculate area
   unchanged <- unchanged %>%
     mutate(
       area_new = if_else(!is.na(intersection), as.numeric(st_area(geometry_l)), NA_real_),
       area_old = if_else(!is.na(intersection), as.numeric(st_area(geometry_l_old)), NA_real_)
     )
-  # NA_real_ instead of NA prevents following error:
-  # Caused by error in `if_else()`:
-  #   ! `false` must be a `units` object, not a logical vector.
-  
+
   # intersection %s
   unchanged <- unchanged %>%
     mutate(
-      p_inter_new = (intersection / area_new),
-      p_inter_old = (intersection / area_old)
-    )
-  unchanged <- unchanged %>%
-    mutate(max_p=if_else(p_inter_new>p_inter_old, p_inter_new, p_inter_old))
+      p_inter_new = intersection / area_new,
+      p_inter_old = intersection / area_old
+    ) %>%
+    mutate(max_p=if_else(p_inter_new>p_inter_old, p_inter_new, p_inter_old)) %>%
+    mutate(relative_difference = pmax(area_new, area_old) / pmin(area_new, area_old))
   
   
   # throw out objects that have moved beyond the threshold for objects with the same ID
   unchanged <- unchanged %>%
-    filter(distance <= same_id_distance_threshold | max_p >= same_id_overlap_threshold)
+    filter(distance <= same_id_distance_threshold | (max_p >= same_id_overlap_threshold & relative_difference <= same_id_size_factor))
   
   # count number of times new objects were used
   unchanged <- unchanged %>%
@@ -390,10 +477,7 @@ if (reuse_ingestion_data==FALSE) {
   
   unchanged_for_visualisation <- unchanged
   
-  # remove unneeded columns
-  unchanged <- unchanged %>%
-    select(-geometry_old, -distance, -geometry_l, -geometry_l_old, -count_new, -count_old, -new_rownumber)
-  
+
   ### Finalize UNCHANGED CASES ----
   ## Now finish unchanged to be used as the first part of the upload. These will be used to overwrite the existing cases with the same ID in the transformation table in Postgres
   # old_metadata has the metadata from the old data
@@ -403,14 +487,59 @@ if (reuse_ingestion_data==FALSE) {
   
   # merge the old metadata to the new data
   unchanged <- left_join(unchanged, old_metadata, by = "id")
-  # NOTE: for now, we will NOT change updated_at here, even though some objects might have minor updates. We could compare column by column to define things that were updated
+
   
+  # small function to make sure that name!=name_old never returns NA if one of the values is NA
+  differs <- function(a, b) xor(is.na(a), is.na(b)) | (!is.na(a) & !is.na(b) & a != b)
+  
+  # updated_at should be today if: name changed, geometry changed or properties(_secondary) changed
+  unchanged <- unchanged %>%
+    mutate(updated_at = if_else(
+      differs(name, name_old) |
+        differs(properties, properties_old) |
+        differs(sf::st_as_text(geometry), sf::st_as_text(geometry_old)) |
+        differs(properties_secondary, properties_secondary_old) |
+        differs(legend_item, legend_item_old) |
+        differs(legend_item_id, legend_item_id_old) |
+        differs(risk_level, risk_level_old) |
+        differs(data_list_id, data_list_id_old),
+      Sys.Date(),
+      updated_at))
+  
+  unchanged <- unchanged %>%
+    mutate(diff_prop = if_else(differs(properties, properties_old),1,0),
+           diff_prop2 = if_else(differs(properties_secondary, properties_secondary_old),1,0),
+           diff_li = if_else(differs(legend_item, legend_item_old),1,0),
+           diff_li2 = if_else(differs(legend_item_id, legend_item_id_old),1,0),
+           diff_risk_level = if_else(differs(risk_level, risk_level_old),1,0),
+           diff_data_list = if_else(differs(data_list_id, data_list_id_old),1,0),
+           diff_geometry = if_else(differs(sf::st_as_text(geometry), sf::st_as_text(geometry_old)),1,0))
+  
+  # Create a summary dataframe
+  update_summary <- unchanged %>%
+    sf::st_drop_geometry() %>%   # only needed if `updated` is an sf object
+    summarise(
+      n = n(),
+      across(starts_with("diff_"), ~ sum(.x, na.rm = TRUE))
+    )
+  print("Summary of changes in the group matched based on original_id")
+  capture <- capture.output(print(t(update_summary), row.names=FALSE))
+  cat(paste(capture, collapse="\n"), "\n")
+  
+  
+  
+  # remove unneeded columns
+  unchanged <- unchanged %>%
+    select(-geometry_old, -distance, -geometry_l, -geometry_l_old, -count_new, -count_old, -new_rownumber,
+           -properties_old, -properties_secondary_old, -name_old, -legend_item_old, -legend_item_id_old, -risk_level_old, -data_list_id_old)
+  
+
   
   # add the unchanged objects to the table to be pushed to postgres
   table_to_push_to_sql <- unchanged
   
   
-  print("Identified the unchanged cases")
+  print(paste0("Linked ",nrow(unchanged)," objects based on the original id (content may have changed, but not by much)"))
   
   
   # UPDATED CASES ----
@@ -462,52 +591,48 @@ if (reuse_ingestion_data==FALSE) {
       mutate(rownumber_old = row_number())
     
 
-    # Spatial join adapted for joining lines
-    if (all(st_geometry_type(old_transformation) %in% c("LINESTRING", "MULTILINESTRING"))
-           && all(st_geometry_type(new_ingestion_nogeo) %in% c("LINESTRING", "MULTILINESTRING")))
-    {
-      print("All geometries are LINESTRING or MULTILINESTRING, so using the BBOX-filtered spatial join")
+    
+    # Spatial join based on distance
+    ## In the join, all records are compared against all records. When joining dense datasets, this means massive amounts of comparisons
+    ## To avoid, this, the data will be split spacially into a grid
+    
+    # All objects need to be covered by the grid, so we base it on the combined bbox of both datasets
+    combined_bbox <- st_union(st_as_sfc(st_bbox(new_ingestion_nogeo)), 
+                              st_as_sfc(st_bbox(old_transformation)))
+    grid <- st_make_grid(combined_bbox, n = c(10, 10)) %>% 
+      st_as_sf()
+    
+    # loop through the grid cells
+    results <- lapply(seq_len(nrow(grid)), function(i) {
+      new_tile <- st_filter(new_ingestion_nogeo, grid[i,])
+      if (nrow(new_tile) == 0) return(NULL)
       
-      # Pre-calculate bounding boxes
-      old_transformation <- old_transformation %>%
-        mutate(bbox_old = purrr::map(geometry, st_bbox)) # Calculate bbox for each record
+      # Add buffer to old data to catch cross-boundary matches
+      old_tile <- st_filter(old_transformation, 
+                            st_buffer(grid[i,], different_id_distance_raw_threshold))
+      if (nrow(old_tile) == 0) return(NULL)
       
-      # Initialize results
-      results <- list()
-
-
-      # Loop through each record in the new data
-      for (i in seq_len(nrow(new_ingestion_nogeo))) {
-        # Get the bounding box for the current record
-        bbox_new <- st_bbox(new_ingestion_nogeo[i, ])
-        
-        # Pre-filter old data based on bbox overlap
-        old_filtered <- old_transformation %>%
-          filter(map_dbl(bbox_old, ~ bbox_overlap(bbox_new, .)) >= 0.9) # Use map_dbl for vectorized computation
-        
-        # Perform the spatial join on the filtered data
-        if (nrow(old_filtered) > 0) {
-          joined <- st_join(new_ingestion_nogeo[i, ], old_filtered, join = st_is_within_distance, dist = different_id_distance_raw_threshold)
-          results[[i]] <- joined
-        }
-      }
-      
-      # Combine results into a single sf object
+      st_join(new_tile, old_tile, 
+              join = st_is_within_distance, 
+              dist = different_id_distance_raw_threshold)
+    })
+    
+    # make sure something is kept as "join" even if there are no matching pairs
+    ## first remove the list of nulls (one for each grid cell)
+    results <- Filter(Negate(is.null), results)
+    if (length(results) == 0) { # create empty sf with correct columns
+      join <- bind_rows(new_ingestion_nogeo[1, ],old_transformation[1, ]) 
+      join <- join[0, ]
+    } else {
       join <- do.call(rbind, results)
-      
-      print(paste0("Number of initial new/old objects possible pairs: ", nrow(join)))
-      
-      
-      
-      } else 
-           
-      
-      {
-        print("Not all geometries are lines, so using the normal spatial join")
-        # Execute spatial join: adjust distance based on different_id_distance_raw_threshold
-        join <- st_join(new_ingestion_nogeo, old_transformation, join = st_is_within_distance, dist = different_id_distance_raw_threshold)
-        print(paste0("Number of initial new/old objects possible pairs: ", nrow(join)))
-        }
+    }
+    # remove results data from memory
+    results <- NA
+
+    # Every new object is processed for each cell it is in. So there is a possibility that the same object is matched to the same old object twice.
+    ## An alternative would be to assign the object to a cell based on the centroid, but this might have adverse effects if the object happens to be as large as the cell. So we just remove duplicate matches
+    join <- join %>%
+      filter(!duplicated(paste(new_rownumber_new, rownumber_old)))
 
     join <- as.data.frame(join)
     
@@ -531,65 +656,73 @@ if (reuse_ingestion_data==FALSE) {
                
     # Calculate overlap between potential matches
     if (nrow(join)>0) { 
-      print(paste0("Calculating overlap between potential matches"))
-    # if we are dealing with lines, turn them into polygons  
+      print(paste0("Calculating overlap between potential matches (", nrow(join), " candidate pairs): ", format(Sys.time())))
+      
+      # if we just manipulate all the data at once using mutate etc, it can create massive amounts of geometries
+      # especially when there are relatively few candidates that can be combined in many ways, this is also very inefficient
+      # so first we do calculations per unique new and old geometry (step 1 and 2)
+      # then we do create a very big dataset again at step 3
+      # at step 4 we calculate the intersections between the two geometries row by row. After that we can discard the geometries
+      overlap_start_time <- Sys.time()
+      # 1. Unique new-side geometries (one row per new_rownumber_new) - buffer + area computed once
+      buffered_new <- join %>%
+        select(new_rownumber_new, geometry_new) %>%
+        distinct(new_rownumber_new, .keep_all = TRUE) %>%
+        mutate(geometry_new = buffer_if_line(geometry_new, different_id_line_buffer)) %>% # if we are dealing with lines, turn them into polygons  
+        mutate(area_new = as.numeric(st_area(geometry_new)))
+      # 2. Unique old-side geometries (one row per rownumber_old) - buffer + area computed once
+      buffered_old <- join %>%
+        distinct(rownumber_old, .keep_all = TRUE) %>%
+        select(rownumber_old, geometry = geometry) %>%
+        mutate(geometry = buffer_if_line(geometry, different_id_line_buffer)) %>%
+        mutate(area_old = as.numeric(st_area(geometry)))
+      # 3. Drop un-buffered geometry columns, re-attach buffered geometry + area via lookup join
+      #    (as.data.frame() is required first - sf's select() keeps the active geometry column
+      #    "sticky" and won't actually drop it otherwise)
+      join <- as.data.frame(join) %>%
+        select(-geometry_new, -geometry) %>%
+        left_join(buffered_new, by = "new_rownumber_new") %>%
+        left_join(as.data.frame(buffered_old), by = "rownumber_old")
+      # 4. Compute the actual pairwise intersection area row-by-row, so we never hold more
+      #    than one intersection geometry in memory at a time (this is the step that
+      #    previously produced ~2GB of intermediate geometry when done as one vectorized call)
+      n <- nrow(join)
+      intersection <- rep(NA_real_, n)
+      is_poly_pair <- st_geometry_type(join$geometry_new) %in% c("POLYGON", "MULTIPOLYGON") &
+        st_geometry_type(join$geometry)     %in% c("POLYGON", "MULTIPOLYGON") &
+        join$distance > 0
+      candidate_idx <- which(is_poly_pair)
+      for (i in candidate_idx) {
+        inter <- sf::st_intersection(join$geometry_new[[i]], join$geometry[[i]])
+        a <- as.numeric(sf::st_area(inter))
+        if (length(a) > 0 && a > 0) intersection[i] <- a
+        rm(inter)
+        if (i %% 5000 == 0) {
+          gc()
+          print(paste0("  ...processed ", i, " / ", n, " candidate pairs (", format(Sys.time()), ")"))
+        }
+      }
+      join$intersection <- intersection
+      # buffered geometries no longer needed anywhere downstream
+      join <- join %>% select(-geometry_new, -geometry)
+      overlap_time_elapsed <- round(as.numeric(difftime(Sys.time(), overlap_start_time, units = "secs")), 2)
+      print(paste0("End calculating overlap, time elapsed: ", overlap_time_elapsed, " seconds"))
+      # intersection %s (unchanged from original)
       join <- join %>%
-        rowwise() %>%
         mutate(
-          # Create a 5 meter buffer for lines, keeping original geometry for polygons
-          geometry_new = if (st_geometry_type(geometry_new) %in% c("LINESTRING", "MULTILINESTRING")) {
-            st_buffer(geometry_new, 5)
-          } else {
-            geometry_new
-          },
-          geometry = if (st_geometry_type(geometry) %in% c("LINESTRING", "MULTILINESTRING")) {
-            st_buffer(geometry, 5)
-          } else {
-            geometry
-          }
+          p_inter_new = intersection / area_new,
+          p_inter_old = intersection / area_old
         ) %>%
-        ungroup() 
+        mutate(max_p = if_else(p_inter_new > p_inter_old, p_inter_new, p_inter_old)) %>%
+        mutate(relative_difference = pmax(area_new, area_old) / pmin(area_new, area_old))
+      join <- join %>%
+        select(-intersection, -area_new, -area_old, -p_inter_new, -p_inter_old)
       
-      
-    join <- join %>%
-      rowwise() %>%
-      mutate(
-        intersection = 
-          # only try for an intersection if both are (multi)polygons
-          if (st_geometry_type(geometry_new) %in% c("POLYGON", "MULTIPOLYGON") &&
-              st_geometry_type(geometry) %in% c("POLYGON", "MULTIPOLYGON") && distance > 0) 
-          { # only calculate an intersection if there is actually one
-            if (lengths(st_intersects(geometry_new, geometry))>0) {
-              st_area(st_union(st_intersection(geometry_new, geometry)))
-              #st_intersection(geometry_new, geometry)
-            } else {
-              NA } # here there is no intersection between the polygons
-          } else {
-            NA  # here the preconditions for an intersection were not met
-          }) %>%
-      ungroup()
-    
-    # calculate area
-    join <- join %>%
-      mutate(
-        area_new = if_else(!is.na(intersection), st_area(geometry_new), NA),
-        area_old = if_else(!is.na(intersection), st_area(geometry), NA)
-      )
-    
-    # intersection %s
-    join <- join %>%
-      mutate(
-        p_inter_new = units::drop_units(intersection / area_new),
-        p_inter_old = units::drop_units(intersection / area_old)
-      )
-    join <- join %>%
-      mutate(max_p=if_else(p_inter_new>p_inter_old, p_inter_new, p_inter_old))
-    
-    join <- join %>%
-      select(-intersection, -area_new, -area_old, -p_inter_new, -p_inter_old)
-    
     }
+
+    
     # OPTIONAL MODULE: calculate "distance" based on name text distance and take in account when trying to match new and old ----
+    ## Note:  We may also include some properties to compare, as well as the name Some attributes the same. See the schools script for an example
     if (do_name_comparison & nrow(join)>0) { 
       print("Name comparison requested (running)") 
       #    
@@ -607,7 +740,7 @@ if (reuse_ingestion_data==FALSE) {
     )
     
     
-    #extract name from languaged name + extract other_names from properties
+    #extract name from languaged name
     join$name_new_fre<-tolower(mapply(extract_json_value, join$name_new, "fre"))
     join$name_new_eng<-tolower(mapply(extract_json_value, join$name_new, "eng"))
     join$name_new_dut<-tolower(mapply(extract_json_value, join$name_new, "dut"))
@@ -626,18 +759,6 @@ if (reuse_ingestion_data==FALSE) {
              across(starts_with("name_old_"), ~ stri_trans_general(., "Latin-ASCII")))
     
     
-    # check for identical names
-    join <- join %>%
-      rowwise() %>%
-      mutate(
-        identical_name = ifelse(
-          any(sapply(name_pairs, function(pair) get(pair[1]) == get(pair[2]))), 
-          1, 
-          0
-        )
-      ) %>%
-      ungroup()
-
     # apply to these columns:
     columns_to_clean <- unique(unlist(name_pairs))
     
@@ -651,12 +772,22 @@ if (reuse_ingestion_data==FALSE) {
       join <- string_removal(join, columns_to_clean, ignore_in_name)
     }
 
-    
-    
     # remove leading and trailing whitespaces
     join <- join %>%
       mutate(across(all_of(columns_to_clean), trimws))
-    
+
+    # check for identical names after cleaning
+    join <- join %>%
+      rowwise() %>%
+      mutate(
+        identical_name = ifelse(
+          any(sapply(name_pairs, function(pair) get(pair[1]) == get(pair[2]))), 
+          1, 
+          0
+        )
+      ) %>%
+      ungroup()
+        
     # find the longest common substring
     join <- join %>%
       rowwise() %>%
@@ -720,18 +851,15 @@ if (reuse_ingestion_data==FALSE) {
     join <- join %>%
       select(-all_of(columns_to_clean), -lcs, -longest_common_str_length, -length_name, -identical_name)
     
-    # TODO 2. Some attributes the same
-    # 
-    # properties_to_compare<-c("type_kindergarten", "type_primary", "type_secondary", "type_tertiary", "type_special_needs")
-    # NOTES
-    ## if the attribute is boolean, only consider the same if both are TRUE (not if both are FALSE)
-    ## in other cases, simply consider the same if they are identical
+
     
     # 2. Filter based on distance, same name, number of candidates
 
     # SELECT only if certain distance thresholds met
     join <- join %>%
-      filter(distance < different_id_distance_raw_threshold | max_p>=different_id_overlap_threshold)
+      filter(distance < different_id_distance_raw_threshold |(max_p >= different_id_overlap_threshold & relative_difference <= different_id_size_factor))
+  
+
     
     # if the overlap is great, set distance to 0
     join <- join %>%
@@ -780,7 +908,7 @@ if (reuse_ingestion_data==FALSE) {
       # Group by `new_rownumber_new` to check for presence of 'same_name' in each group
       group_by(new_rownumber_new) %>%
       mutate(
-        # Check if any record in the group has 'close_same_name'
+        # Check if other records in the group also have the same name
         same_name_count = sum(same_name, na.rm = TRUE)
       ) %>%
       ungroup() %>%
@@ -924,36 +1052,37 @@ if (reuse_ingestion_data==FALSE) {
     
     ### filter the likely updated ----
     # first remove the unlikely candidates (further away than the threshold to be taken in account)
-    # unless there is a good overlap
+    # unless there is a good overlap & the size difference isn't too big
     join <- join %>%
-      filter(distance < different_id_distance_raw_threshold | max_p>=different_id_overlap_threshold)
-    
+      filter(distance < different_id_distance_raw_threshold | (max_p>=different_id_overlap_threshold & relative_difference <= different_id_size_factor))
+   
     # only then count number of matches
     join <- join %>%
       group_by(new_rownumber_new) %>% # one could also use original_id_new here instead of new_rownumber_new. The difference is when dealing with cases where you have two "new" objects with the same ID that are pretty far away, and both have one decent match from the old data. With rownumber, these duos will be correctly matched, with original_id, they would still be considered as too hard to match.
-      mutate(count = n())
+      mutate(count = n()) %>%
+      ungroup()
     
-    ## TODO: add (optional) minimal thresholds on top of distance to decide to keep the same object ID
-    ## NOTE: For lines, the line length could be considered.
     # if there is more than one candidate, first select the ones with distance almost 0, and then count again
     join <- join %>%
       filter(count==1 | (count>1 & distance<1))
     
     join <- join %>%
       group_by(new_rownumber_new) %>%
-      mutate(count = n())
+      mutate(count = n()) %>%
+      ungroup()
     
     
-    # if distance < threshold parameter AND count = 1: we keep the id and update the attributes, keep the old metadata but fill in "updated_at" with today
+    # if distance < threshold parameter or the overlap is within parameter AND count = 1: we keep the id and update the attributes, keep the old metadata but fill in "updated_at" with today
     join <- join %>%
-      filter(distance < different_id_distance_unique_threshold & count==1)
+      filter((distance < different_id_distance_unique_threshold | (max_p>=different_id_overlap_threshold & relative_difference <= different_id_size_factor))  & count==1)
     
     # now test if we try to use the same old id more than once, order them by distance and create an ordered number
     join <- join %>%
       group_by(id) %>%
       arrange(distance) %>%
       mutate(rownumber = row_number()) %>%
-      mutate(count = n())
+      mutate(count = n()) %>%
+      ungroup()
     # keep only the first case if count > 1
     join <- join %>%
       filter(rownumber==1)
@@ -965,8 +1094,60 @@ if (reuse_ingestion_data==FALSE) {
     updated_for_visualization <- join
     
     updated <- as.data.frame(join)
+    
+    
+    # analyse if the objects actually did change
+    ## get the new geometry of the "updated" records
     updated <- updated %>%
-      select(new_rownumber_new, id)
+      left_join(
+        as.data.frame(new_ingestion) %>% select(new_rownumber, new_geometry = geometry),
+        by = c("new_rownumber_new" = "new_rownumber")
+      )
+
+    ## get the old geometry of the "updated" records (we get these from the clean copy of the old version we kept for the "deletions" dataset later on)
+    updated <- updated %>%
+      left_join(
+        as.data.frame(deletions) %>% select(id, old_geometry = geometry),
+        by = "id"
+      )   
+    
+    # make a "actually changed" flag 
+    updated <-  updated %>%
+      mutate(actually_changed=if_else(
+        differs(original_id, original_id_new) |
+          differs(name, name_new) |
+          differs(properties, properties_new) |
+          differs(properties_secondary, properties_secondary_new) |
+          differs(legend_item, legend_item_new) |
+          differs(legend_item_id, legend_item_id_new) |
+          differs(risk_level, risk_level_new) |
+          differs(data_list_id, data_list_id_new) |
+          differs(sf::st_as_text(old_geometry), sf::st_as_text(new_geometry)),
+        1, 0))
+    
+    updated <-  updated %>%
+      mutate(diff_original_id = if_else(differs(original_id, original_id_new),1,0),
+             diff_prop = if_else(differs(properties, properties_new),1,0),
+             diff_prop2 = if_else(differs(properties_secondary, properties_secondary_new),1,0),
+             diff_li = if_else(differs(legend_item, legend_item_new),1,0),
+             diff_li2 = if_else(differs(legend_item_id, legend_item_id_new),1,0),
+             diff_risk_level = if_else(differs(risk_level, risk_level_new),1,0),
+             diff_data_list = if_else(differs(data_list_id, data_list_id_new),1,0),
+             diff_geometry = if_else(differs(sf::st_as_text(old_geometry), sf::st_as_text(new_geometry)),1,0))
+
+    # Create a summary dataframe
+    update_summary <- updated %>%
+      sf::st_drop_geometry() %>%   # only needed if `updated` is an sf object
+      summarise(
+        n = n(),
+        across(starts_with("diff_"), ~ sum(.x, na.rm = TRUE))
+      )
+    print("Summary of what exactly changed in the 'updated' group (these are only those records that were *not* matched based on original_id)")
+    capture <- capture.output(print(t(update_summary), row.names=FALSE))
+    cat(paste(capture, collapse="\n"), "\n")
+    
+    updated <- updated %>%
+      select(new_rownumber_new, id, actually_changed, diff_original_id)
     
     new_ingestion_updated <- left_join(new_ingestion, updated, by = c("new_rownumber"="new_rownumber_new"))
     # this dataset now contains the new objects (without an id) & the updated objects (with an id)
@@ -999,8 +1180,10 @@ if (reuse_ingestion_data==FALSE) {
     # merge the old metadata to the new data
     new_ingestion_updated <- left_join(new_ingestion_updated, old_metadata, by = "id")
     
+    # set the updated_at to today, unless we detected the data didn't actually change
     new_ingestion_updated <- new_ingestion_updated %>%
-      mutate(updated_at = Sys.Date())
+      mutate(updated_at = if_else(actually_changed==0,updated_at,Sys.Date())) %>%
+      select(-actually_changed)
     
     
     
@@ -1031,19 +1214,49 @@ if (reuse_ingestion_data==FALSE) {
   }
   #end large if
   
-  
+  not_today <- function(x) is.na(x) | as.Date(x) != Sys.Date() 
 
-  
   # add potentially existing extra geometry columns
   if (!is.null(new_ingestion_extra_geom)) {
     # make sure the geometries are recognized as such
-    new_ingestion_extra_geom<-st_as_sf(new_ingestion_extra_geom, wkt="geometry_pt")
-    new_ingestion_extra_geom$geometry_pt <- st_set_crs(new_ingestion_extra_geom$geometry_pt, 4326)
-    new_ingestion_extra_geom<-as.data.frame(new_ingestion_extra_geom)
-    new_ingestion_extra_geom<-st_as_sf(new_ingestion_extra_geom, wkt="geometry_pg")
-    new_ingestion_extra_geom$geometry_pg <- st_set_crs(new_ingestion_extra_geom$geometry_pg, 4326)
-    new_ingestion_extra_geom<-as.data.frame(new_ingestion_extra_geom)
+    new_ingestion_extra_geom <- new_ingestion_extra_geom %>%
+      mutate(
+        geometry_pg = st_as_sfc(structure(geometry_pg, class = "WKB"), EWKB = TRUE),
+        geometry_pt = st_as_sfc(structure(geometry_pt, class = "WKB"), EWKB = TRUE)
+      ) %>%
+      mutate(
+        geometry_pg = st_set_crs(geometry_pg, 4326),
+        geometry_pt = st_set_crs(geometry_pt, 4326)
+      ) %>%
+      as.data.frame()
     table_to_push_to_sql <- left_join(table_to_push_to_sql, new_ingestion_extra_geom, by = "original_id")  
+    
+    # add the old versions of the geometries
+    old_transformation_extra_geom <- old_transformation_extra_geom %>%
+      mutate(
+        geometry_pg_old = st_as_sfc(structure(geometry_pg_old, class = "WKB"), EWKB = TRUE),
+        geometry_pt_old = st_as_sfc(structure(geometry_pt_old, class = "WKB"), EWKB = TRUE)
+      ) %>%
+      mutate(
+        geometry_pg_old = st_set_crs(geometry_pg_old, 4326),
+        geometry_pt_old = st_set_crs(geometry_pt_old, 4326)
+      ) %>%
+      as.data.frame()
+    table_to_push_to_sql <- left_join(table_to_push_to_sql, old_transformation_extra_geom, by = "id")
+
+    # if the object is not new, delete or already marked as updated, and the extra geometry fields have changed, mark the record as updated
+    table_to_push_to_sql <- table_to_push_to_sql %>%
+      mutate(updated_at = if_else(
+        not_today(created_at) &
+        not_today(deleted_at) &
+        not_today(updated_at) &
+        differs(sf::st_as_text(geometry_pt), sf::st_as_text(geometry_pt_old)) &
+        differs(sf::st_as_text(geometry_pg), sf::st_as_text(geometry_pg_old)),
+        Sys.Date(),
+        updated_at
+      ))
+    table_to_push_to_sql <- table_to_push_to_sql %>%
+      select(-geometry_pt_old, -geometry_pg_old)
   }
   
   # Importing JSONB is apparently an issue, so we first turn those fields into text
@@ -1057,12 +1270,19 @@ if (reuse_ingestion_data==FALSE) {
   # turn into SF object, to avoid errors when uploading to Postgres
   table_without_jsonb<-st_as_sf(table_without_jsonb)
   
+  # these test columns are practical so we can use the tst dataset to render visualizations directly
+  table_without_jsonb$new     <- as.integer(!not_today(table_without_jsonb$created_at))
+  table_without_jsonb$deleted <- as.integer(!not_today(table_without_jsonb$deleted_at))
+  table_without_jsonb$updated <- as.integer(!not_today(table_without_jsonb$updated_at))
+  table_without_jsonb$source_identifier <- source_identifier
+  table_without_jsonb$process_timestamp <- Sys.time()
+  
   # now push it to a Postgres test table
   con_pg<-get_con()
   table_id <- DBI::Id(
-    schema  = "tst",
+    schema  = "proposed_updates",
     table   = pgsql_table_name)
-  table_id_t <- paste0("tst.",pgsql_table_name)
+  table_id_t <- paste0("proposed_updates.",pgsql_table_name)
   print(paste0("Import temporary transformation table to postgres at ", table_id_t))
   dbWriteTable(con_pg, table_id, table_without_jsonb, overwrite = TRUE, row.names = FALSE )
   dbExecute(con_pg,paste0("ALTER TABLE IF EXISTS ",table_id_t," OWNER to pgn_group_data_team_w;"))
@@ -1079,11 +1299,10 @@ if (reuse_ingestion_data==FALSE) {
   # Get number of cases with broken geometry or without a name
   ### NOTE: since we just compare the dates of the objects with today, we can get false detections if we run the same process twice in the same day. A simple solution could be to save all dates in transformation as exact timestamps, and then compare the dates here with the timestamp of the start of the process.
   table_without_jsonb_test<-table_without_jsonb
-  table_without_jsonb_test$new     <- ifelse(is.na(table_without_jsonb_test$created_at), 0, ifelse(table_without_jsonb_test$created_at == Sys.Date(), 1, 0))
-  table_without_jsonb_test$deleted <- ifelse(is.na(table_without_jsonb_test$deleted_at), 0, ifelse(table_without_jsonb_test$deleted_at == Sys.Date(), 1, 0))
-  table_without_jsonb_test$updated <- ifelse(is.na(table_without_jsonb_test$updated_at), 0, ifelse(table_without_jsonb_test$updated_at == Sys.Date(), 1, 0))
   table_without_jsonb_test$n <- 1
   table_without_jsonb_test$noname <- ifelse(is.na(table_without_jsonb_test$name) | table_without_jsonb_test$name == "" | table_without_jsonb_test$name == '{"und": ""}' | table_without_jsonb_test$name == '{"und": }' , 1, 0)
+  table_without_jsonb_test$nolegenditemid <- ifelse(is.na(table_without_jsonb_test$legend_item_id), 1, 0)
+  table_without_jsonb_test$nodatalistid <- ifelse(is.na(table_without_jsonb_test$data_list_id), 1, 0)
   
 # count the number of times an id was used
  duplicates <- table_without_jsonb_test %>%
@@ -1109,6 +1328,9 @@ if (reuse_ingestion_data==FALSE) {
   sum_updated <- sum(table_without_jsonb_test$updated)
   sum_n <- sum(table_without_jsonb_test$n)
   sum_noname <- sum(table_without_jsonb_test$noname)
+  sum_nolegenditemid <- sum(table_without_jsonb_test$nolegenditemid)
+  sum_nodatalistid <- sum(table_without_jsonb_test$nodatalistid)
+  
   
   
   
@@ -1125,7 +1347,7 @@ if (reuse_ingestion_data==FALSE) {
   
   
   # Create a summary dataframe
-  check_smart_update <- data.frame(new = sum_new, deleted = sum_deleted, updated = sum_updated, n = sum_n, invalid_geo=sum_invalidgeo, no_geo=sum_nogeo, noname=sum_noname, old_bbox=bbox_old_transformation, new_bbox=bbox_new)
+  check_smart_update <- data.frame(new = sum_new, deleted = sum_deleted, updated = sum_updated, n = sum_n, invalid_geo=sum_invalidgeo, no_geo=sum_nogeo, noname=sum_noname, nolegenditemid=sum_nolegenditemid, nodatalistid=sum_nodatalistid, old_bbox=bbox_old_transformation, new_bbox=bbox_new)
   
   if (
     # Check if any of new/updated/deleted percentage exceeds 10%
@@ -1134,6 +1356,8 @@ if (reuse_ingestion_data==FALSE) {
     sum(check_smart_update$updated) / sum(check_smart_update$n) * 100 > 10 ||
     # Check if there are any cases without a name or with no/broken geometry 
     sum(check_smart_update$noname) > 0 || sum(check_smart_update$invalid_geo) > 0 || sum(check_smart_update$no_geo) > 0 ||
+    # Check for missing IDs
+    sum(check_smart_update$sum_nolegenditemid) > 0 || sum(check_smart_update$nodatalistid) > 0 ||
     # Check if BBOX size changed significantly
     abs(bbox_new - bbox_old_transformation)/bbox_old_transformation*100 > 10)
   { 
@@ -1142,38 +1366,37 @@ if (reuse_ingestion_data==FALSE) {
     check_smart_update$failed_check <- 0
   }
   
-  if (sum(check_smart_update$failed_check)>0) {
-    print("Smart update checks failed.")
-  } else {
-    print("Smart update checks passed.")
-  }
-  
   
   # Overrule checks if user asked to do so
   if (allow_update_even_if_checks_fail == TRUE & sum(check_smart_update$failed_check)>0) {
-    smart_update_checks_failed = 0
+    smart_update_checks_failed <- FALSE 
     print("Smart update checks failed, but we are allowing the update to continue anyway.")
+  } else if (sum(check_smart_update$failed_check)>0) {
+    smart_update_checks_failed <- TRUE
+    print("Smart update checks failed")
   } else {
-    smart_update_checks_failed = sum(check_smart_update$failed_check)
+    smart_update_checks_failed <- FALSE
+    print("Smart update checks passed")
   }
-  
 
   
   # Write a report ----
   filename <- paste0(log_folder,"/",format(Sys.time(), "%Y%m%d_%H%M%S"),"_smartupdate_",pgsql_table_name,"_",source_identifier)
   
-  
+
   # Add transformation check
-  cat("Summary of the proposed update:
+  cat("Summary of the proposed update (updated=same Paragon ID, but any other ingredient changed):
       ")
-  print(t(check_smart_update), row.names=FALSE)
+  capture <- capture.output(print(t(check_smart_update), row.names=FALSE))
+  cat(paste(capture, collapse="\n"), "\n")
+			
   #write.table(t(check_smart_update), paste0(filename,".txt"), sep = "\t", quote = FALSE, row.names=TRUE, append = TRUE)
   #cat("# If there is a large number of new, deleted or updated cases, the check fails (as we want to do a manual review to check if this is realistic) \n\n", file = filename, append = TRUE)
   #print(paste0("Report about the transformation table update for ", pgsql_table_name, " written to ", filename))
 
 #write to gpkg for inspection (note that "unchanged" and updated cases will only show the new version)
 st_write(table_without_jsonb_test, paste0(filename , ".gpkg"))
-
+print(paste0("Dataset to visualize the (proposed) changes available at ",paste0(filename , ".gpkg"))) 
 
 # OPTIONAL: line dataset to visualize the changes ----
 if (visualise_changes == TRUE) {
@@ -1291,73 +1514,112 @@ print(paste0("Visualisation datasets created at ", filename_visualization))
   # prepare the actual update ----
   ### existing id's get an update of all EXCLUDED fields (because they have been updated or deleted); new id's get inserted
   # the query changes depending on the available geometries
-  UpdateTransformationsSQL <- character()
+  #UpdateTransformationsSQL <- character()
   
   if (exists("new_ingestion_extra_geom") && !is.null(new_ingestion_extra_geom)) {
     # query if three geometry fields are available
-    UpdateTransformationsSQL <- c(
-      paste0("INSERT INTO transformation.",pgsql_table_name,"
+    UpdateTransformationsSQL <- #c(
+      paste0("INSERT INTO transformation.",pgsql_table_name," AS t
              (id, original_id, name, legend_item, legend_item_id, data_list_id, risk_level, properties, properties_secondary, imported_at, tags, deleted_at, updated_at, created_at, created_by, updated_by, geometry,geometry_pg,geometry_pt)",
              "\n SELECT id::uuid, original_id,name::jsonb,legend_item::jsonb,legend_item_id::uuid,data_list_id::uuid,
 risk_level,properties::jsonb,properties_secondary::jsonb,imported_at,tags::jsonb,
 deleted_at,updated_at,created_at,created_by::uuid,updated_by::uuid,geometry,geometry_pg,geometry_pt
-FROM tst.",pgsql_table_name, 
+FROM proposed_updates.",pgsql_table_name, 
              "\n ON CONFLICT (id) DO UPDATE
 SET 
-original_id = EXCLUDED.original_id,
-name = EXCLUDED.name,
-legend_item = EXCLUDED.legend_item,
-legend_item_id = EXCLUDED.legend_item_id,
-data_list_id = EXCLUDED.data_list_id,
-risk_level = EXCLUDED.risk_level,
-properties = EXCLUDED.properties,
-properties_secondary = EXCLUDED.properties_secondary,
-imported_at = EXCLUDED.imported_at,
-tags = EXCLUDED.tags,
-deleted_at = EXCLUDED.deleted_at,
-updated_at = EXCLUDED.updated_at,
-created_at = EXCLUDED.created_at,
-created_by = EXCLUDED.created_by,
-updated_by = EXCLUDED.updated_by,
-geometry = EXCLUDED.geometry,
-geometry_pg = EXCLUDED.geometry_pg,
-geometry_pt = EXCLUDED.geometry_pt;"),
-      paste0("DROP TABLE IF EXISTS tst.",pgsql_table_name,";"))
-    
+  original_id = EXCLUDED.original_id,
+  name = EXCLUDED.name,
+  legend_item = EXCLUDED.legend_item,
+  legend_item_id = EXCLUDED.legend_item_id,
+  data_list_id = EXCLUDED.data_list_id,
+  risk_level = EXCLUDED.risk_level,
+  properties = EXCLUDED.properties,
+  properties_secondary = EXCLUDED.properties_secondary,
+  imported_at = EXCLUDED.imported_at,
+  tags = EXCLUDED.tags,
+  deleted_at = EXCLUDED.deleted_at,
+  updated_at = EXCLUDED.updated_at,
+  created_at = EXCLUDED.created_at,
+  created_by = EXCLUDED.created_by,
+  updated_by = EXCLUDED.updated_by,
+  geometry = EXCLUDED.geometry,
+  geometry_pg = EXCLUDED.geometry_pg,
+  geometry_pt = EXCLUDED.geometry_pt
+WHERE 
+  t.original_id IS DISTINCT FROM EXCLUDED.original_id OR
+  t.name IS DISTINCT FROM EXCLUDED.name OR
+  t.legend_item IS DISTINCT FROM EXCLUDED.legend_item OR
+  t.legend_item_id IS DISTINCT FROM EXCLUDED.legend_item_id OR
+  t.data_list_id IS DISTINCT FROM EXCLUDED.data_list_id OR
+  t.risk_level IS DISTINCT FROM EXCLUDED.risk_level OR
+  t.properties IS DISTINCT FROM EXCLUDED.properties OR
+  t.properties_secondary IS DISTINCT FROM EXCLUDED.properties_secondary OR
+  t.imported_at IS DISTINCT FROM EXCLUDED.imported_at OR
+  t.tags IS DISTINCT FROM EXCLUDED.tags OR
+  t.deleted_at IS DISTINCT FROM EXCLUDED.deleted_at OR
+  t.updated_at IS DISTINCT FROM EXCLUDED.updated_at OR
+  t.created_at IS DISTINCT FROM EXCLUDED.created_at OR
+  t.created_by IS DISTINCT FROM EXCLUDED.created_by OR
+  t.updated_by IS DISTINCT FROM EXCLUDED.updated_by OR
+  t.geometry IS DISTINCT FROM EXCLUDED.geometry OR
+  t.geometry_pg IS DISTINCT FROM EXCLUDED.geometry_pg OR
+  t.geometry_pt IS DISTINCT FROM EXCLUDED.geometry_pt
+RETURNING id;")
   } else {   
     # query if only one geometry field is available    
-    UpdateTransformationsSQL <- c(
-      paste0("INSERT INTO transformation.",pgsql_table_name,"
+    UpdateTransformationsSQL <- #c(
+      paste0("INSERT INTO transformation.",pgsql_table_name," AS t
              (id, original_id, name, legend_item, legend_item_id, data_list_id, risk_level, properties, properties_secondary, imported_at, tags, deleted_at, updated_at, created_at, created_by, updated_by, geometry)",
              "\n SELECT id::uuid, original_id,name::jsonb,legend_item::jsonb,legend_item_id::uuid,data_list_id::uuid,
 risk_level,properties::jsonb,properties_secondary::jsonb,imported_at,tags::jsonb,
 deleted_at,updated_at,created_at,created_by::uuid,updated_by::uuid,geometry
-FROM tst.",pgsql_table_name, 
+FROM proposed_updates.",pgsql_table_name, 
              "\n ON CONFLICT (id) DO UPDATE
 SET 
-original_id = EXCLUDED.original_id,
-name = EXCLUDED.name,
-legend_item = EXCLUDED.legend_item,
-legend_item_id = EXCLUDED.legend_item_id,
-data_list_id = EXCLUDED.data_list_id,
-risk_level = EXCLUDED.risk_level,
-properties = EXCLUDED.properties,
-properties_secondary = EXCLUDED.properties_secondary,
-imported_at = EXCLUDED.imported_at,
-tags = EXCLUDED.tags,
-deleted_at = EXCLUDED.deleted_at,
-updated_at = EXCLUDED.updated_at,
-created_at = EXCLUDED.created_at,
-created_by = EXCLUDED.created_by,
-updated_by = EXCLUDED.updated_by,
-geometry = EXCLUDED.geometry;"),
-      paste0("DROP TABLE IF EXISTS tst.",pgsql_table_name,";"))
+  original_id = EXCLUDED.original_id,
+  name = EXCLUDED.name,
+  legend_item = EXCLUDED.legend_item,
+  legend_item_id = EXCLUDED.legend_item_id,
+  data_list_id = EXCLUDED.data_list_id,
+  risk_level = EXCLUDED.risk_level,
+  properties = EXCLUDED.properties,
+  properties_secondary = EXCLUDED.properties_secondary,
+  imported_at = EXCLUDED.imported_at,
+  tags = EXCLUDED.tags,
+  deleted_at = EXCLUDED.deleted_at,
+  updated_at = EXCLUDED.updated_at,
+  created_at = EXCLUDED.created_at,
+  created_by = EXCLUDED.created_by,
+  updated_by = EXCLUDED.updated_by,
+  geometry = EXCLUDED.geometry
+WHERE 
+  t.original_id IS DISTINCT FROM EXCLUDED.original_id OR
+  t.name IS DISTINCT FROM EXCLUDED.name OR
+  t.legend_item IS DISTINCT FROM EXCLUDED.legend_item OR
+  t.legend_item_id IS DISTINCT FROM EXCLUDED.legend_item_id OR
+  t.data_list_id IS DISTINCT FROM EXCLUDED.data_list_id OR
+  t.risk_level IS DISTINCT FROM EXCLUDED.risk_level OR
+  t.properties IS DISTINCT FROM EXCLUDED.properties OR
+  t.properties_secondary IS DISTINCT FROM EXCLUDED.properties_secondary OR
+  t.imported_at IS DISTINCT FROM EXCLUDED.imported_at OR
+  t.tags IS DISTINCT FROM EXCLUDED.tags OR
+  t.deleted_at IS DISTINCT FROM EXCLUDED.deleted_at OR
+  t.updated_at IS DISTINCT FROM EXCLUDED.updated_at OR
+  t.created_at IS DISTINCT FROM EXCLUDED.created_at OR
+  t.created_by IS DISTINCT FROM EXCLUDED.created_by OR
+  t.updated_by IS DISTINCT FROM EXCLUDED.updated_by OR
+  t.geometry IS DISTINCT FROM EXCLUDED.geometry
+RETURNING id;")
   }
+  
+  # We do not drop the test table anymore because we use it for visualizing
+  #DropTstTable <- paste0("DROP TABLE IF EXISTS tst.",pgsql_table_name,";")
+  
   # create backup ----
   # for the time being, we create backups of the transformation table. This can be dropped in the future.
   BackupTransformationsSQL <- c(
     paste0("-- create an empty table if it does not exist yet
-CREATE TABLE IF NOT EXISTS tst.backups_transformation_",pgsql_table_name," AS
+CREATE TABLE IF NOT EXISTS running_backups.backups_transformation_",pgsql_table_name," AS
 SELECT id, original_id,name,legend_item,data_list_id,risk_level,properties,properties_secondary,
 imported_at,tags,deleted_at,updated_at,created_at,created_by,updated_by,geometry, CURRENT_TIMESTAMP AS backup_at, legend_item_id FROM transformation.",pgsql_table_name,"
 WITH NO DATA;
@@ -1366,27 +1628,27 @@ WITH NO DATA;
 DO $$ 
 BEGIN
   -- Check if the table is empty
-  IF NOT EXISTS (SELECT 1 FROM tst.backups_transformation_",pgsql_table_name,") THEN
+  IF NOT EXISTS (SELECT 1 FROM running_backups.backups_transformation_",pgsql_table_name,") THEN
     -- If the table is empty, perform the initial insertion
-    INSERT INTO tst.backups_transformation_",pgsql_table_name,"
+    INSERT INTO running_backups.backups_transformation_",pgsql_table_name,"
     SELECT id, original_id,name,legend_item,data_list_id,risk_level,
 	properties,properties_secondary,imported_at,tags,deleted_at,updated_at,created_at,
 	created_by,updated_by,", if (exists("new_ingestion_extra_geom") && !is.null(new_ingestion_extra_geom)) {"geometry, geometry_pg, geometry_pt"} else {"geometry"},
 	", CURRENT_TIMESTAMP AS backup_at, legend_item_id FROM transformation.",pgsql_table_name,";
-	  ALTER TABLE IF EXISTS tst.backups_transformation_",pgsql_table_name," OWNER to pgn_group_data_team_w;
-    GRANT ALL ON TABLE tst.backups_transformation_",pgsql_table_name," TO pgn_group_data_team_w;
-    GRANT ALL ON TABLE tst.backups_transformation_",pgsql_table_name," TO pgn_user_airflow;
+	  ALTER TABLE IF EXISTS running_backups.backups_transformation_",pgsql_table_name," OWNER to pgn_group_data_team_w;
+    GRANT ALL ON TABLE running_backups.backups_transformation_",pgsql_table_name," TO pgn_group_data_team_w;
+    GRANT ALL ON TABLE running_backups.backups_transformation_",pgsql_table_name," TO pgn_user_airflow;
   ELSE
     -- If the table is not empty, check the most recent backup_at date
     DECLARE
     recent_backup_date TIMESTAMP;
     BEGIN
       SELECT MAX(backup_at) INTO recent_backup_date
-      FROM tst.backups_transformation_",pgsql_table_name,";
+      FROM running_backups.backups_transformation_",pgsql_table_name,";
       -- Compare the most recent backup_at date with the current timestamp
       IF (CURRENT_TIMESTAMP - recent_backup_date) >= INTERVAL '3 days' THEN
         -- If the most recent date is at least three days old, perform the insertion
-        INSERT INTO tst.backups_transformation_",pgsql_table_name,"
+        INSERT INTO running_backups.backups_transformation_",pgsql_table_name,"
         SELECT id, original_id,name,legend_item,data_list_id,risk_level,
 	properties,properties_secondary,imported_at,tags,deleted_at,updated_at,created_at,
 	created_by,updated_by,", if (exists("new_ingestion_extra_geom") && !is.null(new_ingestion_extra_geom)) {"geometry, geometry_pg, geometry_pt"} else {"geometry"},
@@ -1402,7 +1664,7 @@ DECLARE
 BEGIN
   -- Count the number of distinct dates in backup_at
   SELECT COUNT(DISTINCT backup_at) INTO distinct_dates_count
-  FROM tst.backups_transformation_",pgsql_table_name,";
+  FROM running_backups.backups_transformation_",pgsql_table_name,";
   IF distinct_dates_count > 10 THEN
     -- Determine the 10th most recent date
     DECLARE
@@ -1411,14 +1673,14 @@ BEGIN
       SELECT backup_at INTO cutoff_date
       FROM (
       SELECT backup_at
-      FROM tst.backups_transformation_",pgsql_table_name,"
+      FROM running_backups.backups_transformation_",pgsql_table_name,"
       ORDER BY backup_at DESC -- Order by descending to get the most recent dates first
       LIMIT 10 -- Select the top 10 dates
       ) AS recent_dates
       ORDER BY backup_at -- Order again in ascending to get the 10th most recent date
       LIMIT 1; -- Retrieve the 10th most recent date
       -- Delete rows older than the 10th most recent date
-      DELETE FROM tst.backups_transformation_",pgsql_table_name,"
+      DELETE FROM running_backups.backups_transformation_",pgsql_table_name,"
       WHERE backup_at < cutoff_date;
     END;
   END IF;
@@ -1426,113 +1688,84 @@ END $$;"))
   
 ### Update the data list with the most recent updated_at date ----
 
-if (reuse_ingestion_data==FALSE) {
-# Note: if there is no change in the data, the updated_at date will not be updated
-# create a list of the data_list_id's in table_without_jsonb with their most recent updated_at, created_at and deleted_at date
-data_list_id <- as.data.frame(table_without_jsonb) %>%
-  group_by(data_list_id) %>%
-  summarise(
-    updated_at = ifelse(suppressWarnings(max(updated_at, na.rm = TRUE)) == -Inf, NA, max(updated_at, na.rm = TRUE)),
-    created_at = ifelse(suppressWarnings(max(created_at, na.rm = TRUE)) == -Inf, NA, max(created_at, na.rm = TRUE)),
-    deleted_at = ifelse(suppressWarnings(max(deleted_at, na.rm = TRUE)) == -Inf, NA, max(deleted_at, na.rm = TRUE))
-  )
-
-
-# set updated_at to the most recent date of the three created
-data_list_id$updated_at <- as.POSIXct(pmax(data_list_id$updated_at, data_list_id$created_at, data_list_id$deleted_at, na.rm = TRUE), origin = "1970-01-01", tz = "UTC")
-data_list_id <- data_list_id %>% select(data_list_id, updated_at)
-
 # send to postgres
 UploadDataList <- function() {
-con_pg<-get_con()
-table_id <- DBI::Id(
-  schema  = "tst",
-  table   = paste0("data_list_update_", pgsql_table_name))
-table_id_t <- paste0("tst.data_list_update_", pgsql_table_name)
-dbWriteTable(con_pg, table_id, data_list_id, overwrite = TRUE, row.names = FALSE )
-print(paste0("Imported data_list_update to postgres at ", table_id_t))
-dbExecute(con_pg,paste0("ALTER TABLE IF EXISTS ",table_id_t," OWNER to pgn_group_data_team_w;"))
-dbExecute(con_pg,paste0("GRANT ALL ON TABLE ",table_id_t," TO pgn_group_data_team_w;"))
-dbExecute(con_pg,paste0("GRANT ALL ON TABLE ",table_id_t," TO pgn_user_airflow;"))
-dbDisconnect(con_pg) 
-
-
-print(paste0("Dataset to visualize the (proposed) changes available at ",paste0(filename , ".gpkg")))  
-}
-
-} else {
-  # no upload needed
+  # Prepare data list dataset
+  # Note: if there is no change in the data, the updated_at date will not be updated
+  # create a list of the data_list_id's in table_without_jsonb with their most recent updated_at, created_at and deleted_at date
+  data_list_id <- as.data.frame(table_without_jsonb) %>%
+    group_by(data_list_id) %>%
+    summarise(
+      updated_at = ifelse(suppressWarnings(max(updated_at, na.rm = TRUE)) == -Inf, NA, max(updated_at, na.rm = TRUE)),
+      created_at = ifelse(suppressWarnings(max(created_at, na.rm = TRUE)) == -Inf, NA, max(created_at, na.rm = TRUE)),
+      deleted_at = ifelse(suppressWarnings(max(deleted_at, na.rm = TRUE)) == -Inf, NA, max(deleted_at, na.rm = TRUE))
+    )
+  
+  
+  # set updated_at to the most recent date of the three created
+  data_list_id$updated_at <- as.POSIXct(pmax(data_list_id$updated_at, data_list_id$created_at, data_list_id$deleted_at, na.rm = TRUE), origin = "1970-01-01", tz = "UTC")
+  data_list_id <- data_list_id %>% select(data_list_id, updated_at)
+  
+  # Actual upload of the data list data
+  con_pg<-get_con()
+  table_id <- DBI::Id(
+    schema  = "running_backups",
+    table   = paste0("data_list_update_", pgsql_table_name))
+  table_id_t <- paste0("running_backups.data_list_update_", pgsql_table_name)
+  dbWriteTable(con_pg, table_id, data_list_id, overwrite = TRUE, row.names = FALSE )
+  print(paste0("Imported data_list_update to postgres at ", table_id_t))
+  dbExecute(con_pg,paste0("ALTER TABLE IF EXISTS ",table_id_t," OWNER to pgn_group_data_team_w;"))
+  dbExecute(con_pg,paste0("GRANT ALL ON TABLE ",table_id_t," TO pgn_group_data_team_w;"))
+  dbExecute(con_pg,paste0("GRANT ALL ON TABLE ",table_id_t," TO pgn_user_airflow;"))
+  dbDisconnect(con_pg) 
 }
 
 # write the update sql
 UpdateDataList <- c(
   paste0("UPDATE parameterization.data_list p
   SET update_at = d.updated_at
-  FROM tst.data_list_update_",pgsql_table_name," d
+  FROM running_backups.data_list_update_",pgsql_table_name," d
   WHERE p.id = d.data_list_id::uuid;")
   )
 
   
 # Main update function ----  
 
-# we always prepare the table to update the data list with, becuase if it's a dry run or or the checks fail, we still need it available if the user then later does a reuse_ingestion_data run
+## 1. the data list update should be written as a draft when we actually process data ----
+# though we will only actually write it to the data list when we do a real update
 if (reuse_ingestion_data==FALSE) {
-con_pg <- get_con()
-UploadDataList()
-dbDisconnect(con_pg)
+  UploadDataList()
 }
-  # only run the update if the checks are passed and dry run is false. That means the tst table is kept if the checks fail
-  if (exists("smart_update_checks_failed") && smart_update_checks_failed == 0 && !dry_run && !reuse_ingestion_data) {
-    con_pg <- get_con()
-    tryCatch(
-      {
-        for (sql_command in BackupTransformationsSQL) {
-          dbExecute(con_pg, sql_command)
-        }
-        print(paste0("Transformation table ", pgsql_table_name, " backed up succesfully"))
-        
-        # Now, proceed with the update only if backup was successful
-        tryCatch(
-          {
-            for (sql_command in UpdateTransformationsSQL) {
-              dbExecute(con_pg, sql_command)
-            }
-            print(paste0("SUCCESS! Transformation table ", pgsql_table_name, " updated succesfully"))
-            # update the data_list table if the transformation table was updated
-            tryCatch(
-              {
-                for (sql_command in UpdateDataList) {
-                  dbExecute(con_pg, sql_command)
-                }
-                print(paste0("Data list updated succesfully"))
-              }, 
-              error = function(err) {
-                print(err)
-                stop(paste0("The SQL function to update the data list failed."))
-                })
-          },
-          error = function(err) {
-            print(err)  # Print the error message for more details
-            stop(paste0("The SQL function to update the transformation table ", pgsql_table_name, " failed"))
-          }
-        )
-      },
-      error = function(err) {
-        print(err)  # Print the error message for more details
-        stop(paste0("The SQL function to backup the transformation table ", pgsql_table_name, " failed, so we did NOT run the table update."))
+
+## 2. Main update process when it's not a dry run and the checks did not fail
+# the rest of the structure is to make sure it stops when it fails
+# initialize updated_uuids so it always exists
+updated_uuids <- NULL
+
+if (((exists("smart_update_checks_failed") && smart_update_checks_failed == FALSE) # the checks did not fail during the import test we just ran
+      ||
+      reuse_ingestion_data == TRUE) # or we already did a dry run (we assume the user will only reuse ingestion data after actually having reviewed it!)
+    &&
+    !dry_run) # and we're not just testing
+  {
+  con_pg <- get_con()
+  tryCatch(
+    {
+      for (sql_command in BackupTransformationsSQL) {
+        dbExecute(con_pg, sql_command)
       }
-    )
-    dbDisconnect(con_pg)
-  } else {
-    if (reuse_ingestion_data==TRUE) {
-     con_pg <- get_con()
-     # do ONLY transformation table update & do data list update
+      print(paste0("Transformation table ", pgsql_table_name, " backed up succesfully"))
+      
+      # Now, proceed with the update only if backup was successful
       tryCatch(
         {
-          for (sql_command in UpdateTransformationsSQL) {
-            dbExecute(con_pg, sql_command)
-          }
-          print(paste0("SUCCESS! Transformation table ", pgsql_table_name, " updated succesfully based on ingestion table of the previous run"))
+          #for (sql_command in UpdateTransformationsSQL) {
+          updated_uuids <- dbGetQuery(con_pg, UpdateTransformationsSQL) #sql_command)
+          # We do not drop the test table anymore because we use it for visualizing
+          #dbExecute(con_pg, DropTstTable)
+          #}
+          print(paste0("SUCCESS! Transformation table ", pgsql_table_name, " updated succesfully"))
+          
           # update the data_list table if the transformation table was updated
           tryCatch(
             {
@@ -1551,16 +1784,27 @@ dbDisconnect(con_pg)
           stop(paste0("The SQL function to update the transformation table ", pgsql_table_name, " failed"))
         }
       )
-      dbDisconnect(con_pg)
-  } else {
-    if (!dry_run) {
-      stop(paste0(pgsql_table_name," transformation table not updated due to failed checks."))
-    } else {
-      print(paste0("Transformation table not updated because this is just a dry run. Data comparison report available at ",filename,".gpkg"))
+    },
+    error = function(err) {
+      print(err)  # Print the error message for more details
+      stop(paste0("The SQL function to backup the transformation table ", pgsql_table_name, " failed, so we did NOT run the table update."))
     }
-  }
-  
+  )
+  dbDisconnect(con_pg)
 }
+  
+# when it is a dry run, we just print the result
+if (dry_run) {
+    print(paste0("Transformation table not updated because this is just a dry run."))
+}
+
+# when the checks failed we just print checks failed
+if (exists("smart_update_checks_failed") && smart_update_checks_failed == TRUE) {
+  stop(paste0(pgsql_table_name," transformation table not updated due to failed checks."))
+}
+
+# make the updated_uuids available without printing them
+return(invisible(updated_uuids))
 
 }
 # END SMART UPDATE FUNCTION ----

@@ -28,6 +28,8 @@ li_river_class_3 <- "8d29ae2d-9ff5-4585-aa4d-02cd11230535"
 li_river_navigable <- "b299344f-29f4-4659-8ad0-cba46612b791"
 li_river_unclasified <- "c5cb53a8-101c-4353-a79f-ec9c41621655"
 li_river_ditch <- "094094b5-3c5a-4249-9a05-5ebabdde52ca"
+li_river_unknown <- "b55056a3-71d8-444d-b82a-fd12f2d9fbda"
+
 
 #readRenviron("C:/projects/pgn-data-airflow/.Renviron")
 
@@ -70,7 +72,7 @@ source(paste0(rscript_folder,"/utils.R"))
 
 # extra libraries
 library(xml2)
-
+library(arcgislayers) # for the Wallonia ArcGIS REST service
 
 
 # EXTRACT -----------------------------------------------------------
@@ -81,19 +83,29 @@ process_fresh_data <- function(){
   # Default: download fresh data
   if (reuse_ingestion_data==FALSE) {
     
+    options(cli.progress_show_after = Inf)
+    
+    # retry loop for arcgis services
+    arc_select_try_loop <- function(service, max_tries = 3, wait_seconds = 5) {
+      for (attempt in seq_len(max_tries)) {
+        result <- tryCatch(
+          arc_select(service,  where = "LONGUEUR > 0"), # added length filter to remove objects with invalid geometry
+          error = function(e) {
+            message(sprintf("Attempt %d failed: %s", attempt, conditionMessage(e)))
+            NULL
+          }
+        )
+        if (!is.null(result)) return(result)
+        Sys.sleep(wait_seconds)
+      }
+      stop("arc_select failed after ", max_tries, " attempts")
+    }
+    
+    
     # Download Wallonia data ----
-    
-    # Proper ArcGIS REST API query for all data as GeoJSON
-    query_url <- paste0(
-      "https://geoservices.wallonie.be/arcgis/rest/services/EAU/RES_HYDRO_WAL/MapServer/1/query?",
-      "where=1=1",
-      "&outFields=*",
-      "&f=geojson"
-    )
-    
-    # Download and read spatial data
-    axes_hydro_wal <- st_read(query_url)
-    
+    wal_hydro_service <- arc_open("https://geoservices.wallonie.be/arcgis/rest/services/EAU/RES_HYDRO_WAL/MapServer/1/")
+    axes_hydro_wal <- arc_select_try_loop(wal_hydro_service)
+
     ## Available fields
     ### Note: there is no info about who is the manager of the object
     # OBJECTID ( type: esriFieldTypeOID, alias: OBJECTID )
@@ -445,7 +457,7 @@ operated AS (select CASE WHEN river_class_code = 0 THEN 'SPW Mobilité et Infras
 	ORDER BY name_fr, operator),
 			
 clusternumber AS (
-  SELECT ST_ClusterDBSCAN(geometry, eps => 0.0000001, minpoints=>1) over (PARTITION BY name_fr, operator) AS clusters,
+  SELECT ST_ClusterDBSCAN(geometry, eps => 0.1, minpoints=>1) over (PARTITION BY name_fr, operator) AS clusters,
   		*
   FROM operated
     ORDER BY name_fr, clusters, operator
@@ -477,7 +489,7 @@ from raw_data.vla_river_official),
 
 
 clustervla AS (
-  SELECT ST_ClusterDBSCAN(geometry, eps => 0.0000001, minpoints=>1) over (PARTITION BY name_nl, operator) AS cluster,
+  SELECT ST_ClusterDBSCAN(geometry, eps => 0.1, minpoints=>1) over (PARTITION BY name_nl, operator) AS cluster,
   		*
   FROM vlabasic
   ORDER BY original_id, name_nl, operator, cluster
@@ -508,7 +520,7 @@ UNION ALL
 select 'CAN' as original_id,
 	'Haven van Brussel / Port de Bruxelles' as operator,
 	NULL as river_classification_raw,
-	1 as river_class_code,
+	0 as river_class_code,
 	min(naam) as name_nl,
 	min(nom) as name_fr,
 	'",data_list_id_bru,"'::uuid as data_list_id,
@@ -578,6 +590,7 @@ CASE WHEN river_class_code = 0 then '",li_river_navigable,"'::uuid
              WHEN river_class_code = 3 then '",li_river_class_3,"'::uuid
              WHEN river_class_code = 9 then '",li_river_unclasified,"'::uuid
              WHEN river_class_code = 99 then '",li_river_ditch,"'::uuid
+             ELSE '",li_river_unknown,"'::uuid
              END 
   as legend_item_id,
 data_list_id,
@@ -590,7 +603,7 @@ jsonb_strip_nulls(jsonb_build_object(
   'river_basin_planification', river_basin_planification,
   'river_basin_general', river_basin_general))
   as properties,
-geometry,
+ST_ReducePrecision(geometry, 1e-8) as geometry,
 CURRENT_DATE as created_at
 FROM all_data
 WHERE ST_IsValid(geometry) AND NOT ST_IsEmpty(geometry) AND st_length(st_transform(geometry,31370))>1;"),
@@ -604,7 +617,7 @@ WHERE ST_IsValid(geometry) AND NOT ST_IsEmpty(geometry) AND st_length(st_transfo
   # 1-3: class of non-navigable rivers (in Brussels: classed is always... maybe 3?)
   # 9: not defined, not classified, not in Walloon Atlas and not part of a classified stream, Bru: missing AND not Kanaal
   ## 99: public ditch
-  
+  ## 98 and other values: other types
   
   
   
@@ -613,7 +626,7 @@ WHERE ST_IsValid(geometry) AND NOT ST_IsEmpty(geometry) AND st_length(st_transfo
   
   
   run_smart_update = function() {
-    smart_update_process("rivers_official", 50, 100, 50, format(Sys.Date(), "%Y-%m-%d"), allow_update_even_if_checks_fail=overrule_checks, dry_run=do_dry_run,reuse_ingestion_data=reuse_ingestion_data)
+    smart_update_process("rivers_official", 50, 100, 50, format(Sys.Date(), "%Y-%m-%d"), allow_update_even_if_checks_fail=overrule_checks, dry_run=do_dry_run, reuse_ingestion_data=reuse_ingestion_data, same_id_size_factor = 1.25, different_id_size_factor = 1.25)
   }
   
   
@@ -631,6 +644,7 @@ WHERE ST_IsValid(geometry) AND NOT ST_IsEmpty(geometry) AND st_length(st_transfo
       create_ingestion_table()
     }
     run_smart_update()
+    if (overrule_checks==FALSE) {print("Note: a huge amount of records will appear to be 'updated', because in Wallonia we have no original_id. This also means 'overrule checks' is needed to have an actual update of this dataset!")}
   }
   
   if(run_status){

@@ -81,10 +81,20 @@ datatypes <- c("points", "mpolygon")
 
 ### Actual OSM download & transformation ----
 
-osm_all <<- run_process(
-  download_osm_process(features_list, datatypes, extra_columns, keep_region=TRUE, postgres=TRUE),
-  paste0("OSM download & processing for ", paste(paste(names(features_list), unlist(features_list), sep = "="), collapse = ", "), collapse = ", ")
+osm_all <- run_process(
+  download_osm_process(features_list, datatypes, extra_columns, keep_region=TRUE),
+  paste0("OSM download & processing for ", describe_features_list(features_list))
 )
+
+# detect objects on top of other objects in the dataset
+result <- osmspatial_deduplication(osm_all, c("ref_thw"))
+osm_all <- result$data
+#osm_diagnostic <- result$diagnostic
+
+# standardize the usual OSM columns
+osm_all <- build_osm_derived_columns(osm_all)
+
+CreateImportTable(dataset = osm_all, schema = "raw_data", table_name = "osm_emergency_response")
 
   } else {
     print("No fresh data downloaded because user requested to re-use existing data")
@@ -134,26 +144,18 @@ CREATE TABLE IF NOT EXISTS ingestion.emergency_response
 ",paste0("
 WITH cleaned as (SELECT
 'https://osm.org/' || osm_id AS original_id,
-jsonb_build_object(
+jsonb_strip_nulls(jsonb_build_object(
       'und', CASE WHEN name IS NULL THEN 'civil protection' ELSE name END,
     	'fre', name_fr,
       'ger', name_de::text,
-      'dut', name_nl) as name,
+      'dut', name_nl)) as name,
 jsonb_build_object(
     	'fre', 'protection civile',
     	'ger', 'Zivilschutz',
     	'dut', 'civiele bescherming',
     	'eng', 'civil protection') as legend_item,
-NULLIF(CONCAT_WS('; ',name, short_name, official_name, alt_name, old_name), '') AS other_names,
-CASE WHEN addr_street IS NULL THEN NULL 
-	ELSE LTRIM(CONCAT(addr_street, ' ' || CASE WHEN nohousenumber='yes' THEN 'w/n' ELSE addr_housenumber END, ', ' || CONCAT((addr_postcode || ' '), addr_city))) END
-	AS address,
-NULLIF(CONCAT_WS('; ',contact_email, email), '') AS local_email,
-operator_email,
-NULLIF(CONCAT_WS('; ',contact_mobile, mobile, contact_phone, phone, phone_2),'') AS local_phone,
-NULLIF(CONCAT_WS('; ',website, contact_website),'') AS local_website,
-operator_website,
-operator_wikidata, operator, operator_type, image, 
+other_names,address,local_email,operator_email,local_phone,local_website,
+operator_website,operator_wikidata, operator, operator_type, image, 
 geometry
 FROM raw_data.osm_emergency_response)
 
@@ -167,6 +169,7 @@ legend_item,
 '",data_list_id,"'::uuid as data_list_id,
 0 as risk_level,
 JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
+  'address', address,
 	'other_names', other_names,
 	'local_email',local_email,
 	'local_phone',local_phone,
@@ -177,7 +180,7 @@ JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
 	'operator',operator,
 	'operator_type',operator_type,
 	'image', image)) as properties,
-geometry,
+ST_ReducePrecision(geometry, 1e-8) as geometry,
 CURRENT_DATE as created_at
 FROM cleaned;"),
 "ALTER TABLE IF EXISTS ingestion.emergency_response OWNER to pgn_group_data_team_w;",
@@ -192,7 +195,7 @@ create_ingestion_table <- function() {execute_sql_commands(ingestion_table_sql, 
 
 
 # set to TRUE if you want to update the transformation table even if the checks fail. 
-update_even_if_checks_fail<-overrule_checks
+#overrule_checks<-TRUE
 
 
 run_smart_update = function() {
@@ -207,7 +210,6 @@ run_smart_update = function() {
 main_function = function() {
   if (!reuse_ingestion_data) {
     process_fresh_data()
-    CreateImportTable(dataset = osm_all, schema = "raw_data", table_name = "osm_emergency_response")
     create_ingestion_table()
   }
   run_smart_update()

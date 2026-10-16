@@ -98,7 +98,7 @@ process_and_upload_fresh_data <- function(){
     }"
     
     ## Load the data
-    data <- query_wikidata(sparql_query, format = c("simple", "smart"))
+    data <- suppressMessages(query_wikidata(sparql_query, format = c("simple", "smart")))
     
     # Prepare data for ingestion ----
     
@@ -194,13 +194,13 @@ legend_item,
 JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
   'other_names', other_names,
   'address', address,
-  'website', website,
-	'phone', phone,
+  'local_website', website,
+	'local_phone', phone,
 	'operator', operator,
   'start_date', start_date,
   'body_of_water', body_of_water
 )),
-geometry,
+ST_ReducePrecision(geometry, 1e-8) as geometry,
 CURRENT_DATE as created_at
 FROM cleaned;"),
 "ALTER TABLE IF EXISTS ingestion.inland_ports OWNER to pgn_group_data_team_w;",

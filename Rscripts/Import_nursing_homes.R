@@ -76,10 +76,11 @@ source(paste0(rscript_folder,"/utils.R"))
 process_osm_data <- function(){
   
   # Define the list of features
-  features_list <- list("social_facility:for"="senior", 
-                        "social_facility"="nursing_home",
-                        "social_facility"="assisted_living",
-                        "social_facility"="group_home")
+  features_list <- list(or_group(
+    tag_filter("social_facility:for", "senior"),
+    tag_filter("social_facility", "nursing_home"),
+    tag_filter("social_facility", "assisted_living"),
+    tag_filter("social_facility", "group_home")))
   
   # Define extra tags to use as columns for properties
   extra_columns <- c("amenity", "capacity", "social_facility", "social_facility:for", "description")
@@ -89,9 +90,24 @@ process_osm_data <- function(){
   
   ### Actual OSM download & transformation ----
   osm_all <- run_process(
-    download_osm_process(features_list, datatypes, extra_columns, keep_region=TRUE, postgres=TRUE),
-    paste0("OSM download & processing for ", paste(paste(names(features_list), unlist(features_list), sep = "="), collapse = ", "), collapse = ", ")
+    download_osm_process(features_list, datatypes, extra_columns, keep_region=TRUE),
+    paste0("OSM download & processing for ", describe_features_list(features_list))
   )
+  
+  # remove objects already in "higher" layers
+  ## get the relevant object ids
+  con_pg <- get_con()
+  remove_objects <- dbGetQuery(con_pg, paste0("WITH presel AS (SELECT DISTINCT replace(original_id, 'https://osm.org/', '') AS osm_id
+                                     FROM transformation.handicap_care WHERE deleted_at IS NULL
+                                     UNION ALL
+                                     SELECT DISTINCT replace(original_id, 'https://osm.org/', '') AS osm_id
+                                     FROM transformation.hospitals WHERE deleted_at IS NULL)
+                                     SELECT distinct(osm_id) AS osm_id from presel"))
+  dbDisconnect(con_pg)
+  ## anti-join to throw them out
+  osm_all <- osm_all %>%
+    anti_join(remove_objects, by = "osm_id")
+  
   
   # social_facility=nursing_home and social_facility_for should be "senior" or missing
   # or another social_facility value, but then social_facility_for must have the value "senior"
@@ -109,7 +125,7 @@ process_osm_data <- function(){
              (is.na(social_facility_for) | grepl("senior", social_facility_for, ignore.case = TRUE))) |
             
             # Case 2: other facility types must have "senior"
-            (social_facility != "nursing_home" &
+            ((social_facility != "nursing_home" | is.na(social_facility)) &
                grepl("senior", social_facility_for, ignore.case = TRUE))
         ) 
         #& (language == "ger" | is.na(language)) #commented out for now to be able to asses OSM BE quality
@@ -118,106 +134,10 @@ process_osm_data <- function(){
   
   
   # detect objects on top of other objects in the dataset
-  ## first define a set of potential outers
-  osm_outers<-osm_filtered %>%
-    select(outer_id=osm_id) %>%
-    filter(!st_is(geometry, "POINT"))
-  ## then join them to the objects
-  join <- st_join(osm_filtered, osm_outers, join = st_within)
-  
-  # count the number of times an inner is used (to later find objects that are linked to itself and something else too, or to more than one outer)
-  join<-join %>%
-    mutate(outer_id=case_when(!is.na(outer_id)~outer_id, TRUE~osm_id)) %>%
-    group_by(osm_id) %>%
-    mutate(count_inner=case_when(!is.na(outer_id) ~n(), TRUE~NA))
-  # remove if the inner is used by an outer but still refers to itself as well
-  join<-join %>%
-    filter(count_inner==1 | (count_inner>1 & osm_id!=outer_id))
-  
-  
-  # add a count with the number of times an outer is used
-  join<-join %>%
-    mutate(outer_id=case_when(!is.na(outer_id)~outer_id, TRUE~osm_id)) %>%
-    group_by(outer_id) %>%
-    mutate(count=case_when(!is.na(outer_id) ~n(), TRUE~NA))
-  
-  # count inners again and give them an order_inner number, where 1 is for the case linked to the biggest count (outer)
-  join<-join %>%
-    group_by(osm_id) %>%
-    mutate(count_inner=case_when(!is.na(outer_id) ~n(), TRUE~NA)) %>%
-    arrange(desc(count)) %>%
-    mutate(order_inner = row_number())
-  
-  # if count_inner>1, take the first one (i.e. the one linked to the biggest polygon)
-  join<-join %>%
-    filter(count_inner==1 | (count_inner>1 & order_inner==1))
-  
+  result <- osmspatial_deduplication(osm_filtered, c("capacity", "description", "amenity", "social_facility", "social_facility_for"))
+  join_filtered <- result$data
+  #osm_diagnostic <- result$diagnostic
 
-  
-  # create aggregated variables
-  join <- join %>%
-    group_by(outer_id) %>%
-    mutate(operator= ifelse(count > 1, na_if(paste(unique(na.omit(operator)), collapse = "; "),""), operator)) %>%
-    mutate(addr_city= ifelse(count > 1, na_if(paste(unique(na.omit(addr_city)), collapse = "; "),""), addr_city)) %>%
-    mutate(addr_housenumber= ifelse(count > 1, na_if(paste(unique(na.omit(addr_housenumber)), collapse = "; "),""), addr_housenumber)) %>%
-    mutate(addr_street= ifelse(count > 1, na_if(paste(unique(na.omit(addr_street)), collapse = "; "),""), addr_street)) %>%
-    mutate(addr_postcode= ifelse(count > 1, na_if(paste(unique(na.omit(addr_postcode)), collapse = "; "),""), addr_postcode)) %>%
-    mutate(contact_email= ifelse(count > 1, na_if(paste(unique(na.omit(contact_email)), collapse = "; "),""), contact_email)) %>%
-    mutate(email= ifelse(count > 1, na_if(paste(unique(na.omit(email)), collapse = "; "),""), email)) %>%
-    mutate(website= ifelse(count > 1, na_if(paste(unique(na.omit(website)), collapse = "; "),""), website)) %>%
-    mutate(contact_website= ifelse(count > 1, na_if(paste(unique(na.omit(contact_website)), collapse = "; "),""), contact_website)) %>%
-    mutate(phone= ifelse(count > 1, na_if(paste(unique(na.omit(phone)), collapse = "; "),""), phone)) %>%
-    mutate(contact_phone= ifelse(count > 1, na_if(paste(unique(na.omit(contact_phone)), collapse = "; "),""), contact_phone)) %>%
-    mutate(opening_hours= ifelse(count > 1, na_if(paste(unique(na.omit(opening_hours)), collapse = "; "),""), opening_hours)) %>%
-    mutate(mobile= ifelse(count > 1, na_if(paste(unique(na.omit(mobile)), collapse = "; "),""), mobile)) %>%
-    mutate(contact_mobile= ifelse(count > 1, na_if(paste(unique(na.omit(contact_mobile)), collapse = "; "),""), contact_mobile)) %>%
-    mutate(check_date= ifelse(count > 1, na_if(paste(unique(na.omit(check_date)), collapse = "; "),""), check_date)) %>%
-    mutate(wikidata= ifelse(count > 1, na_if(paste(unique(na.omit(wikidata)), collapse = "; "),""), wikidata)) %>%
-    mutate(operator_website= ifelse(count > 1, na_if(paste(unique(na.omit(operator_website)), collapse = "; "),""), operator_website)) %>%
-    mutate(capacity= ifelse(count > 1, na_if(paste(unique(na.omit(capacity)), collapse = "; "),""), capacity)) %>%
-    mutate(description= ifelse(count > 1, na_if(paste(unique(na.omit(description)), collapse = "; "),""), description)) %>%
-    mutate(amenity=ifelse(count > 1, na_if(paste(unique(na.omit(amenity)), collapse = "; "),""), amenity)) %>%
-    mutate(social_facility=ifelse(count > 1, na_if(paste(unique(na.omit(social_facility)), collapse = "; "),""), social_facility)) %>%
-    mutate(social_facility_for=ifelse(count > 1, na_if(paste(unique(na.omit(social_facility_for)), collapse = "; "),""), social_facility_for))
-  
-
-  # aggregate names
-  #if osm_id=outer_id and name is missing, fill it in with "sports"
-  #join<-join %>%  mutate(name=ifelse(osm_id==outer_id & is.na(name) & count>1, "sports", name))
-  
-  aggregate_names <- function(df, names_to_aggregate) {
-    for (col in names_to_aggregate) {
-      df <- df %>%
-        group_by(outer_id) %>%
-        mutate(
-          primary_name = ifelse(!is.na(get(col))[osm_id == outer_id][1], get(col)[osm_id == outer_id][1], NA),
-          other_names = paste(unique(na.omit(get(col)[osm_id != outer_id & get(col) != primary_name])), collapse = ", "),
-          across(col, ~ ifelse(!is.na(.), case_when(
-            count > 1 & !is.na(other_names) & other_names != "" ~ ifelse(is.na(primary_name) | primary_name == "", other_names, paste0(primary_name, " (", other_names, ")")),
-            TRUE ~ .
-          ), .))
-        ) %>%
-        ungroup() %>%
-        select(-primary_name, -other_names)  # Remove temporary columns if not needed
-    }
-    
-    return(df)
-  }
-  
-  
-  # Define list of columns for name aggregation
-  names_to_aggregate <- c("name", "name_nl", "name_fr", "name_de", "alt_name", "short_name", "official_name", "old_name")
-  
-  # Call the function to aggregate names
-  join <- aggregate_names(join, names_to_aggregate)
-  
-  
-  
-  # Filter records based on the count and outer_id conditions
-  join_filtered <- join %>%
-    filter(count == 1 | (count > 1 & outer_id == osm_id))
-  #table(join_filtered$social_facility)
-  
   #dummies for assisted living, nursing home, day care > remove if none of those
   join_filtered <- join_filtered %>%
     mutate(day_care_dummy = case_when(
@@ -410,18 +330,20 @@ name_nl,name_fr,name_de,
 CASE WHEN activity_type='1' THEN '",li_wzc,"'::uuid
 WHEN activity_type='2' THEN '",li_elderly_day_care,"'::uuid
 ELSE '",li_wzc_combo,"'::uuid END as legend_item_id,
-ST_AsText(geometry) as geometry
+ST_AsHEXEWKB(geometry) as geometry
 from filtered"))
 
 dbDisconnect(con_pg)
 
 
 # make sf
-nursing_cobrha<-nursing_cobrha %>% filter( !is.na(geometry) & geometry != "")
-nursing_cobrha<-st_as_sf(nursing_cobrha, wkt="geometry")
+nursing_cobrha<-nursing_cobrha %>% filter(!is.na(geometry))
+nursing_cobrha$geometry <- st_as_sfc(structure(nursing_cobrha$geometry, class = "WKB"), EWKB = TRUE)
 nursing_cobrha$geometry <- st_set_crs(nursing_cobrha$geometry, 31370)
+nursing_cobrha <- st_as_sf(nursing_cobrha)
 #nursing_cobrha <- st_transform(nursing_cobrha, 31370)
-
+nursing_cobrha <- nursing_cobrha %>%
+  filter(!st_is_empty(geometry))
 
 # make OSM data 31370
 join_filtered<-st_transform(join_filtered, 31370)
@@ -468,8 +390,8 @@ nursing_cobrha_enriched <- merge_to_external_polygons(
   attr_hnr_col = "house_number",
   geom_street_col = "addr_street",
   geom_hnr_col = "addr_housenumber",
-  distance_matched_threshold = 50,
-  distance_raw_threshold = 500,
+  distance_matched_threshold = distance_matched_threshold,
+  distance_raw_threshold = distance_raw_threshold,
   patterns_to_remove = "patterns_to_remove"
 )
 
@@ -477,11 +399,10 @@ nursing_cobrha_enriched <- merge_to_external_polygons(
 nursing_cobrha_enriched <- nursing_cobrha_enriched %>%
   mutate(agg_id = ifelse(!is.na(osm_id),osm_id,st_as_text(geometry)))
 
-# back to 4326, explicit geometry name
+# explicit geometry name
 nursing_cobrha_enriched<-nursing_cobrha_enriched %>% rename(off_geometry=geometry)
 nursing_cobrha_enriched <- st_as_sf(nursing_cobrha_enriched, wkt="off_geometry")
-nursing_cobrha_enriched$off_geometry <- st_set_crs(nursing_cobrha_enriched$off_geometry, 31370)
-nursing_cobrha_enriched <- st_transform(nursing_cobrha_enriched, 4326)
+
 
 
 
@@ -494,54 +415,11 @@ osm_properties <- rbind(osm_be,osm_rest)
 #convert back to 4326
 osm_properties <- st_transform(osm_properties, 4326)
 
+osm_properties <- build_osm_derived_columns(osm_properties)
+
+
 osm_properties <- osm_properties %>%
   rowwise() %>%
-  mutate(
-    # Build other_names
-    other_names = ifelse(
-      all(is.na(c(short_name, official_name, alt_name, old_name))),
-      NA_character_,
-      paste(na.omit(c(short_name, official_name, alt_name, old_name)), collapse = "; ")
-    ),
-    
-    # Build local_email
-    local_email = ifelse(
-      all(is.na(c(contact_email, email))),
-      NA_character_,
-      paste(na.omit(c(contact_email, email)), collapse = "; ")
-    ),
-    
-    # Build local_phone
-    local_phone = ifelse(
-      all(is.na(c(contact_mobile, mobile, contact_phone, phone, phone_2))),
-      NA_character_,
-      paste(na.omit(c(contact_mobile, mobile, contact_phone, phone, phone_2)), collapse = "; ")
-    ),
-    
-    # Build local_website
-    local_website = ifelse(
-      all(is.na(c(website, contact_website, alt_website))),
-      NA_character_,
-      paste(na.omit(c(website, contact_website, alt_website)), collapse = "; ")
-    ),
-    
-    # Build address
-    address = if_else(
-      is.na(addr_street),
-      NA_character_,
-      trimws(paste0(
-        addr_street, " ",
-        if_else(
-          !is.na(nohousenumber) & nohousenumber == "yes", 
-          "w/n", 
-          coalesce(addr_housenumber, "")
-        ),
-        ", ",
-        paste0(coalesce(addr_postcode, ""), " "),
-        coalesce(addr_city, "")
-      ))
-    )
-  ) %>%
   mutate(properties = jsonlite::toJSON(
     purrr::discard(list(
       operator_wikidata = operator_wikidata,
@@ -582,7 +460,7 @@ nursing_cobrha_enriched_joined <- left_join(
 # simplify the osm_properties set
 osm_properties <- osm_properties %>%
   mutate(original_id=paste0("https://osm.org/", osm_id)) %>%
-  select(original_id, name, properties, data_list_id, legend_item_id, language)
+  select(original_id, name, risk_level, properties, data_list_id, legend_item_id, language)
 
 
 
@@ -812,7 +690,7 @@ select
   risk_level,
 	properties::jsonb,
 	jsonb_strip_nulls(jsonb_build_object('",data_list_id_cob,"', properties_secondary::jsonb)) AS properties_secondary,
-	geometry,
+	ST_ReducePrecision(geometry, 1e-8) as geometry,
 	CURRENT_DATE as created_at
 from raw_data.nursery_home_osm_cobrha;"),
 "ALTER TABLE IF EXISTS ingestion.nursing_homes OWNER to pgn_group_data_team_w;",
@@ -825,7 +703,7 @@ from raw_data.nursery_home_osm_cobrha;"),
 create_ingestion_table <- function() {execute_sql_commands(ingestion_table_sql, "Ingestion table")}
 
 run_smart_update = function() {
-  smart_update_process("nursing_homes", 50, 100, 50, format(Sys.Date(), "%Y-%m-%d"), allow_update_even_if_checks_fail=overrule_checks, dry_run=do_dry_run)
+  smart_update_process("nursing_homes", 50, 100, 50, format(Sys.Date(), "%Y-%m-%d"), allow_update_even_if_checks_fail=overrule_checks, dry_run=do_dry_run, reuse_ingestion_data=reuse_ingestion_data)
 }
 
 

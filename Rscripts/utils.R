@@ -1,3 +1,5 @@
+Sys.setenv(TZ = "UTC")
+
 library(RPostgres)
 library(httr)
 library(dplyr)
@@ -27,6 +29,87 @@ alter_column_data_type_to_json <- function(con_pg, schema, table, column) {
   print(sql_query)
   res <- dbSendQuery(con_pg, sql_query)
   dbClearResult(res)
+}
+
+
+# Run a list of SQL commands with error reporting based on the task name ------------
+
+execute_sql_commands <- function(sql_commands, task_name) {
+  con_pg <- get_con()
+  tryCatch(
+    {
+      for (sql_command in sql_commands) {
+        dbExecute(con_pg, sql_command)
+      }
+      print(paste(task_name, "SQL ran correctly"))
+    },
+    error = function(err) {
+      message(paste("The SQL functions for", task_name, "failed"))
+      message(err)  # Print the error message for more details
+    }
+  )
+  dbDisconnect(con_pg)
+}
+
+
+# Upload a table to a PostgreSQL database -------------------------------
+
+# create new or replace content
+CreateImportTable<-function(dataset, schema, table_name){
+  if (!exists("dataset")) {
+    print(paste0("Error, the dataset you wanted to import into ", table_id_t, "does not exist, try again"))
+  }else{
+    con_pg<-get_con()
+    table_id <- DBI::Id(
+      schema  = schema,
+      table   = table_name
+    )
+    table_id_t <- paste0(schema,".",table_name)
+    start<-Sys.time()
+    print(paste0("Start :",format(Sys.time(), "%a %b %d %X %Y")))
+    print(paste0("Import data into postgresql table ", table_id_t))
+    dbWriteTable(con_pg, table_id, dataset, overwrite = TRUE, row.names = FALSE )
+    
+    print("ID primary key")
+    query <- paste("ALTER TABLE ", table_id_t,
+                   "ADD COLUMN IF NOT EXISTS ogc_fid SERIAL;")
+    dbExecute(con_pg, query)
+    query <- paste("ALTER TABLE ", table_id_t,
+                   "ADD PRIMARY KEY (ogc_fid);")
+    dbExecute(con_pg, query)
+    # make sure the whole team can work with the table
+    dbExecute(con_pg,paste0("ALTER TABLE IF EXISTS ",table_id_t," OWNER to pgn_group_data_team_w;"))
+    dbExecute(con_pg,paste0("GRANT ALL ON TABLE ",table_id_t," TO pgn_group_data_team_w;"))
+    dbExecute(con_pg,paste0("GRANT ALL ON TABLE ",table_id_t," TO pgn_user_airflow;"))
+    
+    ## Close connection --------------------------------------------------------
+    dbDisconnect(con_pg)
+    print(paste0("End :",format(Sys.time(), "%a %b %d %X %Y")))
+    print(Sys.time()-start)
+  }
+}
+
+# add new content to existing table
+AppendImportTable <- function(dataset, schema, table_name) {
+  if (!exists("dataset")) {
+    print(paste0("Error, the dataset you wanted to append into ", schema, ".", table_name, " does not exist, try again"))
+    return(invisible(NULL))
+  }
+  
+  con_pg <- get_con()
+  table_id <- DBI::Id(schema = schema, table = table_name)
+  table_id_t <- paste0(schema, ".", table_name)
+  
+  start <- Sys.time()
+  print(paste0("Start :", format(Sys.time(), "%a %b %d %X %Y")))
+  print(paste0("Appending data into postgresql table ", table_id_t))
+  
+  # append=TRUE, overwrite=FALSE — plain INSERT, no dedup/upsert
+  dbWriteTable(con_pg, table_id, dataset, append = TRUE, overwrite = FALSE, row.names = FALSE)
+  
+  dbDisconnect(con_pg)
+  print(paste0("End :", format(Sys.time(), "%a %b %d %X %Y")))
+  print(Sys.time() - start)
 }
 
 
@@ -70,6 +153,63 @@ extract_json_value <- function(json_str, key) {
 # join$name_und <- tolower(mapply(extract_json_value, join$name, "und"))
 # NOTE: if the json attribute does not always exist, force the correct datatype, e.g. 
 # join$name_und <- as.character(tolower(mapply(extract_json_value, join$name, "und")))
+
+
+# Aggregate text columns
+## When you want to create a list of unique text values and add them to all relevant rows, without turning NA's into empty strings
+## note that it assumes you want to overwrite existing columns
+## use within summarize or mutate
+
+collapse_unique <- function(x) {
+  out <- paste(unique(na.omit(x)), collapse = "; ")
+  if (out == "") NA_character_ else out
+}
+
+#example
+#join_test <- join %>%
+#  group_by(outer_id) %>%
+#  mutate(
+#    across(
+#      c(operator, addr_city),
+#      collapse_unique
+#    )
+#  )
+
+# summarize default OSM address info
+## used during grouping, usually by outer_id
+## first summarize addresses per unique street (and other address info)
+## So if we have both "Steltenstraat 3" and "Steltenstraat 5" in a group, we will get "Steltenstraat 3-5"
+## then summarize based on the group ID, so we will get "Steltenstraat 3-5, 1234 Municipality; Anderestraat 2, 1234 Municipality"
+collapse_address <- function(df, group_var) {
+  group_var <- enquo(group_var)
+  
+  df %>%
+    mutate(addr_housenumber = if_else(!is.na(nohousenumber) & nohousenumber == "yes", "w/n", addr_housenumber)) %>%
+    st_drop_geometry() %>%
+    select(!!group_var, addr_street, addr_housenumber, addr_postcode, addr_city) %>%
+    distinct() %>%
+    arrange(!!group_var, addr_street, addr_postcode, addr_city, addr_housenumber) %>%
+    group_by(!!group_var, addr_street, addr_postcode, addr_city) %>%
+    summarise(
+     hn = paste(unique(na.omit(addr_housenumber)), collapse = "-"),
+      .groups = "drop"
+    ) %>%
+    filter(!is.na(addr_street)) %>%
+    mutate(address = trimws(paste0(
+      addr_street,
+      if_else(hn != "", paste0(" ", hn), ""),
+      if_else(!is.na(addr_postcode), paste0(", ", addr_postcode), ""),
+      if_else(!is.na(addr_city), paste0(" ", addr_city), "")
+    ))) %>%
+    group_by(!!group_var) %>%
+    summarise(address = paste(address, collapse = "; "), .groups = "drop")
+}
+
+## usage example:
+#join <- join %>%
+#  left_join(collapse_address(join, outer_id), by = "outer_id")
+
+
 
 # Fuzzy string match ------------------------------------------------------
 
@@ -124,68 +264,11 @@ fuzzyStringMatch<-function(table1, table2=NULL, name_column1, name_column2, id_c
   return(fuzzy_match)
 }
 
-# Run a list of SQL commands with error reporting based on the task name ------------
-
-execute_sql_commands <- function(sql_commands, task_name) {
-  con_pg <- get_con()
-  tryCatch(
-    {
-      for (sql_command in sql_commands) {
-        dbExecute(con_pg, sql_command)
-      }
-      print(paste(task_name, "SQL ran correctly"))
-    },
-    error = function(err) {
-      message(paste("The SQL functions for", task_name, "failed"))
-      message(err)  # Print the error message for more details
-    }
-  )
-  dbDisconnect(con_pg)
-}
-
-
-
-
-# Upload a table to a PostgreSQL database -------------------------------
-
-CreateImportTable<-function(dataset, schema, table_name){
-  if (!exists("dataset")) {
-    print(paste0("Error, the dataset you wanted to import into ", table_id_t, "does not exist, try again"))
-  }else{
-    con_pg<-get_con()
-    table_id <- DBI::Id(
-      schema  = schema,
-      table   = table_name
-    )
-    table_id_t <- paste0(schema,".",table_name)
-    start<-Sys.time()
-    print(paste0("Start :",format(Sys.time(), "%a %b %d %X %Y")))
-    print(paste0("Import data into postgresql table ", table_id_t))
-    dbWriteTable(con_pg, table_id, dataset, overwrite = TRUE, row.names = FALSE )
-    
-    print("ID primary key")
-    query <- paste("ALTER TABLE ", table_id_t,
-                   "ADD COLUMN IF NOT EXISTS ogc_fid SERIAL;")
-    dbExecute(con_pg, query)
-    query <- paste("ALTER TABLE ", table_id_t,
-                   "ADD PRIMARY KEY (ogc_fid);")
-    dbExecute(con_pg, query)
-    # make sure the whole team can work with the table
-    dbExecute(con_pg,paste0("ALTER TABLE IF EXISTS ",table_id_t," OWNER to pgn_group_data_team_w;"))
-    dbExecute(con_pg,paste0("GRANT ALL ON TABLE ",table_id_t," TO pgn_group_data_team_w;"))
-    dbExecute(con_pg,paste0("GRANT ALL ON TABLE ",table_id_t," TO pgn_user_airflow;"))
-    
-    ## Close connection --------------------------------------------------------
-    dbDisconnect(con_pg)
-    print(paste0("End :",format(Sys.time(), "%a %b %d %X %Y")))
-    print(Sys.time()-start)
-  }
-}
 
 
 # String cleanup functions --------------------------------------------
 
-## string removal function
+## string removal function (remove specific words from an existing value)----
 string_removal <- function(df, columns, patterns) {
   for (col in columns) {
     for (pattern in patterns) {
@@ -206,7 +289,7 @@ string_removal <- function(df, columns, patterns) {
 # call the function
 # join <- string_removal(join, columns_to_clean, patterns)
 
-## string replacement function
+## string replacement function (replace specific words with other words)----
 string_replacement <- function(df, columns, replacements) {
   if (length(replacements) %% 2 != 0) {
     stop("Replacements list must contain an even number of elements.")
@@ -230,6 +313,24 @@ string_replacement <- function(df, columns, replacements) {
 # call the function
 # join <- string_replacement(join, columns_to_clean, replacements)
 # you can use this function also to remove strings of course
+
+## Set useless strings to NA ----
+# turn useless string values into NA (empty, space, dash, dot), when it's a real string column (skip json columns masquerading as string)
+clean_empty_strings <- function(df) {
+  df %>%
+    mutate(across(
+      where(~is.character(.) && !inherits(., "pq_jsonb")),
+      ~na_if(trimws(.), "") %>% na_if(".") %>% na_if("-")
+    ))
+}
+#Usage: simply as df <- clean_empty_strings(df)
+
+
+# Remove all characters except numbers, letters, hyphens, and semicolons ----
+clean_string <- function(x) {
+  gsub("[^0-9a-zA-Z;-]", "", x)
+}
+
 
 
 # Get an Azure password --------------------------------------------
@@ -256,7 +357,7 @@ get_azure_access_token <- function() {
     return(Sys.getenv("POSTGRES_PASSWORD"))
   }
 }
-get_azure_access_token()
+
 
 
 
@@ -264,224 +365,270 @@ get_azure_access_token()
 
 # Download OSM data ------------------------------------------
 
-#USAGE
+## USAGE ----
 # List of features
-## features_list <- list("generator:source" = "wind")
-## OR filter-list, where you list several tags that all must apply:
-#features_list <- list(
-#  list(key = "leisure", value = "track"),
-#  list(key = "name")
-#)
-## this needs to be combined with a flag at the end
+# QUERY STRUCTURE: features_list is a list of or_groups, ANDed together.
+#   - Each or_group is a list of tag_filter()s, ORed together.
+#   - The final WHERE clause is: (or_group1) AND (or_group2) AND ...
+#
+# SIMPLE USAGE (single condition):
+#   features_list <- list(or_group(tag_filter("amenity", "restaurant")))
+# because of as_features_list() this can be written as simply list("amenity", "restaurant")
+#
+# COMPLEX USAGE (AND of OR-groups):
+#   features_list <- list(
+#     or_group(tag_filter("country", "EU"), tag_filter("wikidata"), tag_filter("operator:wikidata")),
+#     or_group(tag_filter("office"), tag_filter("amenity", "childcare"), tag_filter("tourism", "museum"))
+#   )
+#
+# NEGATE (key != value):
+#   tag_filter("access", "private", negate = TRUE)
+#
+# KEY MUST NOT EXIST:
+#   tag_filter("leisure", not_exists = TRUE)
 
-# use negate=TRUE to say "the key should NOT equal the value"
-## list(key = "access", value = "private", negate = TRUE)
 
-# use key_does_not_exist=TRUE to say "the key should not exist"
-##list(key = "leisure", key_does_not_exist = TRUE)
-
-
-# If default server fails, set to TRUE to use mail.ru server (older data)
-## alternative_overpass_server<-FALSE
 # Define extra tags to use as columns for properties
 ## extra_columns <- c("generator:output:electricity", "generator:type", "generator:model", "manufacturer", "manufacturer:ref","manufacturer:type")
-# Choose which datatypes are needed, as a list of datatypes, using any of "points", "lines", "mpolygons" (this is polygons+multipolygons together)
+
+# Choose which datatypes are needed, as a list of datatypes, using any of "points", "lines", "mpolygon" (this is polygons+multipolygons together)
 #datatypes <- c("points", "mpolygon")
+
 # Optionally, choose a different BBOX. The default is set below, but when calling the function you can overrule this
 #bbox <- c(2.15,49.15,7.07,51.8) #(or simply paste bbox=c(2.15,49.15,7.07,51.8) when you call the function )
 #bbox <- c(1.32,48.77,10.55,54.42)
+
 # Optionally, keep the language of the area as a columns (default set to FALSE)
 #keep_region <- TRUE
-# required if you want to use the feature_tag_list
-## feature_tag_list<-TRUE
-# optional key to use the postgres database
-# postgres <- TRUE
 
-# TODO: deal with bbox or Belgian buffer if the OSM db grows beyond the Belgian buffer
 
-# actual OSM download function
+## Functions needed outside main function ----
+
+# 1. Schema helper
+## Make sure we know which tags exist as columns vs are saved in the hstore "tags" column
+### Prepare connection
+osm_host_name <- Sys.getenv("POSTGRES_HOST_NAME_OSM")
+osm_user <- Sys.getenv("POSTGRES_USER_OSM")
+osm_password <- Sys.getenv("POSTGRES_PASSWORD_OSM")
+osm_db_name <- Sys.getenv("POSTGRES_DB_NAME_OSM")
+
+get_con_osm<-function(){
+  con_pg <- dbConnect(Postgres(),
+                      user=osm_user, 
+                      password=osm_password,
+                      host=osm_host_name,
+                      dbname=osm_db_name,
+                      port=5432, 
+                      sslmode = 'prefer')
+  return(con_pg)
+}
+#' Fetch column names from all OSM tables, combined and deduplicated.
+#' Call once per session and pass the result into tag_filter() calls.
+.osm_cols_cache <- NULL
+get_osm_columns <- function(force = FALSE) {
+  if (is.null(.osm_cols_cache) || force) {
+    con_pg <- get_con_osm()
+    on.exit(dbDisconnect(con_pg))
+    points   <- dbGetQuery(con_pg, "SELECT * FROM public.planet_osm_point   LIMIT 0")
+    lines    <- dbGetQuery(con_pg, "SELECT * FROM public.planet_osm_line    LIMIT 0")
+    polygons <- dbGetQuery(con_pg, "SELECT * FROM public.planet_osm_polygon LIMIT 0")
+    .osm_cols_cache <<- unique(names(rbind(points, lines, polygons)))
+  }
+  .osm_cols_cache
+}
+
+
+# 2. Basic filter constructor
+#' Create a single filter condition.
+#'
+#' @param key        OSM key (column name or tag key).
+#' @param value      Optional value to match. NULL means "key exists".
+#' @param cols       Character vector from get_osm_columns(). Used to decide
+#'                   whether to query a real column or the tags hstore.
+#' @param negate     If TRUE: key != value (only meaningful when value is set).
+#' @param not_exists If TRUE: key/tag must be absent.
+
+tag_filter <- function(key, value = NULL, cols = get_osm_columns(), negate = FALSE, not_exists = FALSE) {
+  stopifnot(is.character(key), length(key) == 1)
+  if (negate && is.null(value)) stop("negate=TRUE requires a value")
+  if (not_exists && !is.null(value)) stop("not_exists=TRUE cannot be combined with a value")
+  
+  structure(
+    list(
+      key        = key,
+      value      = value,
+      negate     = negate,
+      not_exists = not_exists,
+      is_column  = key %in% cols
+    ),
+    class = "osm_tag_filter"
+  )
+}
+
+# 3. OR-group constructor
+#' Wrap one or more tag_filter()s into an OR-group.
+or_group <- function(...) {
+  filters <- list(...)
+  if (!all(sapply(filters, inherits, "osm_tag_filter"))) {
+    stop("or_group() only accepts tag_filter() objects")
+  }
+  structure(filters, class = "osm_or_group")
+}
+
+
+# 4. Feature list helper 
+# 'Transform any input to the expected format, so simple old style queries keep working
+as_features_list <- function(x) {
+  # already new format
+  if (all(sapply(x, inherits, "osm_or_group"))) return(x)
+  # convert old named list format
+  nms <- names(x)
+  filters <- lapply(seq_along(x), function(i) {
+    key   <- if (!is.null(nms) && nzchar(nms[i])) nms[i] else as.character(x[[i]])
+    value <- if (!is.null(nms) && nzchar(nms[i]) && nzchar(x[[i]])) x[[i]] else NULL
+    tag_filter(key, value)
+  })
+  list(do.call(or_group, filters))
+}
+
+# 5. Description helper
+#' Transform the features list to a human readable query so it can be printed when calling the function
+describe_features_list <- function(features_list) {
+  features_list <- as_features_list(features_list)
+  and_parts <- sapply(features_list, function(grp) {
+    or_parts <- sapply(grp, function(f) {
+      if (is.null(f$value)) f$key
+      else paste(f$key, f$value, sep = "=")
+    })
+    paste(or_parts, collapse = " OR ")
+  })
+  if (length(and_parts) > 1) {
+    and_parts <- paste0("(", and_parts, ")")
+  }
+  paste(and_parts, collapse = " AND ")
+}
+
+## actual OSM download function ----
 download_osm_process <- function(
     features_list, 
     datatypes, 
-    extra_columns, 
-    alternative_overpass_server=FALSE,
+    extra_columns=c(), 
     bbox = c(1.32,48.77,10.55,54.42),
-    keep_region=FALSE,
-    feature_tag_list=FALSE,
-    postgres=FALSE)
+    keep_region=FALSE)
 {
 
+  print("Downloading data from Postgres DB")
+  
+  # Transform simple feature lists to expected format
+  features_list <- as_features_list(features_list)
+  
+  # These columns are always in the download
   default_columns <- c("osm_id", "name", "name:nl", "name:fr", "name:de", "operator:wikidata",
                        "operator", "operator:type",
                        "addr:city", "addr:housenumber", "addr:street", "addr:postcode", "nohousenumber",
                        "short_name", "old_name", "alt_name", "official_name", 
-                       "contact:email", "email", "website", "contact:website", "phone", "contact:phone", "opening_hours",  "phone:2", "mobile", "contact:mobile", "alt_website", "operator:email", "operator:website",
+                       "contact:email", "email", "website", "contact:website", "phone", "contact:phone", "opening_hours",  "phone:2", "mobile", 
+                       "contact:mobile", "alt_website", "operator:email", "operator:website",
                        "check_date", "image", "wikidata")  
   
 
-  if (postgres == TRUE) {
-    print("Downloading data from Postgres DB")
+ 
     
-    # overwriting the bbox to make sure we get all data for BE+buffer
-    ## if the first element of the provided bbox is larger than 1.329 then overwrite it with c(1.32,48.82,7.45,52.22)
-    if (bbox[1] > 1.329) {
-      bbox <- c(1.32,48.82,7.45,52.22)
-    }
-
-    ### Prepare connection ----
-    osm_host_name <- Sys.getenv("POSTGRES_HOST_NAME_OSM")
-    osm_user <- Sys.getenv("POSTGRES_USER_OSM")
-    osm_password <- Sys.getenv("POSTGRES_PASSWORD_OSM")
-    osm_db_name <- Sys.getenv("POSTGRES_DB_NAME_OSM")
-    
-    get_con_osm<-function(){
-      con_pg <- dbConnect(Postgres(),
-                          user=osm_user, 
-                          password=osm_password,
-                          host=osm_host_name,
-                          dbname=osm_db_name,
-                          port=5432, 
-                          sslmode = 'prefer')
-      return(con_pg)
-    }
-
-    # Prepare the WHERE clause
-    # TODO: take in account the various special cases (AND, NOT clauses)
-    
-    # If you query two tags, one of which is a column and the other is in the tags column, then the "normal" query will fail, and the "tags query" will only return the tags column. So the effect of the first query is lost. Or maybe only the first query is executed, and the second is ignored.
-    # Solution: first download an empty table and check which columns exist and which don't. Ideally we just deal with that, but for now we just STOP and require simple queries. The user should just do two queries instead
-    # Ensure both key-value pairs and just keys are handled
-    named_elements <- features_list[names(features_list) != ""]
-    unnamed_elements <- if (is.null(names(features_list))) {unnamed_elements <- features_list} else {features_list[names(features_list) == ""]}
-
-    #check if all objects are either all columns or all tags
-    con_pg <- get_con_osm()
-    points_model<- dbGetQuery(con_pg, "select * FROM public.planet_osm_point limit 0")
-    lines_model<- dbGetQuery(con_pg, "select * FROM public.planet_osm_line limit 0")
-    mpolygons_model<- dbGetQuery(con_pg, "select * FROM public.planet_osm_polygon limit 0")
-    dbDisconnect(con_pg)
-    model <- names(rbind(points_model, lines_model, mpolygons_model))
-    # extract unique requested keys
-    keys <- unique(c(names(named_elements), unlist(unnamed_elements)))
-    # check how many keys are in the model
-    keys_in_model <- intersect(trimws(as.character(keys)), trimws(as.character(model)))
-    # stop if length of keys_in_model is not equal to length of keys, unless it is zero
-    if (length(keys_in_model) != length(keys) & length(keys_in_model) != 0) {
-      print("Please split up the query into both groups. Below the columns available in the dbase.")
-      print(model)
-      stop("Some of the keys used as filter are columns in the dbase, and others are within the tags column.")
-    }
-    
-    where_clauses <- paste(
-      c(
-        ifelse(
-          nzchar(named_elements), 
-          sprintf("\"%s\"='%s'", names(named_elements), named_elements),
-          sprintf("\"%s\" IS NOT NULL", names(named_elements))
-        ),
-        
-        # Unnamed elements: Use "IS NOT NULL"
-        sprintf("\"%s\" IS NOT NULL", unnamed_elements)
-      ),
-      collapse = " OR "
-    )
-    
-    where_clauses_tags <- paste(
-      c(
-        ifelse(
-          nzchar(named_elements), 
-          sprintf("tags @> '\"%s\"=>\"%s\"'", names(named_elements), named_elements),
-          sprintf("tags -> '%s' IS NOT NULL", names(named_elements))
-        ),
-        
-        # Unnamed elements: Use "IS NOT NULL"
-        sprintf("tags -> '%s' IS NOT NULL", unnamed_elements)
-      ),
-      collapse = " OR "
-    )
     
 
-
-    # Download the data
-    con_pg <- get_con_osm()
-    if ("points" %in% datatypes) {
-      # Define your queries
-      column_query <- paste0("SELECT * ,ST_AsText(ST_Transform(way, 4326)) as geometry FROM public.planet_osm_point WHERE (",where_clauses,") AND ST_Transform(way, 4326) && ST_MakeEnvelope(",bbox[1], ", ", bbox[2], ", ", bbox[3], ", ", bbox[4], ", 4326)")
-      tags_query <- paste0("SELECT * ,ST_AsText(ST_Transform(way, 4326)) as geometry FROM public.planet_osm_point WHERE (",where_clauses_tags,") AND ST_Transform(way, 4326) && ST_MakeEnvelope(",bbox[1], ", ", bbox[2], ", ", bbox[3], ", ", bbox[4], ", 4326)")
-
-
-            
-      # Attempt the first query, if it fails, run the second query
-      points <- tryCatch(
-        {
-          dbGetQuery(con_pg, column_query) # Attempt the first query
-        },
-        error = function(e) {
-          # If the first query fails, run the second query
-          dbGetQuery(con_pg, tags_query)
-        }
-      )
-    }
-    if ("lines" %in% datatypes) {
-      column_query <- paste0("SELECT * ,ST_AsText(ST_Transform(way, 4326)) as geometry FROM public.planet_osm_line WHERE (",where_clauses,") AND ST_Transform(way, 4326) && ST_MakeEnvelope(",bbox[1], ", ", bbox[2], ", ", bbox[3], ", ", bbox[4], ", 4326)")
-      tags_query <- paste0("SELECT * ,ST_AsText(ST_Transform(way, 4326)) as geometry FROM public.planet_osm_line WHERE (",where_clauses_tags,") AND ST_Transform(way, 4326) && ST_MakeEnvelope(",bbox[1], ", ", bbox[2], ", ", bbox[3], ", ", bbox[4], ", 4326)")
+    # Convert features_list to SQL query ----
+    #' Convert a single tag_filter() to a SQL fragment.
+    tag_filter_to_sql <- function(filter) {
+      stopifnot(inherits(filter, "osm_tag_filter"))
       
-      lines <- tryCatch(
-        {
-          dbGetQuery(con_pg, column_query) # Attempt the first query
-        },
-        error = function(e) {
-          # If the first query fails, run the second query
-          dbGetQuery(con_pg, tags_query)
-        }
-      )
+      if (filter$is_column) {
+        col <- sprintf('"%s"', filter$key)
+        if      (filter$not_exists)       sprintf('%s IS NULL', col)
+        else if (is.null(filter$value))   sprintf('%s IS NOT NULL', col)
+        else if (filter$negate)           sprintf("%s != '%s'", col, filter$value)
+        else                              sprintf("%s = '%s'", col, filter$value)
+      } else {
+        tag <- sprintf("tags -> '%s'", filter$key)
+        if      (filter$not_exists)       sprintf('%s IS NULL', tag)
+        else if (is.null(filter$value))   sprintf('%s IS NOT NULL', tag)
+        else if (filter$negate)           sprintf("%s != '%s'", tag, filter$value)
+        else                              sprintf("tags @> '\"%s\"=>\"%s\"'", filter$key, filter$value)
+      }
+    }
+    
+    #' Convert a features_list of or_group()s to a full SQL WHERE clause string.
+    #' Result is suitable for pasting directly after WHERE.
+    build_where_clause <- function(features_list) {
+      if (!is.list(features_list) || length(features_list) == 0) stop("features_list must be a non-empty list")
       
+      and_parts <- vapply(features_list, function(grp) {
+        stopifnot(inherits(grp, "osm_or_group"))
+        sql_parts <- vapply(grp, tag_filter_to_sql, character(1))
+        if (length(sql_parts) == 1) sql_parts else sprintf("(%s)", paste(sql_parts, collapse = " OR "))
+      }, character(1))
+      
+      paste(and_parts, collapse = " AND ")
     }
-    if ("mpolygon" %in% datatypes) {
-      column_query <- paste0("SELECT * ,ST_AsText(ST_Transform(way, 4326)) as geometry FROM public.planet_osm_polygon WHERE (",where_clauses,") AND ST_Transform(way, 4326) && ST_MakeEnvelope(",bbox[1], ", ", bbox[2], ", ", bbox[3], ", ", bbox[4], ", 4326)")
-      tags_query <- paste0("SELECT * ,ST_AsText(ST_Transform(way, 4326)) as geometry FROM public.planet_osm_polygon WHERE (",where_clauses_tags,") AND ST_Transform(way, 4326) && ST_MakeEnvelope(",bbox[1], ", ", bbox[2], ", ", bbox[3], ", ", bbox[4], ", 4326)")
-      mpolygon <- tryCatch(
-        {
-          dbGetQuery(con_pg, column_query) # Attempt the first query
-        },
-        error = function(e) {
-          # If the first query fails, run the second query
-          dbGetQuery(con_pg, tags_query)
-        }
-      )
-    }
-    dbDisconnect(con_pg)
     
     
-    # Make readable OSM ids and set as SF objects
-    if ("points" %in% datatypes) { points <- points %>% mutate(osm_id = paste0("node/", osm_id))
-    # prepare the geometry
-    points<-st_as_sf(points, wkt="geometry")
-    points$geometry <- st_set_crs(points$geometry, 4326)
-    }
-    if ("lines" %in% datatypes) { lines <- lines %>% mutate(osm_id = paste0("way/", osm_id))
-    lines<-st_as_sf(lines, wkt="geometry")
-    lines$geometry <- st_set_crs(lines$geometry, 4326)
-    }
-    if ("mpolygon" %in% datatypes) { mpolygon <- mpolygon %>%
-      mutate(osm_id = ifelse(osm_id < 0, 
-                             paste0("relation/", abs(osm_id)),  # Make it positive and prefix with "relation/"
-                             paste0("way/", osm_id))) # Prefix with "way/"
-    mpolygon<-st_as_sf(mpolygon, wkt="geometry")
-    mpolygon$geometry <- st_set_crs(mpolygon$geometry, 4326)
-    # Set all polygons as multipolygons
-    # mpolygon <- mpolygon %>%
-    #   mutate(geometry = if_else(
-    #     st_geometry_type(geometry) == "POLYGON",
-    #     st_cast(geometry, "MULTIPOLYGON"),
-    #     geometry
-    #   ))
-    # Because if_else can fail on different data types for TRUE (sfc_MULTIPOLYGON) and FALSE (sfc_GEOMETRY), use this simplified mutate:
-    mpolygon <- mpolygon %>% mutate(geometry = st_cast(geometry, "MULTIPOLYGON"))
+    # Query execution -----
     
-    }          
-
+    #' Actual OSM download for a features_list.
+    #'
+    #' @param features_list  list of or_group()s — the query to execute.
+    #' @param bbox           Numeric vector c(xmin, ymin, xmax, ymax) in WGS84.
+    #' @param datatypes      Character vector, any of "points", "lines", "mpolygon".
+    #' @return Named list with elements corresponding to requested datatypes.
+      where <- build_where_clause(features_list)
+      bbox_sql <- sprintf("ST_MakeEnvelope(%s, %s, %s, %s, 4326)", bbox[1], bbox[2], bbox[3], bbox[4])
+      
+      make_query <- function(table) {
+        sprintf(
+          "SELECT *, ST_AsText(ST_Transform(way, 4326)) AS geometry
+       FROM public.%s
+       WHERE (%s) AND ST_Transform(way, 4326) && %s",
+          table, where, bbox_sql
+        )
+      }
+      
+      con_pg <- get_con_osm()
+      on.exit(dbDisconnect(con_pg))
+      
+      if ("points"   %in% datatypes) points   <- dbGetQuery(con_pg, make_query("planet_osm_point"))
+      if ("lines"    %in% datatypes) lines     <- dbGetQuery(con_pg, make_query("planet_osm_line"))
+      if ("mpolygon" %in% datatypes) mpolygon  <- dbGetQuery(con_pg, make_query("planet_osm_polygon"))
     
+    
+      # Make readable OSM ids and set as SF objects
+      if ("points" %in% datatypes) {
+        points <- points %>% 
+          mutate(osm_id = 
+                   dplyr::if_else(osm_id < 0, # Relations recognizable by the negative integer
+                                  paste0("relation/", abs(osm_id)),  # Make them positive and prefix with "relation/" for a valid url
+                                  paste0("node/", osm_id))) # all the others are nodes
+        # prepare the geometry
+        points<-st_as_sf(points, wkt="geometry")
+        points$geometry <- st_set_crs(points$geometry, 4326)
+      }
+      if ("lines" %in% datatypes) {
+        lines <- lines %>% 
+          mutate(osm_id = 
+                   dplyr::if_else(osm_id < 0,
+                                  paste0("relation/", abs(osm_id)),
+                                  paste0("way/", osm_id)))
+        lines<-st_as_sf(lines, wkt="geometry")
+        lines$geometry <- st_set_crs(lines$geometry, 4326)
+      }
+      if ("mpolygon" %in% datatypes) { mpolygon <- mpolygon %>%
+        mutate(osm_id = 
+                 dplyr::if_else(osm_id < 0,
+                                paste0("relation/", abs(osm_id)),
+                                paste0("way/", osm_id)))
+      mpolygon<-st_as_sf(mpolygon, wkt="geometry")
+      mpolygon$geometry <- st_set_crs(mpolygon$geometry, 4326)
+      # Set all polygons as multipolygons
+      mpolygon <- mpolygon %>% mutate(geometry = st_cast(geometry, "MULTIPOLYGON"))
+      }         
     
     # Merge all OSM data to a single dataset
     # Datatypes provided by the user
@@ -497,12 +644,11 @@ download_osm_process <- function(
 
     # flag failed OSM data download
     if (inherits(osm_all, "try-error")) {
-      osm_download_failed <- TRUE
-      print("OSM data download failed")
+      stop("OSM data download failed")
     } else { print("Postgres OSM data download successful")}
 
     
-    # multipolygons that are discontinous are returned as "islands" with the same ID. Here we merge them again
+    # multipolygons that are discontinuous are returned as "islands" with the same ID. Here we merge them again
     ## select just the duplicate osm_id's
     osm_all_dup <- osm_all %>% filter(duplicated(osm_id) | duplicated(osm_id, fromLast = TRUE))
     if(nrow(osm_all_dup) > 0) {
@@ -575,196 +721,15 @@ download_osm_process <- function(
     
         
     
-### END POSTGRES SPECIFIC PART ----
-  } else {
-### START OVERPASS SPECIFIC PART ----
-    print("Downloading data using Overpass API")
-
-  
-
-  ## set custom server (only needed if the main instance is giving trouble; see https://wiki.openstreetmap.org/wiki/Overpass_API#Public_Overpass_API_instances doe more options)
-  if (alternative_overpass_server == TRUE) {
-    custom_server_url <- "https://maps.mail.ru/osm/tools/overpass/api/interpreter"
-    set_overpass_url(custom_server_url)
-  }
-  #default overpass server: https://overpass-api.de/api/interpreter
-
- 
-  
-
-  
-  # special situation if the query is of an AND logic (where we create a feature tag list instead of a list of features)
-  if (feature_tag_list==TRUE) {
-
-    osm_query <- opq(bbox = bbox, timeout = 60)
-    
-    # Reduce function to add features to the query
-    osm_query <- reduce(features_list, function(opq_obj, feature) {
-      if ("key_does_not_exist" %in% names(feature) && feature$key_does_not_exist) {
-        # Handle requests for "this key does not exist" on the object
-        opq_obj <- add_osm_feature(opq_obj, key = paste0("!", feature[[1]]))
-      } else if (!("value" %in% names(feature))) {
-        # Handle the case where only the key is specified
-        opq_obj <- add_osm_feature(opq_obj, key = feature$key)
-      } else {
-        # Handle the case where both key and value are specified
-        if ("negate" %in% names(feature) && feature$negate) {
-          # And the key should NOT equal the value
-          opq_obj <- add_osm_feature(opq_obj, key = feature$key, value = paste0("!", feature$value))
-        } else {
-          # And the key should equal the value
-          opq_obj <- add_osm_feature(opq_obj, key = feature$key, value = feature$value)
-        }
-      }
-      opq_obj
-    }, .init = osm_query)
-
-  
-  } else {
-    #default situation where we simply query a list of features
-    ## get OSM data (use http://bboxfinder.com/ to make a bbox)
-    # Use the defined list of features in the opq function
-    osm_query <- opq(
-      bbox = bbox,
-      timeout = 60
-    ) %>%
-      add_osm_features(features = features_list)
-  } 
-  
- 
-  
-  
-
-  
-  
-  ## Download and clean the data
-  osm_data <- try({
-    osm_data <- unique_osmdata(osmdata_sf(osm_query))
-  })
-  
-  # flag failed OSM data download
-  if (inherits(osm_data, "try-error")) {
-    osm_download_failed <- TRUE
-    print("OSM data download failed")
-  } else { print("OSM data download successful")}
-  
-  
-  # we split the OSM data blob up by data type. We do this for polygons (which we assume to always exist) and points, lines and multipolygons. Even if we don't need them! At the end, we merge all the data back together, but only of the type requested by the user.
-  
-  osm_polygons <- osm_data$osm_polygons %>% mutate(osm_id = paste0("way/", osm_id))
-  
-  # check and see if we can make points (this creates osm_points if there is no error else it creates an empty set)
-  result_point <- try({
-    if (!is.null(osm_data$osm_points) && (nrow(osm_data$osm_points) > 0)) {
-      osm_points <- osm_data$osm_points %>% mutate(osm_id = paste0("node/", osm_id))
-    } else {
-      # Handle the case when osm_data$osm_points is NULL
-      osm_points <- osm_polygons[0, ]
-    }
-  })
-  
-  # same for multipolygons
-  result_mp <- try({
-    if (!is.null(osm_data$osm_multipolygons) && (nrow(osm_data$osm_multipolygons) > 0)) {
-              osm_multipolygons <- osm_data$osm_multipolygons %>% mutate(osm_id = paste0("relation/", osm_id))
-      } else {
-      # Handle the case when osm_data$osm_multipolygons is NULL
-      osm_multipolygons <- osm_polygons[0, ]
-    }
-  })
-  
-  # and same for lines
-  result_line <- try({
-    if (!is.null(osm_data$osm_lines) && (nrow(osm_data$osm_lines) > 0)) {
-      osm_lines <- osm_data$osm_lines %>% mutate(osm_id = paste0("way/", osm_id))
-    } else {
-      # Handle the case when osm_data$osm_multipolygons is NULL
-      osm_lines <- osm_polygons[0, ]
-    }
-  })  
-  
-   
-
-  
-  
-  
-  
-  
-  
-  ### Prepare OSM points
-  # Standardise columns:
-  ## select only the columns that interest us, then make sure the dataframe always has these columns
-  ## "extra_columns" are provided by the user
-  
- 
-  
-  columns_to_select <- c(default_columns, extra_columns)
-  
-  
-  
-  # Keep only interesting columns in point data
-  osm_points_limited <- osm_points %>%
-    select(any_of(columns_to_select))
-  
-  # Create a data frame with missing columns filled with NA values
-  missing_columns <- as.data.frame(matrix(NA, nrow = nrow(osm_points), ncol = length(setdiff(columns_to_select, colnames(osm_points)))))
-  colnames(missing_columns) <- setdiff(columns_to_select, colnames(osm_points))
-  
-  # Combine the selected columns and the missing columns
-  points <- cbind(osm_points_limited, missing_columns)
-  
-  # Note: we do this because once we are in the SQL environment, we want to have a stable set of columns. If for some reason one of the columns would not exist in the data we download, then no column would exist
-  
-  
-  ### Prepare OSM polygon info (merge polygons & multipolygons and set all as mp)
-  osm_mpolygon <- bind_rows(
-    osm_multipolygons,
-    osm_polygons %>% mutate(geometry = st_cast(geometry, "MULTIPOLYGON"))
-  )
-  osm_mpolygon <- osm_mpolygon %>%
-    select(any_of(columns_to_select))
-  
-  # Create a data frame with missing columns filled with NA values
-  missing_columns_p <- as.data.frame(matrix(NA, nrow = nrow(osm_mpolygon), ncol = length(setdiff(columns_to_select, colnames(osm_mpolygon)))))
-  colnames(missing_columns_p) <- setdiff(columns_to_select, colnames(osm_mpolygon))
-  
-  # Combine the selected columns and the missing columns
-  mpolygon <- cbind(osm_mpolygon, missing_columns_p)
-  
-  
-  ### Prepare OSM line info
-  # Keep only interesting columns
-  osm_lines_limited <- osm_lines %>%
-    select(any_of(columns_to_select))
-  
-  # Create a data frame with missing columns filled with NA values
-  missing_columns <- as.data.frame(matrix(NA, nrow = nrow(osm_lines), ncol = length(setdiff(columns_to_select, colnames(osm_lines)))))
-  colnames(missing_columns) <- setdiff(columns_to_select, colnames(osm_lines))
-  
-  # Combine the selected columns and the missing columns
-  lines <- cbind(osm_lines_limited, missing_columns)
-  
-  
-  # Merge all OSM data to a single dataset
-  # Datatypes provided by the user
-  # if datatypes variable has more than one value, bind_rows:
-  if (length(datatypes) > 1) {
-    osm_all <- bind_rows(mget(datatypes))
-  } else {
-    osm_all <- get(datatypes)
-  }
-  
-  
-} 
-### END OVERPASS SPECIFIC PART----
   
   # keep only objects within our area of interest
   ## download the spatial filter
-  con_pg <- get_con()
-  spatial_filter <- dbGetQuery(con_pg, "SELECT ST_AsText(geometry) as geometry FROM raw_data.anchor_db_spatial_filter")
-  dbDisconnect(con_pg)
-  spatial_filter<-st_as_sf(spatial_filter, wkt="geometry")
+  con_pg_curation <- get_con()
+  on.exit(dbDisconnect(con_pg_curation), add = TRUE)
+  spatial_filter <- dbGetQuery(con_pg_curation, "SELECT ST_AsHEXEWKB(geometry) as geometry FROM raw_data.anchor_db_spatial_filter")
+  spatial_filter$geometry <- st_as_sfc(structure(spatial_filter$geometry, class = "WKB"), EWKB = TRUE)
   spatial_filter$geometry <- st_set_crs(spatial_filter$geometry, 4326)
+  spatial_filter <- st_as_sf(spatial_filter)
   ## select only records within this geometry
   osm_all <- st_filter(osm_all, spatial_filter, .predicate = st_intersects)
   
@@ -776,14 +741,9 @@ download_osm_process <- function(
   osm_all <- osm_all %>%
     rename_all(tolower)  
   
-  # standardise emtpy values in string columns (for some reason, relations end up having empty strings instead of nulls)
-  replace_empty_with_null <- function(x) {
-    ifelse(x == "", NA_character_ , x)
-  }
-  string_columns <- names(osm_all)[sapply(osm_all, is.character) & names(osm_all) != "geometry"]
-  osm_all <- osm_all %>%
-    mutate_at(vars(all_of(string_columns)), ~ replace_empty_with_null(.))
-  
+
+
+  osm_all <- clean_empty_strings(osm_all)
   
   # columns with only NULLs are boolean type. This causes problems later. So recast all of them to string.
   recast_boolean_to_string <- function(sf_data) {
@@ -830,14 +790,12 @@ download_osm_process <- function(
   # Add transformation check
   cat("Summary of the data downloaded from OSM:
       ")
-  print(t(basic_stats_raw_data), row.names=FALSE)
-  cat(paste0("The table shows how many objects were downloaded, and how many were kept after removing empty and unfixable geometries.\n\n OSM query: \n",paste(paste(names(features_list), unlist(features_list), sep = "="), collapse = "\n"),"\n"))
-  #write.table(t(basic_stats_raw_data), filename, sep = "\t", quote = FALSE, row.names=TRUE, append = TRUE)
-  #cat(paste0("The table shows how many objects were downloaded, and how many were kept after removing empty and unfixable geometries.\n\n OSM query: \n",paste(paste(names(features_list), unlist(features_list), sep = "="), collapse = "\n")), file = filename, append = TRUE)
-  #print(paste0("Report about the new OSM data download written to ", filename))
+capture <- capture.output(print(t(basic_stats_raw_data), row.names=FALSE))
+cat(paste(capture, collapse="\n"), "\n")
+cat(paste0("The table shows how many objects were downloaded, and how many were kept after removing empty and unfixable geometries.\n\n OSM query: \n",
+           paste(describe_features_list(features_list)),"\n"))  
   
-  
-  
+
   
   # join ngi_municipality & deal with multilingual & missing names ----
   ### Download NGI data
@@ -845,18 +803,17 @@ download_osm_process <- function(
   if (exists("ngi_muni_cleaned")) {
     ngi_muni <- ngi_muni_cleaned
   } else {
-    con_pg <- get_con()
-  ngi_muni <- dbGetQuery(con_pg, "SELECT niscode, CASE WHEN languagestatute=1 THEN 'dut'
+  ngi_muni <- dbGetQuery(con_pg_curation, "SELECT niscode, CASE WHEN languagestatute=1 THEN 'dut'
 WHEN languagestatute=5 THEN 'dut'
 WHEN languagestatute=4 THEN 'brussels'	
 WHEN languagestatute=8 THEN 'ger'	
 WHEN languagestatute=7 THEN 'fre'		
 WHEN languagestatute=6 THEN 'fre'
 WHEN languagestatute=2 THEN 'fre'
-ELSE 'und' END as language, nameger, namefre, namedut, ST_AsText(shape) as geometry FROM raw_data.ngi_ign_municipality")
-  dbDisconnect(con_pg)
-  ngi_muni<-st_as_sf(ngi_muni, wkt="geometry")
+ELSE 'und' END as language, nameger, namefre, namedut, ST_AsHEXEWKB(shape) as geometry FROM raw_data.ngi_ign_municipality")
+  ngi_muni$geometry <- st_as_sfc(structure(ngi_muni$geometry, class = "WKB"), EWKB = TRUE)
   ngi_muni$geometry <- st_set_crs(ngi_muni$geometry, 4326)
+  ngi_muni <- st_as_sf(ngi_muni)
   ngi_muni_cleaned<<-ngi_muni
   }
  
@@ -906,20 +863,24 @@ run_process <- function(expr, process_name) {
 
 # Join a dataset interesting because of its attributes to a dataset interesting for its geometry, based on distance, name and address notation ----
 
+# assumes both datasets are in Lambert72
+# can consume other distance_matched_threshold and distance_raw_threshold values
+
 merge_to_external_polygons <- function(
     attribute_features, # name of the dataset with the interesting attributes
     geom_features, # name of the dataset with the interesting geometries
-    attr_id_col, # name of the unique identifier in the attribute dataset
-    geom_id_col, # name of the unique identifier in the geometry dataset 
-    attr_name_col, # name of the name field (attr)
-    geom_name_col, # name of the name field (geom)
+    attr_id_col = "original_id", # name of the unique identifier in the attribute dataset
+    geom_id_col = "osm_id", # name of the unique identifier in the geometry dataset 
+    attr_name_col = "name", # name of the name field (attr)
+    geom_name_col = "name", # name of the name field (geom)
     attr_street_col, # name of the streetname column (attr)
     attr_hnr_col, # name of the house number column (attr)
     geom_street_col,# name of the streetname column (geom)
     geom_hnr_col, # name of the house number column (geom)
     distance_matched_threshold = 50, # distance where we consider something "quite closeby"
     distance_raw_threshold = 250, # remotest distance where we want to look for possible candidates
-    patterns_to_remove # a list of strings that should be removed from the name, because they are meaningless in the context (e.g. the word "school" should not help make a match better if the dataset is about schools and lots of records include that word in the name
+    patterns_to_remove, # a list of strings that should be removed from the name, because they are meaningless in the context (e.g. the word "school" should not help make a match better if the dataset is about schools and lots of records include that word in the name
+    force_same_name = "no" # by default, objects can be merged, even if they don't have a similar name. Use "strong" to enforce same name in all circumstances and "soft" to enforce same name unless the distance is less than 1/10 of the distance_matched_threshold
 ) {
   
   start_time <- Sys.time()
@@ -937,10 +898,7 @@ merge_to_external_polygons <- function(
     stop("Geometry of the features providing a geometry should be in EPSG:31370")
   }
   
-  clean_string <- function(x) {
-    # Remove all characters except numbers, letters, hyphens, and semicolons
-    gsub("[^0-9a-zA-Z;-]", "", x)
-  }
+
   
   
   # Prepare attribute_features
@@ -1013,19 +971,12 @@ merge_to_external_polygons <- function(
       name_geom=stri_trans_general(name_geom, "Latin-ASCII")
     )
   
-  # check for identical names
-  join <- join %>%
-    mutate(
-      same_name = ifelse(name_attr==name_geom, 1, 0)
-    )
-  
-  
-  
+
   # apply to these columns:
   columns_to_clean <- c("name_geom", "name_attr")
   
   # default removals
-  default_patterns_to_remove <- c("\"", "”", "“", "´")
+  default_patterns_to_remove <- c("\"", "”", "“", "´", "\\*")
   join <- string_removal(join, columns_to_clean, default_patterns_to_remove)
   # string_removal is a function defined in utils.R
   
@@ -1037,28 +988,59 @@ merge_to_external_polygons <- function(
   # remove leading and trailing whitespaces
   join <- join %>%
     mutate(
-      name_attr = trimws(name_attr),
-      name_geom = trimws(name_geom)
+      name_attr = str_squish(name_attr),
+      name_geom = str_squish(name_geom)
+    )
+ 
+  # check for identical names
+  join <- join %>%
+    mutate(
+      same_name = ifelse(name_attr==name_geom, 1, 0)
     )
   
-  # find the longest common substring
+  # Small function to use LCS without throwing errors if one of the values is NA
+  safe_lcs <- function(a, b) {
+    if (is.na(a) | is.na(b)) return(NA_character_)
+    LCSn(c(tolower(a), tolower(b)))
+  }
+
+  # find the longest common substring  
   join <- join %>%
     rowwise() %>%
-    mutate(lcs=LCSn(c(tolower(name_attr), tolower(name_geom)))) %>%
-    mutate(longest_common_str_length=nchar(lcs))
+    mutate(
+      lcs = safe_lcs(name_attr, name_geom),
+      longest_common_str_length = nchar(lcs)
+    )
   
+  # is one name the substring of the other
+  join <- join %>%
+    mutate(
+      condition = !is.na(name_attr) & !is.na(name_geom) &
+        nchar(as.character(name_attr)) > 1 &
+        nchar(as.character(name_geom)) > 1,
+      name_sim = ifelse(
+        condition,
+        as.integer(
+          str_detect(as.character(name_attr), fixed(as.character(name_geom))) |
+            str_detect(as.character(name_geom), fixed(as.character(name_attr)))
+        ),
+        0L
+      )
+    ) %>%
+    select(-condition)
+
   # shorten name before calculating length
   join$length_name<-nchar(join$name_attr)
-  
-  
-  
-  
+
   
   # Decide when we consider the names to be the same (length should de significant)
   join <- join %>%
     mutate(
       same_name = ifelse(
-        ((longest_common_str_length > 10 | (longest_common_str_length > 4 & longest_common_str_length <= 10 & longest_common_str_length > length_name / 2)) |        name_attr==name_geom | same_name==1),
+        ((longest_common_str_length > 10 | (longest_common_str_length > 4 & longest_common_str_length <= 10 & longest_common_str_length > length_name / 2)) |
+          name_attr==name_geom |
+          same_name==1 |
+          name_sim==1),
         1,
         0
       )
@@ -1066,7 +1048,7 @@ merge_to_external_polygons <- function(
   
   
   join <- join %>%
-    select(-lcs, -longest_common_str_length, -length_name)
+    select(-lcs, -longest_common_str_length, -length_name, -name_sim)
   
   
   ### 2. street similarity ----
@@ -1140,8 +1122,8 @@ merge_to_external_polygons <- function(
   join <- join %>%
     mutate(
       condition = nchar(street_geom) > 3 & nchar(street_attr) > 3,
-      substring_left_check = ifelse(condition, str_detect(street_attr, street_geom), FALSE),
-      substring_right_check = ifelse(condition, str_detect(street_geom, street_attr), FALSE),
+      substring_left_check = ifelse(condition, str_detect(street_attr, replace_na(street_geom,"")), FALSE),
+      substring_right_check = ifelse(condition, str_detect(street_geom, replace_na(street_attr,"")), FALSE),
       streetsim = ifelse((substring_left_check | substring_right_check) & streetsim<0.9, 0.9, streetsim)
     ) %>%
     select(-condition, -substring_right_check, -substring_left_check)
@@ -1163,8 +1145,8 @@ merge_to_external_polygons <- function(
   join <- join %>%
     mutate(
       condition = nchar(as.character(hnr_attr)) > 1 & nchar(as.character(hnr_geom)) > 1,
-      substring_left_check = ifelse(condition, str_detect(as.character(hnr_attr), as.character(hnr_geom)), FALSE),
-      substring_right_check = ifelse(condition, str_detect(as.character(hnr_geom), as.character(hnr_attr)), FALSE),
+      substring_left_check = ifelse(condition, str_detect(as.character(hnr_attr), replace_na(as.character(hnr_geom),"")), FALSE),
+      substring_right_check = ifelse(condition, str_detect(as.character(hnr_geom), replace_na(as.character(hnr_attr),"")), FALSE),
       hnr_sim = ifelse((substring_left_check | substring_right_check) & hnr_sim<0.9 , 0.9, hnr_sim)
     ) %>%
     select(-condition, -substring_right_check, -substring_left_check)
@@ -1205,9 +1187,23 @@ merge_to_external_polygons <- function(
   
   
   ### Make choices ----
+  
   # SELECT only if certain quality thresholds met
-  join <- join %>%
-    filter(distance < distance_matched_threshold | address_certainty >= 0.85 | same_name ==1)
+  
+  ## how important is name concordance?
+  ## make sure a valid option was provided
+  force_same_name <- match.arg(force_same_name, choices = c("no", "strong", "soft"))
+  if (force_same_name=="no") {
+    join <- join %>%
+      filter(distance < distance_matched_threshold | address_certainty >= 0.85 | same_name ==1)
+    } else if (force_same_name=="strong") {
+    join <- join %>%
+      filter(same_name ==1)
+    } else if (force_same_name=="soft") {
+    join <- join %>%
+      filter(same_name == 1 | distance <= distance_matched_threshold/10)
+  }  
+  
   
   # order by distance
   join <- join %>%
@@ -1286,6 +1282,404 @@ merge_to_external_polygons <- function(
   attr_features <- attr_features %>%
     rename(!!geom_id_col := geom_id)
   
+  # transform back to WGS84
+  attr_features <- st_transform(attr_features, 4326)
+  
   return(attr_features)
   
+}
+
+
+
+# Concatenate names of records in a group, with the value of the "outer" as primary, and any other names between brackets ----
+
+aggregate_names <- function(df, names_to_aggregate) {
+  for (col in names_to_aggregate) {
+    df <- df %>%
+      group_by(outer_id) %>%
+      mutate(
+        primary_name = ifelse(!is.na(get(col))[osm_id == outer_id][1], get(col)[osm_id == outer_id][1], NA),
+        other_names = paste(
+          unique(na.omit(get(col)[osm_id != outer_id & (is.na(primary_name) | get(col) != primary_name)])),
+          collapse = ", "
+        ),
+        across(col, ~ case_when(
+          count > 1 & !is.na(other_names) & other_names != "" & (is.na(primary_name) | primary_name == "") ~ other_names,
+          count > 1 & !is.na(other_names) & other_names != "" ~ paste0(primary_name, " (", other_names, ")"),
+          TRUE ~ .
+        ))
+      ) %>%
+      ungroup() %>%  select(-primary_name, -other_names)  # Remove temporary columns
+  }
+  
+  return(df)
+}
+
+
+# Merge OSM objects to OSM objects they are completely within ----
+osmspatial_deduplication <- function(
+	osm_dataset, # name of the dataset to deduplicate
+	custom_columns_to_aggregate, # list of columns in c(x, y) format beyond default OSM selection that you wish to aggregate
+	pre_aggregation_hook = NULL
+	) {
+## first define a set of potential outers
+    osm_outers<-osm_dataset %>%
+      select(outer_id=osm_id) %>%
+      filter(!st_is(geometry, "POINT"))
+
+    print(paste0("There are ",nrow(osm_outers)," potential outers"))
+	  print(paste0("Original number of objects is ",nrow(osm_dataset)))
+      ## then join them to the objects
+      join <- st_join(osm_dataset, osm_outers, join = st_within)
+      
+      # count the number of times an inner is used (to later find objects that are linked to itself and something else too, or to more than one outer)
+      join<-join %>%
+        mutate(outer_id=case_when(!is.na(outer_id)~outer_id, TRUE~osm_id)) %>%
+        group_by(osm_id) %>%
+        mutate(count_inner=n())
+      # remove if the inner is used by an outer but still refers to itself as well
+      join<-join %>%
+        filter(count_inner==1 | (count_inner>1 & osm_id!=outer_id))
+      
+      
+      # add a count with the number of times an outer is used
+      join<-join %>%
+        group_by(outer_id) %>%
+        mutate(count=n())
+      
+	    print(paste0("The object with the largest amount of 'inners' has ",max(join$count)-1," objects that will be merged to it"))
+	  
+      # count inners again and give them an order_inner number, where 1 is for the case linked to the biggest count (outer)
+      join<-join %>%
+        group_by(osm_id) %>%
+        mutate(count_inner=n()) %>%
+        arrange(desc(count)) %>%
+        mutate(order_inner = row_number())
+      
+      # if count_inner>1, take the first one (i.e. the one linked to the biggest polygon)
+      join<-join %>%
+        filter(count_inner==1 | (count_inner>1 & order_inner==1))
+      
+	  
+	  default_columns_to_aggregate <- c("contact_email", "email", "website", "contact_website", "phone", "contact_phone",
+              "opening_hours", "phone_2", "mobile", "contact_mobile", "alt_website", "operator_email", "check_date", "image", "wikidata", "network_wikidata", "language")
+	  
+	  all_columns_to_aggregate <- c(custom_columns_to_aggregate,default_columns_to_aggregate)
+	  
+	  # Apply optional pre-aggregation transformation
+	  if (!is.null(pre_aggregation_hook)) {
+	    join <- pre_aggregation_hook(join)
+	  }
+
+      # create normal aggregated variables
+      join <- join %>%
+        group_by(outer_id) %>%
+        mutate(
+          across(any_of(all_columns_to_aggregate), ~ collapse_unique(.x))
+        )
+      
+      
+      # Define list of columns for name aggregation
+      names_to_aggregate <- c("name", "name_nl", "name_fr", "name_de", "alt_name", "short_name", "official_name", "old_name")
+      
+      
+      # Call the function to aggregate names
+      join <- aggregate_names(join, names_to_aggregate)
+      
+      # Build collapsed address per outer
+      address_df <- collapse_address(join, outer_id)
+      join <- join %>%
+        left_join(address_df, by = "outer_id")
+      
+      # Save a dataframe with just the OSM_id of objects that have been simplified
+      osm_diagnostic <- as.data.frame(join) %>%
+        filter(count > 1 & osm_id != outer_id) %>%
+        select(osm_id, outer_id, count)
+      
+      # Filter records based on the count and outer_id conditions
+      ## Grouped objects only have a different ID and geometry at this point. This filter keeps just the record we defined as outer.
+      osm_dedup <- join %>%
+        filter(count == 1 | (count > 1 & outer_id == osm_id)) %>%
+        select(-outer_id, - count_inner, -count, -order_inner)
+      print(paste0("Number of objects after deduplication ",nrow(osm_dedup),". There were ",nrow(osm_diagnostic)," objects that received info of at least one other object."))
+      
+      # make available outside the function
+      return(list(
+        data = osm_dedup,
+        diagnostic = osm_diagnostic
+      ))
+    
+}
+
+# usage example:  
+#result <- osmspatial_deduplication(osm_all, c("tourism", "rooms"))
+#osm_all <- result$data
+#osm_diagnostic <- result$diagnostic
+
+
+# summarize dataset based on some shared attribute ----
+summarize_by_value <- function(df, group_col, id_col, summary_cols, max_cols = NULL, geom_col = "geometry") {
+  max_cols <- intersect(max_cols, summary_cols)
+  cols_to_collapse <- setdiff(c(id_col, summary_cols), c(group_col, max_cols))
+  cols_to_max <- setdiff(max_cols, group_col)
+  has_geom <- geom_col %in% names(df)
+  add_geom <- has_geom && !(geom_col %in% group_col)
+  
+  collapse_unique <- function(x) {
+    vals <- unique(na.omit(x))
+    if (length(vals) == 0) NA_character_ else paste(vals, collapse = "; ")
+  }
+  
+  # note: make sure the data has no empty strings before running this (run clean_empty_strings if needed)
+  collapse_max <- function(x) {
+    vals <- na.omit(x)
+    if (length(vals) == 0) return(NA)
+    num_vals <- suppressWarnings(as.numeric(as.character(vals)))
+    if (any(is.na(num_vals))) {
+      stop("collapse_max: non-numeric value(s) encountered: ",
+           paste(unique(vals[is.na(num_vals)]), collapse = ", "))
+    }
+    
+    max(num_vals)
+  }
+  
+  grouped <- df %>%
+    group_by(across(all_of(group_col)))
+  
+  agg_exprs <- list(
+    rlang::expr(across(all_of(cols_to_collapse), collapse_unique))
+  )
+  if (length(cols_to_max) > 0) {
+    agg_exprs <- c(agg_exprs, list(rlang::expr(across(all_of(cols_to_max), collapse_max))))
+  }
+  
+  if (add_geom) {
+    grouped %>%
+      summarize(
+        !!!agg_exprs,
+        "{geom_col}" := first(.data[[geom_col]]),
+        .groups = "drop"
+      )
+  } else {
+    grouped %>%
+      summarize(
+        !!!agg_exprs,
+        .groups = "drop"
+      )
+  }
+}
+
+# usage example
+#seveso_dedup <- summarize_by_value(
+#  df           = seveso_all,
+#  group_col    = "geometry",
+#  id_col       = "original_id",
+#  summary_cols = c("name", "data_list_id", "risk_level", "streetname", "city", "zip"),
+#  max_cols     = "risk_level"
+#)
+
+# use certain columns to create a properties json column, then remove the columns used for it ----
+build_json_column <- function(df, cols, output_col, data_list_id = NULL) {
+  df %>%
+    rowwise() %>%
+    mutate(!!output_col := {
+      vals <- purrr::discard(
+        as.list(pick(all_of(cols))),
+        is.na
+      )
+      if (!is.null(data_list_id)) {
+        vals <- list(vals)
+        names(vals) <- data_list_id
+      }
+      jsonlite::toJSON(vals, auto_unbox = TRUE)
+    }) %>%
+    ungroup() %>%
+    select(-all_of(setdiff(cols, output_col)))
+}
+
+# standardize default OSM columns so they can be used in the properties ----
+build_osm_derived_columns <- function(df) {
+  
+  cols_to_remove <- c(
+    "short_name", "official_name", "alt_name", "old_name",
+    "contact_email", "email",
+    "contact_mobile", "mobile", "contact_phone", "phone", "phone_2",
+    "website", "contact_website", "alt_website",
+    "addr_street", "addr_housenumber", "nohousenumber", "addr_postcode", "addr_city"
+  )
+  
+  # Ensure all potentially missing columns exist as NA
+  address_cols <- c("address", "addr_street", "addr_housenumber", "nohousenumber", "addr_postcode", "addr_city")
+  for (col in address_cols) {
+    if (!col %in% names(df)) df[[col]] <- NA_character_
+  }
+  
+  other_name_cols <- c("short_name", "official_name", "alt_name", "old_name")
+  for (col in other_name_cols) {
+    if (!col %in% names(df)) df[[col]] <- NA_character_
+  }
+  
+  contact_cols <- c("contact_email", "email", "contact_mobile", "mobile", 
+                    "contact_phone", "phone", "phone_2", "website", "contact_website", "alt_website")
+  for (col in contact_cols) {
+    if (!col %in% names(df)) df[[col]] <- NA_character_
+  }
+  
+  df %>%
+    rowwise() %>%
+    mutate(
+      other_names = ifelse(
+        all(is.na(c(short_name, official_name, alt_name, old_name))),
+        NA_character_,
+        paste(na.omit(c(short_name, official_name, alt_name, old_name)), collapse = "; ")
+      ),
+      local_email = ifelse(
+        all(is.na(c(contact_email, email))),
+        NA_character_,
+        paste(na.omit(c(contact_email, email)), collapse = "; ")
+      ),
+      local_phone = ifelse(
+        all(is.na(c(contact_mobile, mobile, contact_phone, phone, phone_2))),
+        NA_character_,
+        paste(na.omit(c(contact_mobile, mobile, contact_phone, phone, phone_2)), collapse = "; ")
+      ),
+      local_website = ifelse(
+        all(is.na(c(website, contact_website, alt_website))),
+        NA_character_,
+        paste(na.omit(c(website, contact_website, alt_website)), collapse = "; ")
+      ),
+      address = if_else(
+        !is.na(address),  # priority: keep pre-built address (e.g. from collapse_address)
+        address,
+        if_else(
+          is.na(addr_street),
+          NA_character_,
+          trimws(paste0(
+            addr_street, " ",
+            if_else(!is.na(nohousenumber) & nohousenumber == "yes", "w/n", coalesce(addr_housenumber, "")),
+            ", ",
+            paste0(coalesce(addr_postcode, ""), " "),
+            coalesce(addr_city, "")
+          ))
+        )
+      )
+    ) %>%
+    ungroup() %>%
+    select(-any_of(cols_to_remove))
+}
+
+
+
+# Email functions ----
+#  """""""""""""""""" ----------------------
+# Get access token (client credentials flow) ----
+get_office365_email_token <- function(tenant_id, client_id, client_secret) {
+  url <- sprintf("https://login.microsoftonline.com/%s/oauth2/v2.0/token", tenant_id)
+  
+  resp <- request(url) |>
+    req_body_form(
+      grant_type    = "client_credentials",
+      client_id     = client_id,
+      client_secret = client_secret,
+      scope         = "https://graph.microsoft.com/.default"
+    ) |>
+    req_error(is_error = \(r) FALSE) |>
+    req_perform()
+  
+  body <- resp |> resp_body_json()
+  
+  if (!is.null(body$error)) {
+    stop(sprintf("Token error [%s]: %s", body$error, body$error_description))
+  }
+  
+  message("✓ Access token obtained (expires in ", body$expires_in, "s)")
+  body$access_token
+}
+
+# Paginated Graph API GET when accessing inbox ----
+
+## add simple syntax for doing a unless it is missing
+`%||%` <- function(a, b) if (!is.null(a)) a else b
+
+graph_get <- function(token, url, ...) {
+  all_values <- list()
+  
+  repeat {
+    resp <- request(url) |>
+      req_headers(Authorization = paste("Bearer", token)) |>
+      req_url_query(...) |>
+      req_error(is_error = \(r) FALSE) |>
+      req_perform()
+    
+    if (resp_status(resp) >= 400) {
+      body <- resp |> resp_body_json()
+      stop(sprintf("Graph API error %s: %s",
+                   resp_status(resp),
+                   body$error$message %||% "unknown"))
+    }
+    
+    body <- resp |> resp_body_json()
+    all_values <- c(all_values, body$value)
+    
+    # Follow @odata.nextLink for pagination
+    next_link <- body[["@odata.nextLink"]]
+    if (is.null(next_link)) break
+    url <- next_link
+  }
+  
+  all_values
+}
+
+# List mail folders ----
+email_list_folders <- function(token, mailbox) {
+  url <- sprintf(
+    "https://graph.microsoft.com/v1.0/users/%s/mailFolders",
+    utils::URLencode(mailbox, reserved = TRUE)
+  )
+  folders <- graph_get(token, url, `$top` = 50)
+  
+  folder_df <- data.frame(
+    id          = sapply(folders, `[[`, "id"),
+    displayName = sapply(folders, `[[`, "displayName"),
+    totalItems  = sapply(folders, \(f) f$totalItemCount %||% NA_integer_),
+    unreadItems = sapply(folders, \(f) f$unreadItemCount %||% NA_integer_),
+    stringsAsFactors = FALSE
+  )
+  folder_df
+}
+
+
+# Send an email ----
+send_an_email <- function(token, from, to, subject, body) {
+  url <- sprintf(
+    "https://graph.microsoft.com/v1.0/users/%s/sendMail",
+    utils::URLencode(from, reserved = TRUE)
+  )
+  
+  payload <- list(
+    message = list(
+      subject = subject,
+      body    = list(contentType = "Text", content = body),
+      toRecipients = list(list(emailAddress = list(address = to)))
+    )
+  )
+  
+  resp <- request(url) |>
+    req_headers(Authorization = paste("Bearer", token), `Content-Type` = "application/json") |>
+    req_body_json(payload) |>
+    req_error(is_error = \(r) FALSE) |>
+    req_perform()
+  
+  if (resp_status(resp) == 202) {
+    message(paste0("Email sent to ", to, " about ",subject))
+    return(invisible(TRUE))
+  } else {
+    message("Sending email failed: ", resp_body_json(resp)$error$message)
+    return(invisible(FALSE))
+  }
+}
+
+# Turn html into human readable text
+strip_html <- function(html) {
+  html %>% read_html() %>% html_text2()
 }

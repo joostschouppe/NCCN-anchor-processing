@@ -22,6 +22,7 @@ data_list_id_ostbelgien<-"c5321bf8-4772-4ec5-9f65-a462382b6892"
 
 legend_item_nursery_afterschool <- "cbc03961-798f-46ee-aaf5-2f4f4fc799cf"
 legend_item_nursery_preschool <- "1d1db4eb-17e2-485a-9def-9f5df6efa63d"
+legend_item_nursery_specialneeds <- "829ac1bd-f1a9-4bc1-a1ee-18d18c2033a4"
 
 #readRenviron("C:/projects/pgn-data-airflow/.Renviron")
 
@@ -53,7 +54,16 @@ do_dry_run<-ifelse(tolower(do_dry_run) == "true", TRUE, FALSE)
 # Set location for files received by email
 offline_storage <-Sys.getenv("OFFLINE_STORAGE")
 data_folder <- paste0(offline_storage,"/nursery/")
-ostbelgien_data <- paste0(data_folder,"2025 02 Versand Kontaktangaben nationales Krisenzentrum cleaned.xlsx")
+ostbelgien_data <- paste0(data_folder,"2026 05 Versand Kontaktangaben nationales Krisenzentrum cleaned.xlsx")
+
+# if the source file is updated, set use_raw_excel to TRUE. Set to false serverside
+use_raw_excel <- Sys.getenv("FRESH_OSTBELGIEN_DATA")
+use_raw_excel <- ifelse(tolower(use_raw_excel) == "true", TRUE, FALSE)
+if (use_raw_excel) {
+  warning("You will reprocess the raw excel data from ostbelgien. Are you sure you want to do that? If the file is unchanged, it could still change results because of phacochr quirks")
+} else if (run_status) {
+  warning("Even if there is a new file on the Airflow server, it will not be processed unless you set the variable FRESH_OSTBELGIEN_DATA to true in the Admin > Variables section.")
+}
 
 
 # Set log folder
@@ -108,13 +118,15 @@ getPagesAndContent <- function(query_url) {
   df <- data.frame()
   all_ids <- c()  # To keep track of unique identifiers
   
-  for (page in 1:total_pages) {
-    print(paste("Fetching page", page))
-    
+	for (page in 1:total_pages) {
+   
     # Pagenumber is zero-based. totalPages is one-based
     page_url = page - 1
     next_page <- paste0(query_url, "&page=", page_url, "&size=", page_size, "&sort=LAST_UPDATED_DESC")
-    print(next_page)  # Debug: Print the URL being requested
+
+	  if (page %% 10 == 0 || page == 1 || page == total_pages) {
+		print(paste("Fetching page", page, "of", total_pages, ": ", next_page))
+	  }
     
     response <- GET(url = next_page)
     content <- fromJSON(rawToChar(response$content))$content
@@ -203,45 +215,77 @@ groepsopvang$type<- "Groepsopvang voor kinderen"
 
 
 df_tmp <- NA
-url <- "https://www.desocialekaart.be/api/health-offers?rubrics=10.07.04.%20Opvang%20schoolgaande%20kinderen%20(schooljaar%20en%20vakantie)"
+url <- "https://www.desocialekaart.be/api/health-offers?rubrics=10.07.04.02.%20Opvang%20voor%20kinderen%20met%20een%20specifieke%20zorgbehoefte"
 df_tmp <- getPagesAndContent(query_url = url)
-naschools <- transformTable(df = df_tmp)
-naschools$type<- "Opvang schoolgaande kinderen (schooljaar en vakantie)"
+df_tmp <- transformTable(df = df_tmp)
+df_tmp <- unique(df_tmp)
+if (nrow(df_tmp) != total_elements) {
+  stop("The server did not return all the records it said it has for Specifieke opvang")
+}
+specifieke_opvang <- df_tmp
+specifieke_opvang$type<- "Opvang voor kinderen met een specifieke zorgbehoefte"
+
+# commented out because this layer has disappeared from the server
+#df_tmp <- NA
+#url <- "https://www.desocialekaart.be/api/health-offers?rubrics=10.07.04.%20Opvang%20schoolgaande%20kinderen%20(schooljaar%20en%20vakantie)"
+#df_tmp <- getPagesAndContent(query_url = url)
+#naschools <- transformTable(df = df_tmp)
+#naschools$type<- "Opvang schoolgaande kinderen (schooljaar en vakantie)"
 
 # 2. Ostbelgien data ----
 
-# Load Excel with Ostbelgien data
-ostbelgien_andere <- read_excel(ostbelgien_data)
-# Load second tab ZKB from the same file. Column Trager was manually added there
-ostbelgien_zkb <- read_excel(ostbelgien_data, sheet = "ZKB")
+## Update procedure
+### Joyce Michels <Joyce.Michels@dgov.be> will send an Excel and an SMS with a password
+### Copy paste the content to a new Excel file without password
+### Put it in the relevant place
+### Follow the comments in the email: they tend to use layout to "remove" closed features instead of just removing the row
+### Add a column "Träger" in the ZKB tab, and fill it with ZKB values
+### Maybe some more cleaning may be needed
 
-# Merge both tables
-ostbelgien <- rbind(ostbelgien_andere, ostbelgien_zkb)
+# ONLY PROCESS RAW DATA WHEN NEEDED
+if (use_raw_excel == TRUE) {
 
-# Add an identifier (just the row number)
-ostbelgien$case_number <- seq_len(nrow(ostbelgien))
+  # Load Excel with Ostbelgien data
+  ostbelgien_andere <- read_excel(ostbelgien_data, sheet = "Andere")
+  # Load second tab ZKB from the same file. Column Trager was manually added there
+  ostbelgien_zkb <- read_excel(ostbelgien_data, sheet = "ZKB")
+  
+  # Merge both tables
+  ostbelgien <- rbind(ostbelgien_andere, ostbelgien_zkb)
+  
+  # Add an identifier (just the row number)
+  ostbelgien$case_number <- seq_len(nrow(ostbelgien))
+  
+  # Geocode the data
+  ostbelgien_sel <- ostbelgien %>% select (case_number, Straße, PLZ)
+  ostbelgien_geocoded <- phaco_geocode(data_to_geocode=t_adresse <- ostbelgien_sel, colonne_num_rue="Straße", colonne_code_postal="PLZ")
+  
+  ## change geometry column name and add results to all records
+  simple_geocode_ob <- ostbelgien_geocoded$data_geocoded_sf[, c("case_number")]
+  ostbelgien <- left_join(ostbelgien, simple_geocode_ob, by = "case_number")
+  
+  # Drop records without geometry (log count for troubleshooting)
+  n_not_geocoded <- sum(st_is_empty(ostbelgien$geometry))
+  if (n_not_geocoded > 0) message(paste("Ostbelgien records dropped due to missing geometry:", n_not_geocoded))
 
-# Geocode the data
-ostbelgien_sel <- ostbelgien %>% select (case_number, Straße, PLZ)
-ostbelgien_geocoded <- phaco_geocode(data_to_geocode=t_adresse <- ostbelgien_sel, colonne_num_rue="Straße", colonne_code_postal="PLZ")
+  ostbelgien <- ostbelgien %>% filter(!st_is_empty(geometry))
+  #make sure it is SF dataframe
+  ostbelgien <- st_as_sf(ostbelgien)
+  
+  # Upload to raw data
+  CreateImportTable(dataset = ostbelgien, schema = "raw_data", table_name = "ostbelgien_childcare")
 
-## change geometry column name and add results to all records
-simple_geocode_ob <- ostbelgien_geocoded$data_geocoded_sf[, c("case_number")]
-ostbelgien <- left_join(ostbelgien, simple_geocode_ob, by = "case_number")
+} else {
+  con_pg <- get_con()
+  has_raw_table <- DBI::dbExistsTable(con_pg, DBI::Id(schema = "raw_data", table = "ostbelgien_childcare"))
+  DBI::dbDisconnect(con_pg)
 
-# select the records not geocoded
-ostbelgien_not_geocoded <- ostbelgien %>% filter(st_is_empty(geometry))
+  if (!has_raw_table) {
+    stop("raw_data.ostbelgien_childcare does not exist yet. Set FRESH_OSTBELGIEN_DATA=true once to (re)create it from the Excel source.")
+  }
 
-ostbelgien <- ostbelgien %>% filter(!st_is_empty(geometry))
-
-#make sure it is SF dataframe
-ostbelgien <- st_as_sf(ostbelgien)
-
-# Make available outside the function for upload to raw data
-ostbelgien<<-ostbelgien
-#table(ostbelgien$"Form der Kinderbetreuung")
-
-
+  message("Ostbelgien data not updated from flatfile; using existing raw_data.ostbelgien_childcare")
+}
 
 
 # Transform ----
@@ -252,9 +296,10 @@ ostbelgien<<-ostbelgien
 # Make the data available outside of the function for upload to raw data
 gezinsopvang<<-gezinsopvang
 groepsopvang<<-groepsopvang
-naschools<<-naschools
+#naschools<<-naschools
+specifieke_opvang<<-specifieke_opvang
 
-kinderopvang <- rbind(gezinsopvang, groepsopvang,naschools)
+kinderopvang <- rbind(gezinsopvang,groepsopvang,specifieke_opvang)
 kinderopvang$case_number <- seq_len(nrow(kinderopvang))
 
 
@@ -504,7 +549,7 @@ process_id <- function(id, max_retries = 3) {
   while (attempt <= max_retries) {
     try({
       response <- GET(url)
-      content <- content(response, as = "text")
+      content <- content(response, as = "text", encoding = "UTF-8")
       parsed_data <- fromJSON(content, flatten = TRUE)
       
       
@@ -570,24 +615,21 @@ input_ids <- as.data.frame(kinderopvang_sf) %>%
   select(id = original_id)  #%>% slice(1:5)  # Adjust the range if you want to test
 
 # Initialize an empty data frame to store results
-kinderopvang_extra <- data.frame()
+results_list <- vector("list", length(input_ids$id))
 
-# Loop through each ID and process it
 for (i in seq_along(input_ids$id)) {
   id <- input_ids$id[i]
-  final_results <- bind_rows(kinderopvang_extra, process_id(id))
-  kinderopvang_extra <- final_results
-  if (i %% 30 == 0) {
-    Sys.sleep(1)  # Longer delay every 30 requests
+  results_list[[i]] <- process_id(id)
+  
+  if (i %% 30 == 0) Sys.sleep(1)
+  if (i %% 51 == 0) Sys.sleep(5)
+  if (i %% 99 == 0) Sys.sleep(10)
+  if (i %% 100 == 0 || i == 1 || i == 10 || i == 50 ||  i == nrow(input_ids)) {
+    print(paste("Fetched", i, "of", nrow(input_ids)))
   }
-  if (i %% 51 == 0) {
-    Sys.sleep(5)  # Even longer delay every 51 requests
-  }
-  if (i %% 99 == 0) {
-    Sys.sleep(10)  # Even longer delay every 99 requests
-  }
-  print(i)
 }
+
+kinderopvang_extra <- bind_rows(results_list)
 
 
 # check for duplicates
@@ -617,7 +659,6 @@ for (i in seq_along(ids_not_in_kinderopvang_extra$id)) {
   if (i %% 99 == 0) {
     Sys.sleep(10)  # Even longer delay every 50 requests
   }
-  print(i)
 }
 
 # bind together
@@ -680,21 +721,16 @@ kinderopvang_kbo <<- kinderopvang_kbo
 kinderopvang_summarized <- kinderopvang_kbo %>%
   group_by(first_original_id) %>%
   summarize(
-    original_id = paste(na.omit(unique(original_id)), collapse = '; '),
-    name = paste(na.omit(unique(name)), collapse = '; '),
-    type = paste(na.omit(unique(type)), collapse = '; '),
-    streetname = paste(na.omit(unique(streetname)), collapse = '; '),
-    housenumber = paste(na.omit(unique(housenumber)), collapse = '; '),
-    postalcode = paste(na.omit(unique(postalcode)), collapse = '; '),
-    city = paste(na.omit(unique(city)), collapse = '; '),
-    phone = paste(na.omit(unique(phone)), collapse = '; '),
-    email = paste(na.omit(unique(email)), collapse = '; '),
-    website = paste(na.omit(unique(website)), collapse = '; '),
+    across(
+      c(original_id, name, type, streetname, housenumber, postalcode,
+        city, phone, email, website, kbo_bce, bestad_id),
+      collapse_unique
+    ),
     data_list_id = first(data_list_id),
-    kbo_bce = paste(na.omit(unique(kbo_bce)), collapse = '; '),
-    bestad_id = paste(na.omit(unique(bestad_id)), collapse = '; '),
     geometry = first(geometry)
   )
+
+
 
 # Make available outside the function for upload to raw data
 kinderopvang_summarized <<- kinderopvang_summarized
@@ -752,7 +788,14 @@ cleaned as (SELECT original_id,
               'dut', 'opvang schoolgaande kinderen',
               'fre', 'garde d''enfants pour les enfants scolarisés',
               'ger', 'Betreuung schulpflichtiger Kinder',
-              'eng', 'childcare for school-going children') ELSE
+              'eng', 'childcare for school-going children') 
+      WHEN type='Opvang voor kinderen met een specifieke zorgbehoefte' THEN
+			jsonb_build_object(
+              'dut', 'Kinderopvang (met specifieke zorgbehoefte)',
+              'fre', 'Crèche (avec besoins de soins spécifiques)',
+              'ger', 'Kinderkrippe (mit besonderem Betreuungsbedarf)',
+              'eng', 'Nursery (with specific care needs)')       
+              ELSE
 			jsonb_build_object(
               'dut', 'kinderopvang',
               'fre', 'crèche',
@@ -761,12 +804,16 @@ cleaned as (SELECT original_id,
               as legend_item,
             CASE 
 				WHEN type='Opvang schoolgaande kinderen (schooljaar en vakantie)' THEN '",legend_item_nursery_afterschool,"'::uuid
+				WHEN type='Opvang voor kinderen met een specifieke zorgbehoefte' THEN '",legend_item_nursery_specialneeds,"'::uuid
 				ELSE '",legend_item_nursery_preschool,"'::uuid END
               as legend_item_id,
-		   CASE WHEN type='Opvang schoolgaande kinderen (schooljaar en vakantie)' THEN 2 ELSE 3 END as risk_level,
-           CASE WHEN streetname IS NULL THEN NULL 
-	ELSE LTRIM(CONCAT(streetname, ' ' || housenumber, ', ' || postalcode, ' ' || city),', ') END
-	AS address,
+	CASE 
+		    WHEN type='Opvang voor kinderen met een specifieke zorgbehoefte' THEN 4
+		    WHEN type='Opvang schoolgaande kinderen (schooljaar en vakantie)' THEN 2 
+		    ELSE 3 END as risk_level,
+  CASE WHEN streetname IS NULL THEN NULL 
+	  ELSE LTRIM(CONCAT(streetname, ' ' || housenumber, ', ' || postalcode, ' ' || city),', ') END
+	  AS address,
 	phone,
 	email,
 	website,
@@ -786,13 +833,13 @@ data_list_id,
 risk_level,
 JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
   'address', address,
-  'phone', phone,
-  'email', email,
-  'website', website,
+  'local_phone', phone,
+  'local_email', email,
+  'local_website', website,
   'kbo_bce', kbo_bce,
   'best_address_id', best_address_id
 )) as properties,
-geometry,
+ST_ReducePrecision(geometry, 1e-8) as geometry,
 CURRENT_DATE as created_at
 FROM cleaned;"),"
 ALTER TABLE IF EXISTS ingestion.nursery_soka OWNER to pgn_group_data_team_w;","
@@ -846,15 +893,15 @@ WITH cleaned as (
   3 as risk_level,
   jsonb_strip_nulls(jsonb_build_object(	
     'address', CONCAT(\"Straße\" || ', ' || \"PLZ\",  ' ' || \"Gemeinde\"),
-    'phone', \"Telefonnummer\",
+    'local_phone', \"Telefonnummer\",
     'mobile', \"Handynummer\",
-    'email', \"E-Mail-Adresse\",
+    'local_email', \"E-Mail-Adresse\",
     'capacity', \"Kapazität\",
     'occupancy', \"Anzahl Kinder\",
     'age_groups', \"Alter\",
     'personnel', \"Anzahl Erwachsene\",
     'opening_hours', CASE WHEN \"Öffnungszeiten\" <> '/' THEN \"Öffnungszeiten\" ELSE NULL END)) as properties,
-  st_transform(geometry,4326) as geometry
+  ST_ReducePrecision(st_transform(geometry,4326), 1e-8) as geometry
   from
   raw_data.ostbelgien_childcare)
 INSERT INTO ingestion.nursery_ostbelgien 
@@ -930,9 +977,9 @@ main_function = function() {
     process_fresh_data()
     CreateImportTable(dataset = gezinsopvang, schema = "raw_data", table_name = "vla_depzorg_socialekaart_gezinsopvang") 
     CreateImportTable(dataset = groepsopvang, schema = "raw_data", table_name = "vla_depzorg_socialekaart_groepsopvang")
+    CreateImportTable(dataset = specifieke_opvang, schema = "raw_data", table_name = "vla_depzorg_socialekaart_specifieke_opvang")
     CreateImportTable(dataset = kinderopvang_kbo, schema = "raw_data", table_name = "vla_depzorg_socialekaart_kinderopvang")
     CreateImportTable(dataset = kinderopvang_summarized, schema = "raw_data", table_name = "vla_depzorg_socialekaart_kinderopvang_summ")
-    CreateImportTable(dataset = ostbelgien, schema = "raw_data", table_name = "ostbelgien_childcare")
     create_ingestion_table_soka()
     create_ingestion_table_ostbelgien()
     create_ingestion_table_merged()

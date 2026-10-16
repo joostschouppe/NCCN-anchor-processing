@@ -1,8 +1,8 @@
 ## ---------------------------
 ##
-## Script name: Import institions for the handicapped
+## Script name: Import institutions for the handicapped
 ##
-## Purpose of script: Load institions for the handicapped data & transform into proto-anchors for Paragon
+## Purpose of script: Load institutions for the handicapped data & transform into proto-anchors for Paragon
 ##
 ## Author: Joost Schouppe
 ##
@@ -97,7 +97,7 @@ process_soka_data <- function(){
     getPagesAndContent <- function(query_url) {
       page_size <- 20
       response <- GET(url = query_url)
-      json_val <- content(response, as = "parsed")
+      json_val <- httr::content(response, as = "parsed")
       total_pages <- json_val$page$totalPages
       total_elements <<- json_val$page$totalElements
       print(paste0("total pages: ", total_pages))
@@ -178,7 +178,7 @@ process_soka_data <- function(){
     # Download SOKA data -----------------------------------------------------------
     
     df_tmp <- NA
-    url <- "https://www.desocialekaart.be/api/health-offers?rubrics=13.08.%20Dagopvang%20personen%20met%20een%20handicap"
+    url <- "https://www.desocialekaart.be/api/health-offers?rubrics=13.07.%20Dagopvang%20personen%20met%20een%20handicap"
     df_tmp <- getPagesAndContent(query_url = url)
     df_tmp <- transformTable(df = df_tmp)
     df_tmp <- unique(df_tmp)
@@ -200,7 +200,7 @@ process_soka_data <- function(){
     obc$type<- "Observatie- en behandelcentra"
     
     df_tmp <- NA
-    url <- "https://www.desocialekaart.be/api/health-offers?rubrics=13.09.%20Woonondersteuning%20personen%20met%20een%20handicap"
+    url <- "https://www.desocialekaart.be/api/health-offers?rubrics=13.08.%20Woonondersteuning%20personen%20met%20een%20handicap"
     df_tmp <- getPagesAndContent(query_url = url)
     df_tmp <- transformTable(df = df_tmp)
     df_tmp <- unique(df_tmp)
@@ -475,7 +475,7 @@ process_soka_data <- function(){
       while (attempt <= max_retries) {
         try({
           response <- GET(url)
-          content <- content(response, as = "text")
+          content <- httr::content(response, as = "text")
           parsed_data <- fromJSON(content, flatten = TRUE)
           
           
@@ -595,7 +595,7 @@ process_soka_data <- function(){
     # Deal with spatial duplicates ----
     
     # Group by coordinates and calculate the first ID and count per location
-    handicap_soka_kbo <- handicap_soka_kbo %>%
+    handicap_soka_kbo <<- handicap_soka_kbo %>%
       # Extract coordinates for grouping
       mutate(lon = st_coordinates(.)[,1], lat = st_coordinates(.)[,2]) %>%
       group_by(lon, lat) %>%
@@ -604,41 +604,14 @@ process_soka_data <- function(){
         count = n()  # Count occurrences at this location
       ) %>%
       ungroup() %>%
-      # Optionally, drop the lon and lat helper columns if you don’t need them
       select(-lon, -lat)
     
-    
-    # Aggregate by location and keep the first original_id
-    handicap_soka_summarized <- handicap_soka_kbo %>%
-      group_by(first_original_id) %>%
-      summarize(
-        original_id = paste(na.omit(unique(original_id)), collapse = '; '),
-        name = paste(na.omit(unique(name)), collapse = '; '),
-        type = paste(na.omit(unique(type)), collapse = '; '),
-        streetname = paste(na.omit(unique(streetname)), collapse = '; '),
-        housenumber = paste(na.omit(unique(housenumber)), collapse = '; '),
-        postalcode = paste(na.omit(unique(postalcode)), collapse = '; '),
-        city = paste(na.omit(unique(city)), collapse = '; '),
-        phone = paste(na.omit(unique(phone)), collapse = '; '),
-        email = paste(na.omit(unique(email)), collapse = '; '),
-        website = paste(na.omit(unique(website)), collapse = '; '),
-        data_list_id = first(data_list_id),
-        kbo_bce = paste(na.omit(unique(kbo_bce)), collapse = '; '),
-        bestad_id = paste(na.omit(unique(bestad_id)), collapse = '; '),
-        geometry = first(geometry)
-      )
-    
     CreateImportTable(dataset = handicap_soka_kbo, schema = "raw_data", table_name = "vla_depzorg_socialekaart_handicap")
-    CreateImportTable(dataset = handicap_soka_summarized, schema = "raw_data", table_name = "vla_depzorg_socialekaart_handicap_summ")
-    
-    
-    table(handicap_soka_summarized$type)
-    table(osm_filtered$social_facility)
-    
+
   } else {
     print("No fresh data downloaded because user requested to re-use existing data")
   }
-} # end process_fresh_data function
+} # end process_soka_data function
 
 
 
@@ -652,27 +625,25 @@ process_osm_data <- function(){
   features_list <- list("social_facility:for")
   
   # Define extra tags to use as columns for properties
-  extra_columns <- c("capacity","capacity:male","capacity:female", "social_facility", "social_facility:for")
+  extra_columns <- c("capacity","capacity:male","capacity:female", "social_facility", "social_facility:for", "description")
   # Choose which datatypes are needed, as a list of datatypes, using any of "points", "lines", "mpolygons" (this is polygons+multipolygons together)
   datatypes <- c("points", "mpolygon")
   
   
   ### Actual OSM download & transformation ----
   osm_all <- run_process(
-    download_osm_process(features_list, datatypes, extra_columns, keep_region=TRUE, postgres=TRUE),
-    paste0("OSM download & processing for ", paste(paste(names(features_list), unlist(features_list), sep = "="), collapse = ", "), collapse = ", ")
+    download_osm_process(features_list, datatypes, extra_columns, keep_region=TRUE),
+    paste0("OSM download & processing for ", describe_features_list(features_list))
   )
   
   # the object should be for disabled people (grepl)
   # the object should be of social_facility type assisted_living, nursing_home, day_care or group_home (grepl)
   # the object should have a name
-  # the object should not be in Flanders
   osm_filtered <- osm_all %>%
     filter(
       grepl("disabled", social_facility_for, ignore.case = TRUE) &
         grepl("assisted_living|nursing_home|day_care|group_home", social_facility, ignore.case = TRUE) &
-        !is.na(name) &
-        (language != "dut" | is.na(language))
+        !is.na(name)
     )
   # add day-care and group home dummy
   osm_filtered <- osm_filtered %>%
@@ -682,10 +653,345 @@ process_osm_data <- function(){
   osm_filtered <- osm_filtered %>%
     mutate(data_list_id=data_list_id_osm)
   
+  osm_vl_bru <<- osm_filtered %>%
+    filter(language=='dut' | language=='brussels')
+  
+  osm_rest <<- osm_filtered %>%
+    filter(language == "fre" | language == "ger" | is.na(language))
+    
   CreateImportTable(dataset = osm_filtered, schema = "raw_data", table_name = "osm_handicap")
   
   
-} # end process_fresh_data function
+} # end process_osm_data function
+
+
+# 3. Merge OSM & SOKA data ----
+
+process_merge_data <- function(){
+  # Default: download fresh data
+  if (reuse_ingestion_data==FALSE) {
+
+
+# Prepare datasets
+handicap_soka_kbo$geometry <- st_set_crs(handicap_soka_kbo$geometry, 4326)
+osm_vl_bru$geometry <- st_set_crs(osm_vl_bru$geometry, 4326)
+
+handicap_soka_kbo_lambert <- st_transform(handicap_soka_kbo, 31370)
+osm_vl_bru_lambert <- st_transform(osm_vl_bru, 31370)
+
+# Set parameters
+distance_matched_threshold <- 50
+distance_raw_threshold <- 250
+## insignificant words in names that shouldn't be included in name comparison (don't use accents etc.)
+patterns_to_remove <- NA
+
+handicap_soka_enriched <- merge_to_external_polygons(
+  attribute_features = handicap_soka_kbo_lambert,
+  geom_features = osm_vl_bru_lambert,
+  attr_id_col = "original_id",
+  geom_id_col = "osm_id",
+  attr_name_col = "name",
+  geom_name_col = "name",
+  attr_street_col = "streetname",
+  attr_hnr_col = "housenumber",
+  geom_street_col = "addr_street",
+  geom_hnr_col = "addr_housenumber",
+  distance_matched_threshold = distance_matched_threshold,
+  distance_raw_threshold = distance_raw_threshold,
+  patterns_to_remove = "patterns_to_remove"
+)
+
+# merge only attribute data from osm based on way-links
+osm_node_id <- as.data.frame(handicap_soka_enriched) %>%
+  distinct(osm_id) %>%
+  filter(grepl("node",osm_id))
+
+# if we've linked an OSM node id, simply remove from osm dataset (we don't need the attributes from OSM and we don't need the point geometry either)
+osm_vl_bru <- osm_vl_bru %>%
+  anti_join(osm_node_id, by = "osm_id")
+
+# remove node ids as merge candidates
+handicap_soka_enriched <- handicap_soka_enriched %>%
+  mutate(osm_id=ifelse(grepl("node",osm_id),NA, osm_id))
+
+# aggregation ID
+handicap_soka_enriched <- handicap_soka_enriched %>%
+  mutate(agg_id = ifelse(!is.na(osm_id),osm_id,st_as_text(geometry)))
+
+# explicit geometry name
+handicap_soka_enriched<-handicap_soka_enriched %>% rename(off_geometry=geometry)
+handicap_soka_enriched <- st_as_sf(handicap_soka_enriched, wkt="off_geometry")
+
+
+
+# create OSM attributes in original OSM dataset
+## from osm_be, we use all the records that are there (just the polygons), but some will be removed and read with the cobrha data
+## from osm_rest we use all the records
+osm_properties <- rbind(osm_vl_bru,osm_rest)
+
+osm_properties <- osm_properties %>%
+  rowwise() %>%
+  mutate(
+    # Build other_names
+    other_names = ifelse(
+      all(is.na(c(short_name, official_name, alt_name, old_name))),
+      NA_character_,
+      paste(na.omit(c(short_name, official_name, alt_name, old_name)), collapse = "; ")
+    ),
+    
+    # Build local_email
+    local_email = ifelse(
+      all(is.na(c(contact_email, email))),
+      NA_character_,
+      paste(na.omit(c(contact_email, email)), collapse = "; ")
+    ),
+    
+    # Build local_phone
+    local_phone = ifelse(
+      all(is.na(c(contact_mobile, mobile, contact_phone, phone, phone_2))),
+      NA_character_,
+      paste(na.omit(c(contact_mobile, mobile, contact_phone, phone, phone_2)), collapse = "; ")
+    ),
+    
+    # Build local_website
+    local_website = ifelse(
+      all(is.na(c(website, contact_website, alt_website))),
+      NA_character_,
+      paste(na.omit(c(website, contact_website, alt_website)), collapse = "; ")
+    ),
+    
+    # Build address
+    address = if_else(
+      is.na(addr_street),
+      NA_character_,
+      trimws(paste0(
+        addr_street, " ",
+        if_else(
+          !is.na(nohousenumber) & nohousenumber == "yes", 
+          "w/n", 
+          coalesce(addr_housenumber, "")
+        ),
+        ", ",
+        paste0(coalesce(addr_postcode, ""), " "),
+        coalesce(addr_city, "")
+      ))
+    )
+  ) %>%
+  mutate(properties = jsonlite::toJSON(
+    purrr::discard(list(
+      operator_wikidata = operator_wikidata,
+      operator = operator,
+      operator_type = operator_type,
+      operator_email = operator_email,
+      operator_website = operator_website,
+      opening_hours = opening_hours,
+      image = image,
+      wikidata = wikidata,
+      capacity = capacity,
+      social_facility = social_facility,
+      social_facility_for = social_facility_for,
+      description = description,
+      address = address,
+      other_names = other_names,
+      local_email = local_email,
+      local_phone = local_phone,
+      local_website = local_website
+    ), is.na), auto_unbox = TRUE)) %>%
+  mutate(name = jsonlite::toJSON(
+    purrr::discard(list(
+      und = name,
+      fre = name_fr,
+      dut = name_nl,
+      ger = name_de
+    ), is.na), auto_unbox = TRUE))
+
+osm_properties <- osm_properties %>%
+  mutate(legend_item_id=case_when(
+    day_care & !group_home ~ legend_item_day_care,
+    !day_care & group_home ~ legend_item_group_home,
+    day_care & group_home ~ legend_item_combo,
+    TRUE ~ NA
+  ),
+  risk_level=ifelse(group_home,3,2))
+
+
+# give cobrha records OSM geometries where needed
+handicap_soka_enriched <- left_join(
+  handicap_soka_enriched, 
+  as.data.frame(osm_properties) %>% select(osm_id, osm_name=name, osm_legend_item_id=legend_item_id, osm_risk_level=risk_level, properties, geometry),
+  by = "osm_id"
+)
+
+# simplify the osm_properties set
+osm_properties <- osm_properties %>%
+  mutate(original_id=paste0("https://osm.org/", osm_id)) %>%
+  select(original_id, name, properties, data_list_id, legend_item_id, language, risk_level)
+
+# SOKA cleanup
+# Build address, legend item & risk_level
+handicap_soka_enriched <- handicap_soka_enriched %>%
+  mutate(address =
+   trimws(paste0(
+    streetname, " ",housenumber,", ",
+    paste0(coalesce(postalcode, ""), " "),
+    coalesce(city, "")
+  )),
+  legend_item_id=case_when(
+    type=='Woonondersteuning personen met een handicap' ~ legend_item_group_home,
+    type=='Observatie- en behandelcentra' ~ legend_item_treatment,
+    type=='Dagopvang personen met een handicap' ~ legend_item_day_care,
+    TRUE ~ NA
+  ),
+  risk_level=case_when(
+    type=='Observatie- en behandelcentra' | type=='Dagopvang personen met een handicap' ~ 2,
+    TRUE ~ 3
+  ))
+
+
+
+# group SOKA records and create off_attributes there
+## aggregate
+handicap_soka_enriched <- handicap_soka_enriched %>%
+  group_by(agg_id) %>%
+  summarize(
+    original_id = na_if(paste(unique(original_id), collapse = "; "),"NA"),
+    name = na_if(paste(unique(name), collapse = "; "),"NA"),
+    address = na_if(paste(unique(address), collapse = "; "),"NA"),
+    legend_item_id = na_if(paste(unique(legend_item_id), collapse = "; "),"NA"),
+    local_email = na_if(paste(unique(email), collapse = "; "),"NA"),
+    local_phone = na_if(paste(unique(phone), collapse = "; "),"NA"),
+    local_website = na_if(paste(unique(website), collapse = "; "),"NA"),
+    type = na_if(paste(unique(type), collapse = "; "),"NA"),
+    kbo_bce = na_if(paste(unique(kbo_bce), collapse = "; "),"NA"),
+    bestad_id = na_if(paste(unique(bestad_id), collapse = "; "),"NA"),
+    legend_item_id = na_if(paste(unique(legend_item_id), collapse = "; "),"NA"),
+    risk_level = max(risk_level),
+    osm_legend_item_id = na_if(paste(unique(osm_legend_item_id), collapse = "; "),"NA"),
+    osm_id=first(osm_id),
+    osm_name=first(osm_name),
+    osm_properties=first(properties),
+    osm_risk_level=max(osm_risk_level),
+    off_geometry=first(off_geometry),
+    geometry_osm=first(geometry))
+
+# create official properties
+handicap_soka_enriched <- handicap_soka_enriched %>%
+  rowwise() %>%
+  mutate(properties = jsonlite::toJSON(
+    purrr::discard(list(
+      activity_dut=type,
+      address = address,
+      local_email = local_email,
+      local_website = local_website,
+      kbo_bce = kbo_bce,
+      best_address_id=bestad_id
+    ), is.na), auto_unbox = TRUE))
+
+
+# create official names as json
+handicap_soka_enriched <- handicap_soka_enriched %>%
+  rowwise() %>%
+  mutate(name = jsonlite::toJSON(
+    purrr::discard(list(
+      dut = name
+    ), is.na), auto_unbox = TRUE))
+
+
+
+# set legend item
+handicap_soka_enriched <- handicap_soka_enriched %>%
+  mutate(legend_item_id = case_when(
+    grepl(";",legend_item_id) ~ legend_item_combo, ## if ; in legend_item_id, then it is always a combined place
+    !is.na(osm_id) & osm_legend_item_id==legend_item_id ~ legend_item_id, ## if OSM & official identical: copy 
+    !is.na(osm_id) & osm_legend_item_id!=legend_item_id ~ legend_item_combo, ## if OSM & official different: li_wzc_combo
+    is.na(osm_id) ~ legend_item_id ## in other cases, use the original value
+  ))
+
+# set data list id
+handicap_soka_enriched <- handicap_soka_enriched %>%
+  mutate(
+    data_list_id=ifelse(is.na(osm_id),data_list_id_soka_handicap,data_list_id_osm))
+
+
+# set correct geometry, original_id, properties and name
+## note: we'll put the properties_secondary within its data_list_id during ingestion
+handicap_soka_enriched <- handicap_soka_enriched %>%
+  rowwise() %>%
+  mutate(
+    original_id = ifelse(is.na(osm_id), original_id, paste0("https://osm.org/", osm_id)),
+    name = ifelse(is.na(osm_id), name, osm_name),
+    properties_secondary = ifelse(!is.na(osm_id), properties, NA),
+    properties = ifelse(is.na(osm_id), properties, osm_properties),
+    geometry = case_when(
+      is.na(osm_id) ~ off_geometry,
+      TRUE ~ geometry_osm
+    )
+  ) %>%
+  ungroup()
+
+# set risk level
+handicap_soka_enriched <- handicap_soka_enriched %>%
+  rowwise() %>%
+  mutate(risk_level = max(risk_level, osm_risk_level, na.rm = TRUE))
+
+
+# Keep only relevant columns
+handicap_soka_enriched <- handicap_soka_enriched %>%
+  select(original_id, name, risk_level, data_list_id, legend_item_id, properties, properties_secondary, geometry)
+
+# Ensure the resulting dataframe is an sf object
+handicap_soka_enriched <- st_as_sf(handicap_soka_enriched)
+st_crs(handicap_soka_enriched) <- 4326
+
+
+
+# merge OSM & enriched two datasets
+## do an anti-join to remove OSM objects already used in SOKA data
+osm_properties <- osm_properties %>%
+  anti_join(as.data.frame(handicap_soka_enriched), by = "original_id")
+
+objects_in_osm_not_in_off <- osm_properties %>% filter(language=='dut' | language=='brussels')
+print(paste0(nrow(objects_in_osm_not_in_off), " facilities are mapped in OSM but could not be found in Sociale Kaart. Sometimes these are real issues, sometimes it's just that the point in Sociale Kaart is already assigned to a nearby facility or may be pinned incorrectly"))
+
+## format jsons as text
+osm_properties$name <- as.character(osm_properties$name)
+osm_properties$properties <- as.character(osm_properties$properties)
+
+osm_soka_merge <- bind_rows(handicap_soka_enriched,osm_properties)
+
+
+# Verify if geometries are valid and try to fix
+invalid_geometries <- osm_soka_merge %>% filter(st_is_valid(geometry) == FALSE)
+print(paste0("Invalid geometries: ", nrow(invalid_geometries)))
+if (nrow(invalid_geometries)>0) {
+  osm_soka_merge$geometry <- st_make_valid(osm_soka_merge$geometry)
+}
+invalid_geometries <- osm_soka_merge %>% filter(st_is_valid(geometry) == FALSE)
+if (nrow(invalid_geometries)>0) {
+  stop(paste0("ERROR: There are still ",nrow(invalid_geometries)," invalid geometries after fix"))
+}
+
+# verify all objects have a name
+invalid_count <- osm_soka_merge %>%
+  filter(!sapply(name, function(x) {
+    if (is.null(x) || is.na(x) || x == "") return(FALSE)
+    parsed <- tryCatch(
+      jsonlite::fromJSON(x),
+      error = function(e) NULL
+    )
+    if (is.null(parsed) || length(parsed) == 0) return(FALSE)
+    any(c("dut", "fre", "ger", "und") %in% names(parsed))
+  })) %>%
+  nrow()
+if (invalid_count>0) {
+  stop(paste0("ERROR: There are ",invalid_count," objects without a name"))
+}
+
+CreateImportTable(dataset = osm_soka_merge, schema = "raw_data", table_name = "osm_soka_handicap_merge")
+
+}} # end process_merge_data function
+
+
 
 
 # LOAD ----
@@ -698,175 +1004,12 @@ process_osm_data <- function(){
 
 
 
-soka_ingestion_table_sql <- c(
-  "DROP TABLE IF EXISTS ingestion.handicap_soka CASCADE;
+ingestion_table_sql <- c("DROP TABLE IF EXISTS ingestion.handicap_care CASCADE;
 ","
-CREATE TABLE IF NOT EXISTS ingestion.handicap_soka
+CREATE TABLE IF NOT EXISTS ingestion.handicap_care
 (
   id uuid NOT NULL DEFAULT gen_random_uuid(),
   original_id text,  
-  name jsonb,
-  legend_item jsonb,
-  legend_item_id uuid,
-  data_list_id uuid,
-  risk_level integer,
-  properties jsonb,
-  properties_secondary jsonb,
-  imported_at timestamptz,
-  tags jsonb,
-  deleted_at timestamptz,
-  updated_at timestamptz,
-  created_at timestamptz,
-  created_by uuid,
-  updated_by uuid,
-  geometry geometry(geometry, 4326),
-  CONSTRAINT nursing_home_soka_pkey PRIMARY KEY (id)
-);",paste0("WITH 
-cleaned as (SELECT original_id,
-            jsonb_strip_nulls(jsonb_build_object(
-              'und', CASE WHEN name IS NULL THEN type
-                          ELSE name END,
-              'dut', name)) as name,
-            CASE WHEN type='Woonondersteuning personen met een handicap' THEN '",legend_item_group_home,"'::uuid
-				WHEN type='Observatie- en behandelcentra' then '",legend_item_treatment,"'::uuid
-				WHEN type='Dagopvang personen met een handicap' then '",legend_item_day_care,"'::uuid
-				ELSE '",legend_item_combo,"'::uuid END
-              as legend_item_id,
-		   CASE WHEN type='Observatie- en behandelcentra' or type='Dagopvang personen met een handicap' THEN 2 ELSE 3 END as risk_level,
-           CASE WHEN streetname IS NULL THEN NULL 
-	ELSE LTRIM(CONCAT(streetname, ' ' || housenumber, ', ' || postalcode, ' ' || city),', ') END
-	AS address,
-	phone,
-	email,
-	website,
-	kbo_bce,
-	bestad_id as best_address_id,
-	data_list_id::uuid,
-	geometry FROM raw_data.vla_depzorg_socialekaart_handicap_summ
-	WHERE ST_IsValid(geometry) AND NOT ST_IsEmpty(geometry))
-INSERT INTO ingestion.handicap_soka 
-(original_id, name, legend_item_id, data_list_id, risk_level, properties, geometry, created_at)
-SELECT
-original_id,
-name,
-legend_item_id,
-data_list_id,
-risk_level,
-JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
-  'address', address,
-  'phone', phone,
-  'email', email,
-  'website', website,
-  'kbo_bce', kbo_bce,
-  'best_address_id', best_address_id
-)) as properties,
-geometry,
-CURRENT_DATE as created_at
-FROM cleaned;"),"
-ALTER TABLE IF EXISTS ingestion.handicap_soka OWNER to pgn_group_data_team_w;","
-GRANT ALL ON TABLE ingestion.handicap_soka TO pgn_group_data_team_w;","
-GRANT ALL ON TABLE ingestion.handicap_soka TO pgn_user_airflow;")
-
-
-  
-osm_ingestion_table_sql <- c("DROP TABLE IF EXISTS ingestion.osm_handicap CASCADE;
-","
-CREATE TABLE IF NOT EXISTS ingestion.osm_handicap
-(
-  id uuid NOT NULL DEFAULT gen_random_uuid(),
-  original_id text,  
-  name jsonb,
-  legend_item jsonb,
-  legend_item_id uuid,
-  data_list_id uuid,
-  risk_level integer,
-  properties jsonb,
-  properties_secondary jsonb,
-  imported_at timestamptz,
-  tags jsonb,
-  deleted_at timestamptz,
-  updated_at timestamptz,
-  created_at timestamptz,
-  created_by uuid,
-  updated_by uuid,
-  geometry geometry(geometry, 4326),
-  CONSTRAINT osm_handicap_pkey PRIMARY KEY (id)
-);",paste0("WITH 
-cleaned as (SELECT
-            'https://osm.org/' || osm_id as original_id,
-			jsonb_strip_nulls(jsonb_build_object(
-              'und', CASE WHEN name IS NULL THEN social_facility ELSE name END,
-              'fre', name_fr,
-              'ger', name_de::text,
-              'dut', name_nl)) as name,
-            CASE WHEN day_care = TRUE and group_home = FALSE then '",legend_item_day_care,"'::uuid
-			        WHEN day_care = FALSE and group_home = TRUE then '",legend_item_group_home,"'::uuid
-        			WHEN day_care = TRUE and group_home = TRUE then '",legend_item_combo,"'::uuid END
-              as legend_item_id,
-			CASE WHEN group_home = TRUE then 3 else 2 END as risk_level,
-			data_list_id::uuid as data_list_id,
-           CASE WHEN short_name IS NULL AND official_name IS NULL AND alt_name IS NULL AND old_name IS NULL THEN NULL 
-	ELSE CONCAT_WS('; ',short_name, official_name, alt_name, old_name) END AS other_names,
-CASE WHEN addr_street IS NULL THEN NULL 
-	ELSE LTRIM(CONCAT(addr_street, ' ' || CASE WHEN nohousenumber='yes' THEN 'w/n' ELSE addr_housenumber END, ', ' || addr_postcode, ' ' || addr_city),', ') END
-	AS address,
-CASE WHEN contact_email IS NULL AND email IS NULL THEN NULL
-	ELSE CONCAT_WS('; ',contact_email, email) END AS local_email,
-operator_email,
-CASE WHEN contact_mobile IS NULL AND mobile IS NULL AND contact_phone IS NULL AND phone IS NULL AND phone_2 IS NULL THEN NULL
-	ELSE CONCAT_WS('; ',contact_mobile, mobile, contact_phone, phone, phone_2) END AS local_phone,
-CASE WHEN website IS NULL AND contact_website IS NULL THEN NULL
-	ELSE CONCAT_WS('; ',website, contact_website) END AS local_website,
-	operator_website,
-			opening_hours,
-			image,
-			capacity,
-			social_facility,
-			social_facility_for,
-            geometry
-            FROM raw_data.osm_handicap)
-INSERT INTO ingestion.osm_handicap 
-(original_id, name, legend_item_id, data_list_id, risk_level, properties, geometry, created_at)
-SELECT
-original_id,
-name,
-legend_item_id,
-data_list_id,
-risk_level,
-JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
-  'other_names', other_names,
-  'address', address,
-	'local_email',local_email,
-	'local_phone',local_phone,
-	'local_website',local_website,
-	'operator_email',operator_email,
-	'operator_website',operator_website,
-	'social_facility',social_facility,
-	'social_facility_for',social_facility_for)),
-geometry,
-CURRENT_DATE as created_at
-FROM cleaned;"),
-  "ALTER TABLE IF EXISTS ingestion.osm_handicap OWNER to pgn_group_data_team_w;",
-  "GRANT ALL ON TABLE ingestion.osm_handicap TO pgn_group_data_team_w;",
-  "GRANT ALL ON TABLE ingestion.osm_handicap TO pgn_user_airflow;")
-  
-  
-        
-
-### Execute the SQL commands ----
-
-create_ingestion_table_soka <- function() {execute_sql_commands(soka_ingestion_table_sql, "SOKA ingestion table made")}
-create_ingestion_table_osm <- function() {execute_sql_commands(osm_ingestion_table_sql, "OSM ingestion table made")}
-
-
-### Create SQL for final ingestion table ----
-
-sql_merge <- c(
-  "DROP TABLE IF EXISTS ingestion.handicap_care CASCADE;",
-  "CREATE TABLE IF NOT EXISTS ingestion.handicap_care
-(
-  id uuid NOT NULL DEFAULT gen_random_uuid(),
-  original_id text,    
   name jsonb,
   legend_item jsonb,
   legend_item_id uuid,
@@ -883,26 +1026,32 @@ sql_merge <- c(
   updated_by uuid,
   geometry geometry(geometry, 4326),
   CONSTRAINT handicap_care_pkey PRIMARY KEY (id)
-);",
-  "  
-WITH alldata as (SELECT *
-FROM ingestion.osm_handicap
-UNION ALL
-SELECT s.*
-FROM ingestion.handicap_soka s
-WHERE NOT EXISTS (
-    SELECT 1
-    FROM ingestion.osm_handicap o
-    WHERE ST_DWithin(ST_Transform(s.geometry, 31370),ST_Transform(o.geometry, 31370),50))
-)
-INSERT INTO ingestion.handicap_care (id, original_id, name, legend_item, legend_item_id, data_list_id, risk_level, properties, properties_secondary, imported_at, tags, deleted_at, updated_at, created_at, created_by, updated_by, geometry)
-select * from alldata
-WHERE geometry IS NOT NULL AND NOT ST_IsEmpty(geometry);","
-ALTER TABLE IF EXISTS ingestion.handicap_care OWNER to pgn_group_data_team_w;","
-GRANT ALL ON TABLE ingestion.handicap_care TO pgn_group_data_team_w;","
-GRANT ALL ON TABLE ingestion.handicap_care TO pgn_user_airflow;")
+);",paste0("
+INSERT INTO ingestion.handicap_care 
+(original_id, name, legend_item_id, data_list_id, risk_level, properties, properties_secondary, geometry, created_at)
+select 
+  original_id, 
+  name::jsonb, 
+  legend_item_id::uuid,
+  data_list_id::uuid,
+  risk_level,
+	properties::jsonb,
+	jsonb_strip_nulls(jsonb_build_object('",data_list_id_soka_handicap,"', properties_secondary::jsonb)) AS properties_secondary,
+	ST_ReducePrecision(geometry, 1e-8) as geometry,
+	CURRENT_DATE as created_at
+from raw_data.osm_soka_handicap_merge;"),
+  "ALTER TABLE IF EXISTS ingestion.handicap_care OWNER to pgn_group_data_team_w;",
+  "GRANT ALL ON TABLE ingestion.handicap_care TO pgn_group_data_team_w;",
+  "GRANT ALL ON TABLE ingestion.handicap_care TO pgn_user_airflow;")
+
+
   
-create_ingestion_table_merged <- function() {execute_sql_commands(sql_merge, "Merged ingestion data")}
+  
+        
+
+### Execute the SQL commands ----
+
+create_ingestion_table <- function() {execute_sql_commands(ingestion_table_sql, "ingestion table made")}
 
 
 # Main function -----------------------------------------------------------
@@ -910,7 +1059,7 @@ create_ingestion_table_merged <- function() {execute_sql_commands(sql_merge, "Me
 
 
 run_smart_update = function() {
-smart_update_process("handicap_care", 50, 100, 50, format(Sys.Date(), "%Y-%m-%d"), allow_update_even_if_checks_fail=TRUE, dry_run=do_dry_run,reuse_ingestion_data=reuse_ingestion_data)
+  smart_update_process("handicap_care", 50, 100, 50, format(Sys.Date(), "%Y-%m-%d"), allow_update_even_if_checks_fail=TRUE, dry_run=do_dry_run,reuse_ingestion_data=reuse_ingestion_data)
 }
 
 
@@ -922,9 +1071,8 @@ main_function = function() {
   if (!reuse_ingestion_data) {
       process_soka_data()
       process_osm_data()
-      create_ingestion_table_soka()
-      create_ingestion_table_osm()
-      create_ingestion_table_merged()
+      process_merge_data()
+      create_ingestion_table()
     }
     run_smart_update()
   }

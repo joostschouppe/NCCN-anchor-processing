@@ -87,10 +87,16 @@ datatypes <- c("points", "mpolygon")
 
 
 ### Actual OSM download & transformation ----
-osm_all <<- run_process(
-  download_osm_process(features_list, datatypes, extra_columns, keep_region=TRUE, postgres=TRUE),
-  paste0("OSM download & processing for ", paste(paste(names(features_list), unlist(features_list), sep = "="), collapse = ", "), collapse = ", ")
+osm_all <- run_process(
+  download_osm_process(features_list, datatypes, extra_columns, keep_region=TRUE),
+  paste0("OSM download & processing for ", describe_features_list(features_list))
 )
+
+# NOTE: we do not de-duplicate these records spatially, because the "inner" places add important details (e.g. high risk section). In order to not lose that important spatial detail, we do not aggregate. *However* in some cases the same information is duplicated or spread out in a confusing way . It makes sense to periodically check for new cases.
+
+# standardize the usual OSM columns
+osm_all <- build_osm_derived_columns(osm_all)
+
 
 # if it is in Belgium, it must have a name, and it should have one of the below:
 ## operator:wikidata to indicate it as a federal prison
@@ -123,7 +129,7 @@ if (nrow(osm_all_problems)>0){
   stop("OSM data quality check failed")
 }
 
-
+CreateImportTable(dataset = osm_all, schema = "raw_data", table_name = "osm_jails")  
 
   } else {
     print("No fresh data downloaded because user requested to re-use existing data")
@@ -202,16 +208,8 @@ CASE WHEN prison='rejected_asylum_seekers' THEN '",legend_item_id_asylum_detenti
   WHEN operator_wikidata='Q1469956' THEN '",legend_item_id_jail_fed,"'::uuid
   ELSE '",legend_item_id_jail_oth,"'::uuid
   END as legend_item_id,	
-NULLIF(CONCAT_WS('; ',name, short_name, official_name, alt_name, old_name), '') AS other_names,
-CASE WHEN addr_street IS NULL THEN NULL 
-	ELSE LTRIM(CONCAT(addr_street, ' ' || CASE WHEN nohousenumber='yes' THEN 'w/n' ELSE addr_housenumber END, ', ' || CONCAT((addr_postcode || ' '), addr_city))) END
-	AS address,
-NULLIF(CONCAT_WS('; ',contact_email, email), '') AS local_email,
-operator_email,
-NULLIF(CONCAT_WS('; ',contact_mobile, mobile, contact_phone, phone, phone_2),'') AS local_phone,
-NULLIF(CONCAT_WS('; ',website, contact_website),'') AS local_website,
-operator_website,
-operator_wikidata, operator, operator_type, image, 
+other_names,address,local_email,operator_email,local_phone,local_website,
+operator_website,operator_wikidata, operator, operator_type, image,
 start_date,capacity,capacity_planned,capacity_female,capacity_theoretically,prison,		
 geometry
 FROM raw_data.osm_jails)
@@ -244,7 +242,7 @@ JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
 	'capacity_theoretically',capacity_theoretically,
 	'prison_type',prison
 	)) as properties,
-geometry,
+ST_ReducePrecision(geometry, 1e-8) as geometry,
 CURRENT_DATE as created_at
 FROM cleaned;"),
 "ALTER TABLE IF EXISTS ingestion.jails OWNER to pgn_group_data_team_w;",
@@ -261,8 +259,7 @@ create_ingestion_table <- function() {execute_sql_commands(ingestion_table_sql, 
 
 
 # set to TRUE if you want to update the transformation table even if the checks fail. 
-update_even_if_checks_fail<-FALSE
-# Don't forget to also set checks_failed<-0 if there were already some issues in the base data
+#overrule_checks<-TRUE
 
 
 run_smart_update = function() {
@@ -275,7 +272,6 @@ run_smart_update = function() {
 main_function = function() {
   if (!reuse_ingestion_data) {
     process_fresh_data()
-    CreateImportTable(dataset = osm_all, schema = "raw_data", table_name = "osm_jails")  
     create_ingestion_table()
   }
   run_smart_update()

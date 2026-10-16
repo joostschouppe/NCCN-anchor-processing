@@ -177,7 +177,7 @@ legend_item,
 legend_item_id,
 data_list_id,
 1 as risk_level,
-geometry,
+ST_ReducePrecision(geometry, 1e-8) as geometry,
 CURRENT_DATE as created_at
 FROM cleaned;"),
 "ALTER TABLE IF EXISTS ingestion.seaport_right_of_first_refusal OWNER to pgn_group_data_team_w;",

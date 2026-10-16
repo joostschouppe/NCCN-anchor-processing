@@ -161,7 +161,7 @@ url$query <- list(service = "wfs",
                   srsName = "EPSG:31370"
 )
 request <- build_url(url)
-reiswegen <- read_sf(request)
+reiswegen <- st_read(request, options = "CONVERT_TO_LINEAR=YES")
 cat("Total VL routes retrieved:", nrow(reiswegen), "\n")
 
 reiswegen_raw<<-reiswegen
@@ -254,22 +254,41 @@ cat("Total VL stops after processing:", nrow(vl_haltes_agg), "\n")
 ### Brussels ----
 # download zip
 # set the source
-zip_url<-"https://stibmivb.opendatasoft.com/api/explore/v2.1/catalog/datasets/shapefiles-production/alternative_exports/shapefileszip/"
+zip_url<-"https://api-management-discovery-production.azure-api.net/api/datasets/stibmivb/static/shape-files/"
 # set the location to save it
-local_zip_path <- paste0(temporary_folder,"/shapefiles.zip")
-# Download the ZIP file
-GET(url = zip_url, write_disk(local_zip_path, overwrite = TRUE))
-# Unzip the downloaded file
-unzip(local_zip_path, exdir = temporary_folder)
+local_zip_folder <- file.path(temporary_folder,"bru-bus")
+local_zip_path <- file.path(local_zip_folder,"shapefiles.zip")
 
-# List the contents of the unzipped directory
-unzipped_contents <- list.dirs(paste0(temporary_folder,"/shapefiles"), recursive = FALSE)
-print(unzipped_contents)
+# If the folder exists, delete it and everything in it
+if (dir.exists(local_zip_folder)) {
+  unlink(local_zip_folder, recursive = TRUE, force = TRUE)
+}
+
+# Now (re)create the folder
+dir.create(local_zip_folder, recursive = TRUE)
+
+# Download the ZIP file
+response <- GET(url = zip_url, write_disk(local_zip_path, overwrite = TRUE))
+
+# stop the process if download failed
+if (httr::http_error(response)) {
+  stop(sprintf(
+    "Failed to download %s: HTTP %s", 
+    zip_url, 
+    httr::status_code(response)
+  ))
+}
+
+# Unzip the downloaded file
+unzip(local_zip_path, exdir = local_zip_folder)
+
+# Isolate the first folder created
+unzipped_contents <- list.dirs(file.path(local_zip_folder), recursive = FALSE)
 unzipped_folder <- unzipped_contents[1]
-print(unzipped_folder)
+
 
 # open the shapefile 
-brussels_stops <- st_read(paste0(unzipped_folder,"/ACTU_STOPS.shp"))
+brussels_stops <- st_read(file.path(unzipped_folder,"ACTU_STOPS.shp"))
 brussels_stops_raw<<-brussels_stops
 
 # set all columns to lowercase
@@ -277,7 +296,7 @@ brussels_stops <- brussels_stops %>%
   rename_all(tolower)
 
 
-brussels_lines <- st_read(paste0(unzipped_folder,"/ACTU_LIGNES_BRUTES.shp"))
+brussels_lines <- st_read(file.path(unzipped_folder,"ACTU_LIGNES_BRUTES.shp"))
 brussels_lines_raw<<-brussels_lines
 
 # set all columns to lowercase
@@ -288,8 +307,7 @@ cat("Total BRU stops:", nrow(brussels_stops), "\n")
 cat("Total BRU lines:", nrow(brussels_lines), "\n")
 
 # delete the temporary data
-unlink(paste0(temporary_folder,"/shapefiles"), recursive = TRUE)
-unlink(local_zip_path)
+unlink(local_zip_folder, recursive = TRUE, force = TRUE)
 
 # turn POINT Z into just POINT geometry
 brussels_stops <- brussels_stops %>%
@@ -569,13 +587,13 @@ reiswegen <- reiswegen %>%
 
 # BRU
 brussels_lines <- brussels_lines %>%
-  select(ligne,variante) %>%
+  select(linecode,variante) %>%
   mutate(source="STIB")
 
-# extract the last digit of the ligne
+# extract the last character of the linecode
 brussels_lines <- brussels_lines %>% 
   mutate(
-    last_char = substr(ligne, nchar(ligne), nchar(ligne)), # Extract the last character
+    last_char = substr(linecode, nchar(linecode), nchar(linecode)), # Extract the last character
     metro = ifelse(last_char == "m", 1, 0),                # 1 if last character is 'm', else 0
     tram = ifelse(last_char == "t", 1, 0),                 # 1 if last character is 't', else 0
     bus = ifelse(last_char == "b", 1, 0)                   # 1 if last character is 'b', else 0
@@ -616,10 +634,11 @@ WHEN languagestatute=8 THEN 'wal'
 WHEN languagestatute=7 THEN 'wal'		
 WHEN languagestatute=6 THEN 'wal'
 WHEN languagestatute=2 THEN 'wal'
-ELSE 'und' END as region, ST_AsText(shape) as geometry FROM raw_data.ngi_ign_municipality")
+ELSE 'und' END as region, ST_AsHEXEWKB(shape) as geometry FROM raw_data.ngi_ign_municipality")
 dbDisconnect(con_pg)
-ngi_muni<-st_as_sf(ngi_muni, wkt="geometry")
+ngi_muni$geometry <- st_as_sfc(structure(ngi_muni$geometry, class = "WKB"), EWKB = TRUE)
 ngi_muni$geometry <- st_set_crs(ngi_muni$geometry, 4326)
+ngi_muni <- st_as_sf(ngi_muni)
 #reproject to 31370
 ngi_muni <- st_transform(ngi_muni, 31370)
 
@@ -708,7 +727,7 @@ all_stops <- all_stops %>%
       source == "TEC",
       jsonlite::toJSON(
         purrr::discard(list(
-          original_id = original_id,
+          official_id = original_id,
           arret_id = arret_id,
           pmr = pmr,
           pot_id = pot_id
@@ -737,7 +756,7 @@ all_stops <- all_stops %>%
       source == "De Lijn",
       jsonlite::toJSON(
         purrr::discard(list(
-          original_id = original_id,
+          official_id = original_id,
           stop_type = stop_type,
           stopid = stopid
         ), is.na), auto_unbox = TRUE),
@@ -756,7 +775,7 @@ all_stops <- all_stops %>%
       source == "STIB",
       jsonlite::toJSON(
         purrr::discard(list(
-          original_id = original_id
+          official_id = original_id
         ), is.na), auto_unbox = TRUE),
       NA
     )
@@ -946,12 +965,10 @@ CREATE TABLE IF NOT EXISTS ingestion.bus_tram_metro_stops
 cleaned as (SELECT
             original_id,
             jsonb_strip_nulls(jsonb_build_object(
-              'fre', CASE WHEN (name_fre='' OR name_fre is NULL) AND name_dut IS NULL THEN 'halte openbaar vervoer'
-              WHEN name_fre='' OR name_fre is NULL THEN name_dut 
-              ELSE name_fre END,
-              'dut', CASE WHEN (name_dut='' OR name_dut is NULL) AND name_fre IS NULL THEN 'arrêt de transport en commun'
-              WHEN name_dut='' OR name_dut is NULL THEN name_fre 
-              ELSE name_dut END)) as name,
+              'dut', CASE WHEN (name_fre='' OR name_fre is NULL) AND name_dut IS NULL THEN 'halte openbaar vervoer'
+              ELSE name_dut END,
+              'fre', CASE WHEN (name_dut='' OR name_dut is NULL) AND name_fre IS NULL THEN 'arrêt de transport en commun'
+              ELSE name_fre END)) as name,
             jsonb_build_object(
               'dut', CASE 
                 WHEN metro=1 then 'metrohalte'
@@ -992,7 +1009,7 @@ data_list_id,
 1 as risk_level,
 properties::jsonb,
 properties_secondary::jsonb,
-geometry,
+ST_ReducePrecision(geometry, 1e-8) as geometry,
 CURRENT_DATE as created_at
 FROM cleaned;"),
 "ALTER TABLE IF EXISTS ingestion.bus_tram_metro_stops OWNER to pgn_group_data_team_w;",
@@ -1027,11 +1044,11 @@ CREATE TABLE IF NOT EXISTS ingestion.bus_tram_metro_routes
   SELECT
   CASE WHEN source='De Lijn' THEN oidn::text
   WHEN source='TEC' THEN lgn_id
-  ELSE ligne || '_' || variante END
+  ELSE linecode || '_' || variante END
   as original_id,
   jsonb_build_object('und',CASE WHEN source='De Lijn' THEN variant || ' (' || lijn || ')'
                      WHEN source='TEC' THEN lgn_nom || ' (' || lgn_num || ')'
-                     ELSE ligne END)
+                     ELSE linecode END)
   as name,
   jsonb_build_object(
     'dut', CASE WHEN metro=1 then 'metrolijn'
@@ -1075,7 +1092,7 @@ legend_item_id,
 data_list_id,
 1 as risk_level,
 properties::jsonb,
-geometry,
+ST_ReducePrecision(geometry, 1e-8) as geometry,
 CURRENT_DATE as created_at
 FROM cleaned;"),
 "ALTER TABLE IF EXISTS ingestion.bus_tram_metro_routes OWNER to pgn_group_data_team_w;",
@@ -1094,7 +1111,7 @@ create_ingestion_table_routes <- function() {execute_sql_commands(ingestion_tabl
 
 run_smart_update = function() {
   smart_update_process("bus_tram_metro_stops", 50, 100, 50, format(Sys.Date(), "%Y-%m-%d"), allow_update_even_if_checks_fail=overrule_checks, dry_run=do_dry_run,reuse_ingestion_data=reuse_ingestion_data)
-  smart_update_process("bus_tram_metro_routes", 200, 400, 200, format(Sys.Date(), "%Y-%m-%d"), allow_update_even_if_checks_fail=overrule_checks, dry_run=do_dry_run,reuse_ingestion_data=reuse_ingestion_data)
+  smart_update_process("bus_tram_metro_routes", 200, 400, 200, format(Sys.Date(), "%Y-%m-%d"), allow_update_even_if_checks_fail=overrule_checks, dry_run=do_dry_run,reuse_ingestion_data=reuse_ingestion_data, same_id_size_factor = 1.25,different_id_size_factor = 1.25)
 }
 
 

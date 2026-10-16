@@ -94,15 +94,15 @@ process_fresh_data <- function(){
 # Define the list of features
 features_list <- list("amenity"="hospital")
 # Define extra tags to use as columns for properties
-extra_columns <- c("amenity","description","email","emergency","emergency:phone","fax","full_name","healthcare", "healthcare:speciality","loc_name","opening_hours:visitors","start_date", "ref:fps_health:recognition", "ref:fps_health:campus","emergency_ward")
+extra_columns <- c("amenity","description","email","emergency","emergency:phone","fax","full_name","healthcare", "healthcare:speciality","loc_name","opening_hours:visitors","start_date", "ref:fps_health:recognition", "ref:fps_health:campus","emergency_ward", "health_facility:type")
 # Choose which datatypes are needed, as a list of datatypes, using any of "points", "lines", "mpolygons" (this is polygons+multipolygons together)
 datatypes <- c("points", "mpolygon")
 
 ### Actual OSM download & transformation ----
 
 osm_all <- run_process(
-  download_osm_process(features_list, datatypes, extra_columns, keep_region=TRUE, postgres=TRUE),
-  paste0("OSM download & processing for ", paste(paste(names(features_list), unlist(features_list), sep = "="), collapse = ", "), collapse = ", ")
+  download_osm_process(features_list, datatypes, extra_columns, keep_region=TRUE),
+  paste0("OSM download & processing for ", describe_features_list(features_list))
 )
 
 # remove objects that do NOT actually have a hospital tag (this is an artifact from the site relation)
@@ -112,6 +112,11 @@ osm_all <- osm_all %>%
 # remove emergency ward entrances (these are interesting, but not actual hospitals)
 osm_all <- osm_all %>%
   filter(emergency!="emergency_ward_entrance" | is.na(emergency))
+
+# remove hospital departments
+osm_all <- osm_all %>%
+  filter(health_facility_type!="department" | is.na(health_facility_type))
+
 
 # Find all hospitals within other hospitals
 joined_all <- st_join(osm_all, osm_all, join = st_within)
@@ -161,8 +166,8 @@ datatypes <- c("points", "mpolygon")
 
 
 osm_helipad <- run_process(
-  download_osm_process(features_list, datatypes, extra_columns, keep_region=TRUE, postgres=TRUE),
-  paste0("OSM download & processing for ", paste(paste(names(features_list), unlist(features_list), sep = "="), collapse = ", "), collapse = ", ")
+  download_osm_process(features_list, datatypes, extra_columns, keep_region=TRUE),
+  paste0("OSM download & processing for ", describe_features_list(features_list))
 )
 
 # remove non-helipad objects
@@ -178,56 +183,6 @@ helipad_test <- osm_helipad %>%
 cat(paste("Inconsistencies in helipad data: ",nrow(helipad_test),"\n"))
 
 
-# replace the geometry of heliports with the geometry of the helipad within it (if there's only one)
-## select heliports
-osm_heliport <- osm_helipad %>%
-  filter(aeroway=="heliport")
-
-## calculate bbox for each row
-osm_heliport_bbox <- osm_helipad %>%
-  filter(aeroway == "heliport") %>%
-  rowwise() %>%
-  mutate(
-    minx = as.numeric(st_bbox(geometry)["xmin"]),
-    miny = as.numeric(st_bbox(geometry)["ymin"]),
-    maxx = as.numeric(st_bbox(geometry)["xmax"]),
-    maxy = as.numeric(st_bbox(geometry)["ymax"])
-  ) %>%
-  ungroup()
-
-### Create a numeric vector from the four columns in each row
-osm_heliport_bbox <- osm_heliport_bbox %>%
-  mutate(bbox = pmap(list(minx, miny, maxx, maxy), ~ c(...)))
-bbox_numeric <- unlist(osm_heliport_bbox$bbox[1])
-
-## add a stop if this is more than one row
-if (nrow(osm_heliport_bbox) > 1) {
-  stop("More than one row in osm_heliport_bbox - please adapt script to deal with this")
-}
-
-## download any helipad within the bbox
-### do NOT set postgres to TRUE, becuase we're using a very small BBOX here - and that gets overruled by utils.R for now
-osm_helipad_within <- run_process(
-  download_osm_process(features_list, datatypes, extra_columns, bbox=bbox_numeric, keep_region=TRUE, postgres=FALSE),
-  paste0("OSM download & processing for ", paste(paste(names(features_list), unlist(features_list), sep = "="), collapse = ", "), collapse = ", ")
-)
-
-if (nrow(osm_helipad_within) > 1) {
-  stop("More than one row in osm_helipad_within - please adapt script to deal with this")
-}
-
-# replace the geometry
-# Assuming both datasets are in sf format and each contains only one record
-# Extract the geometry from the first (and only) record in osm_helipad_within
-new_geometry <- osm_helipad_within$geometry[1]
-
-# Replace the geometry in osm_heliport
-osm_heliport$geometry[1] <- new_geometry
-
-# replace the record
-osm_helipad <- osm_helipad %>%
-  filter(aeroway=="helipad")
-osm_helipad <- rbind(osm_helipad, osm_heliport)
 
 
 # make available outside the function
@@ -246,8 +201,8 @@ datatypes <- c("points")
 
 ### Actual OSM download & transformation ----
 osm_emergency_entrance <- run_process(
-  download_osm_process(features_list, datatypes, extra_columns, keep_region=TRUE, postgres=TRUE),
-  paste0("OSM download & processing for ", paste(paste(names(features_list), unlist(features_list), sep = "="), collapse = ", "), collapse = ", ")
+  download_osm_process(features_list, datatypes, extra_columns, keep_region=TRUE),
+  paste0("OSM download & processing for ", describe_features_list(features_list))
 )
 
 # Select core hospital data (multipolygon only)
@@ -366,8 +321,8 @@ JSONB_BUILD_OBJECT(
 risk_level as risk_level,
 JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
   'address', address,
-  'email', email,
-  'phone', phone,
+  'local_email', email,
+  'local_phone', phone,
   'emergency_ward_type', emergency_ward_type,
   'fps_health_recognition', fps_health_recognition,
   'fps_health_campus', fps_health_campus,
@@ -375,10 +330,10 @@ JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
   'image', image_url,
   'opening_hours', opening_hours,
   'operator', operator,
-  'website', website,
+  'local_website', website,
   'wikidata', wikidata,
   'other_names',other_names)) as properties,
-geometry,
+ST_ReducePrecision(geometry, 1e-8) as geometry,
 CURRENT_DATE as created_at
 FROM simplified;"),
 "ALTER TABLE IF EXISTS ingestion.hospitals OWNER to pgn_group_data_team_w;",
@@ -454,12 +409,12 @@ JSONB_BUILD_OBJECT(
 risk_level,
 '",data_list_id_helipad,"'::uuid as data_list_id,
 JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
-  'email', email,
+  'local_email', email,
   'operator email', operator_email,
-  'phone', phone,
+  'local_phone', phone,
   'opening_hours', opening_hours,
   'operator', operator,
-  'website', website,
+  'local_website', website,
   'wikidata', wikidata,
   'icao', icao,
   'maxweight', maxweight,
@@ -469,7 +424,7 @@ JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
   'aeroway',aeroway,
   'diameter',diameter
   )) as properties,
-geometry,
+ST_ReducePrecision(geometry, 1e-8) as geometry,
 CURRENT_DATE as created_at
 FROM simplified;"),
 "ALTER TABLE IF EXISTS ingestion.hospital_helipads OWNER to pgn_group_data_team_w;",
@@ -544,15 +499,15 @@ JSONB_BUILD_OBJECT(
 risk_level,
 '",data_list_id_emergency_entrance,"'::uuid as data_list_id,
 JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
-  'email', email,
+  'local_email', email,
   'operator email', operator_email,
-  'phone', phone,
+  'local_phone', phone,
   'opening_hours', opening_hours,
   'operator', operator,
-  'website', website,
+  'local_website', website,
   'wikidata', wikidata
   )) as properties,
-geometry,
+ST_ReducePrecision(geometry, 1e-8) as geometry,
 CURRENT_DATE as created_at
 FROM simplified;"),
 "ALTER TABLE IF EXISTS ingestion.hospital_emergency OWNER to pgn_group_data_team_w;",
@@ -603,6 +558,3 @@ main_function = function() {
 if(run_status){
   main_function()
 }
-
-
-

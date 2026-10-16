@@ -81,7 +81,7 @@ features_list <- list("amenity" = "place_of_worship")
 extra_columns <- c("building","place_of_worship","place_of_worship:type",
                    "religion","denomination",
                    "services","service_times",
-                   "basilica","deanery","diocese","parish","historic", "building:part")
+                   "basilica","deanery","diocese","parish","historic", "building:part", "memorial")
 # Choose which datatypes are needed, as a list of datatypes, using any of "points", "lines", "mpolygons" (this is polygons+multipolygons together)
 datatypes <- c("points", "mpolygon")
 
@@ -89,9 +89,62 @@ datatypes <- c("points", "mpolygon")
 ### Actual OSM download & transformation ----
 
 osm_all <- run_process(
-  download_osm_process(features_list, datatypes, extra_columns, postgres=TRUE),
-  paste0("OSM download & processing for ", paste(paste(names(features_list), unlist(features_list), sep = "="), collapse = ", "), collapse = ", ")
+  download_osm_process(features_list, datatypes, extra_columns, keep_region=TRUE),
+  paste0("OSM download & processing for ", describe_features_list(features_list))
 )
+
+
+# remove objects already in "higher" layers
+## get the relevant object ids
+con_pg <- get_con()
+remove_objects <- dbGetQuery(con_pg, paste0("SELECT DISTINCT replace(original_id, 'https://osm.org/', '') AS osm_id
+                                     FROM transformation.cultural_centre WHERE deleted_at IS NULL"))
+dbDisconnect(con_pg)
+## anti-join to throw them out
+osm_all <- osm_all %>%
+  anti_join(remove_objects, by = "osm_id")
+
+
+
+# classify "size" of the amenity
+osm_all <- osm_all %>%
+  mutate(likely_size=case_when(
+    !is.na(services) | (!is.na(service_times) & !(service_times %in% c('off', 'closed', 'none'))) ~ 'large',
+    place_of_worship %in% c('wayside_chapel', 'wayside_shrine', 'lourdes_grotto', 'cross', 'shrine', 'altar', 'calvary' ,'holy_well', 'tree_chapel', 'chapel', 'tree') ~'small',
+    place_of_worship %in% c('church', 'monastery', 'mosque', 'temple', 'kingdom_hall', 'meditation_centre') ~ 'large',
+    place_of_worship_type %in% c('wayside_chapel', 'wayside_shrine', 'lourdes_grotto', 'cross', 'shrine', 'altar', 'calvary' ,'holy_well', 'tree_chapel', 'chapel', 'tree') ~'small',
+    building %in% c('wayside_chapel', 'wayside_cross', 'wayside_shrine', 'chapel', 'grotto', 'cross', 'shrine', 'bell_tower', 'cabin', 'cave', 'cemetery_chapel', 'hospital', 'ossuary') ~ 'small',
+    building_part %in% c('wayside_chapel', 'wayside_cross', 'wayside_shrine', 'chapel', 'grotto', 'cross', 'shrine', 'bell_tower', 'cabin', 'cave', 'cemetery_chapel', 'hospital', 'ossuary') ~ 'small',
+    building %in% c('church', 'basilica', 'cathedral', 'church_of_christ', 'cloister', 'convent', 'funeral_hall', 'kingdom_hall', 'monastery', 'mosque', 'nunnery', 'synagogue', 'temple') ~ 'large',
+    building_part %in% c('church', 'basilica', 'cathedral', 'church_of_christ', 'cloister', 'convent', 'funeral_hall', 'kingdom_hall', 'monastery', 'mosque', 'nunnery', 'synagogue', 'temple') ~ 'large',
+    historic %in% c('wayside_shrine', 'wayside_cross', 'wayside_chapel', 'memorial', 'chapel') ~ 'small',
+    memorial %in% c('war_memorial', 'statue') ~ 'small',
+    is.na(name) & is.na(religion) ~ 'likely small',
+    grepl('kapel|chapelle', name, ignore.case=TRUE)==TRUE ~ 'likely small',
+    grepl('moschee|moskee|mosqu|kerk|church|kirche|eglise|église', name, ignore.case=TRUE)==TRUE ~ 'likely large',
+    religion=='muslim' ~ 'likely large',
+    TRUE ~'no idea'
+  ))
+
+# keep only places which are not small or likely small
+osm_all <- osm_all %>%
+  filter(likely_size %in% c('large','likely large','no idea'))
+
+# if building=yes, set to missing (because we're only interested in detailed building types)
+osm_all <- osm_all %>%
+  mutate(building=ifelse(building=="yes",NA,building))
+
+# detect objects on top of other objects in the dataset
+result <- osmspatial_deduplication(osm_all, c("building","place_of_worship","place_of_worship_type","religion","denomination","services","service_times",
+"basilica","deanery","diocese","parish"))
+osm_all <- result$data
+#osm_diagnostic <- result$diagnostic
+
+# standardize the usual OSM columns
+osm_all <- build_osm_derived_columns(osm_all)
+
+
+
 
 # Create the import table in the database ----
 CreateImportTable(dataset = osm_all, schema = "raw_data", table_name = "osm_religion")  
@@ -152,20 +205,8 @@ paste0("WITH cleaned as (SELECT
               'fre', 'lieu de culte',
               'ger', 'Anbetungsstätte',
               'eng', 'place of worship') as legend_item,
-            CASE WHEN short_name IS NULL AND official_name IS NULL AND alt_name IS NULL AND old_name IS NULL THEN NULL 
-	ELSE CONCAT_WS('; ',short_name, official_name, alt_name, old_name) END AS other_names,
-CASE WHEN addr_street IS NULL THEN NULL 
-	ELSE LTRIM(CONCAT(addr_street, ' ' || CASE WHEN nohousenumber='yes' THEN 'w/n' ELSE addr_housenumber END, ', ' || CONCAT((addr_postcode || ' '), addr_city))) END
-	AS address,
-CASE WHEN contact_email IS NULL AND email IS NULL THEN NULL
-	ELSE CONCAT_WS('; ',contact_email, email) END AS local_email,
-operator_email,
-CASE WHEN contact_mobile IS NULL AND mobile IS NULL AND contact_phone IS NULL AND phone IS NULL AND phone_2 IS NULL THEN NULL
-	ELSE CONCAT_WS('; ',contact_mobile, mobile, contact_phone, phone, phone_2) END AS local_phone,
-CASE WHEN website IS NULL AND contact_website IS NULL THEN NULL
-	ELSE CONCAT_WS('; ',website, contact_website) END AS local_website,
-	operator_website,
-			CASE WHEN building='yes' THEN null ELSE building END AS building,
+other_names, address, local_email, operator_email, local_phone, local_website,operator_website,
+building,
 CASE WHEN place_of_worship IS NULL AND place_of_worship_type IS NULL THEN NULL 
   ELSE CONCAT_WS('; ',place_of_worship,place_of_worship_type) END as place_of_worship_type,
             religion,denomination,
@@ -174,13 +215,6 @@ CASE WHEN services IS NULL AND service_times IS NULL THEN NULL
             basilica,deanery,diocese,parish,
             geometry
             FROM raw_data.osm_religion
-			WHERE 
-	(building IS NULL OR (building != 'wayside_chapel' AND building != 'wayside_cross' AND building != 'wayside_shrine' AND building != 'chapel'))
-	AND (building_part IS NULL OR (building_part != 'wayside_chapel' AND building_part != 'wayside_cross' AND building_part != 'wayside_shrine' AND building_part != 'chapel'))
-	AND NOT (name IS NULL and religion IS NULL)
-	AND (place_of_worship IS NULL OR (place_of_worship!= 'wayside_chapel' AND place_of_worship!='wayside_shrine' AND place_of_worship!='lourdes_grotto' AND place_of_worship!='cross' AND place_of_worship!='shrine' AND place_of_worship!='altar'))
-	AND (place_of_worship_type IS NULL OR (place_of_worship_type != 'wayside_chapel' AND place_of_worship_type!= 'wayside_shrine' AND place_of_worship_type!='wayside_cross' AND place_of_worship_type!= 'cross' AND place_of_worship_type!='shrine' AND place_of_worship_type!='altar'))
-	AND (historic IS NULL OR (historic != 'wayside_shrine' AND historic != 'wayside_cross' AND historic != 'wayside_chapel'))
 			)
 
 INSERT INTO ingestion.place_of_worship 
@@ -210,7 +244,7 @@ JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
 	'diocese',diocese,
 	'parish',parish
 )),
-geometry,
+ST_ReducePrecision(geometry, 1e-8) as geometry,
 CURRENT_DATE as created_at
 FROM cleaned;"),
 "ALTER TABLE IF EXISTS ingestion.place_of_worship OWNER to pgn_group_data_team_w;",
@@ -226,7 +260,7 @@ create_ingestion_table <- function() {execute_sql_commands(ingestion_table_sql, 
 
 
 # set to TRUE if you want to update the transformation table even if the checks fail. 
-update_even_if_checks_fail<-overrule_checks
+#overrule_checks<-TRUE
 
 
 run_smart_update = function() {

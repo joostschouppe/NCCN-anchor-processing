@@ -76,8 +76,10 @@ DownloadOSM <- function(){
 ### OSM DOWNLOAD PARAMETERS ----
 
 # Define the list of features
-features_list_1 <- list("shop" = "mall")
-features_list_2 <- list("shop" = "department_store")
+features_list <- list(or_group(
+ tag_filter("shop", "mall"),
+ tag_filter("shop", "department_store")
+ ))
 
 # Define extra tags to use as columns for properties
 extra_columns <- c("shop", "max_level", "min_level", "brand:wikidata")
@@ -88,147 +90,30 @@ datatypes <- c("points", "mpolygon")
 
 ### Actual OSM download & transformation ----
 
-osm_mall <- run_process(
-  download_osm_process(features_list_1, datatypes, extra_columns, postgres=TRUE),
-  paste0("OSM download & processing for ", paste(paste(names(features_list_1), unlist(features_list_1), sep = "="), collapse = ", "), collapse = ", ")
+osm_all <- run_process(
+  download_osm_process(features_list, datatypes, extra_columns),
+  paste0("OSM download & processing for ", describe_features_list(features_list))
 )
 
-osm_dept <- run_process(
-  download_osm_process(features_list_2, datatypes, extra_columns, postgres=TRUE),
-  paste0("OSM download & processing for ", paste(paste(names(features_list_2), unlist(features_list_2), sep = "="), collapse = ", "), collapse = ", ")
-)
-
-# remove if no name and remove artefacts from download
-osm_dept<-osm_dept %>%
-  filter(shop=="department_store" & !is.na(name))
-
+# remove if no name
 # only keep relevant department stores:
 ## INNO Q300632, La Fayette Q3094686 , Galeria (Karstadt of Kaufhof) Q80220059 (brand:wikidata), De Bijenkorf Q2063937
-osm_dept<-osm_dept %>%
-  filter(grepl("Q300632|Q3094686|Q80220059|Q2063937", `brand_wikidata`))
-
-
-# remove if no name and remove artefacts from download
-osm_mall<-osm_mall %>%
-  filter(shop=="mall" & !is.na(name))
-
-# merge both sets
-osm_all<-rbind(osm_mall, osm_dept)
+osm_all <- osm_all %>%
+  filter(!is.na(name)) %>%
+  filter(!(shop == "department_store" & !grepl("Q300632|Q3094686|Q80220059|Q2063937", brand_wikidata)))
 
 
 # detect objects on top of other objects in the dataset
-## first define a set of potential outers
-osm_outers<-osm_all %>%
-  select(outer_id=osm_id) %>%
-  filter(!st_is(geometry, "POINT"))
-## then join them to the objects
-join <- st_join(osm_all, osm_outers, join = st_within)
+result <- osmspatial_deduplication(osm_all, c("shop", "min_level", "max_level"))
+join_filtered <- result$data
+#osm_diagnostic <- result$diagnostic
 
-# count the number of times an inner is used (to later find objects that are linked to itself and something else too, or to more than one outer)
-join<-join %>%
-  mutate(outer_id=case_when(!is.na(outer_id)~outer_id, TRUE~osm_id)) %>%
-  group_by(osm_id) %>%
-  mutate(count_inner=case_when(!is.na(outer_id) ~n(), TRUE~NA))
-# remove if the inner is used by an outer but still refers to itself as well
-join<-join %>%
-  filter(count_inner==1 | (count_inner>1 & osm_id!=outer_id))
+# standardize the usual OSM columns
+join_filtered <- build_osm_derived_columns(join_filtered)
 
 
-# add a count with the number of times an outer is used
-join<-join %>%
-  mutate(outer_id=case_when(!is.na(outer_id)~outer_id, TRUE~osm_id)) %>%
-  group_by(outer_id) %>%
-  mutate(count=case_when(!is.na(outer_id) ~n(), TRUE~NA))
+CreateImportTable(dataset = join_filtered, schema = "raw_data", table_name = "osm_mall")
 
-# count inners again and give them an order_inner number, where 1 is for the case linked to the biggest count (outer)
-join<-join %>%
-  group_by(osm_id) %>%
-  mutate(count_inner=case_when(!is.na(outer_id) ~n(), TRUE~NA)) %>%
-  arrange(desc(count)) %>%
-  mutate(order_inner = row_number())
-
-# if count_inner>1, take the first one (i.e. the one linked to the biggest polygon)
-join<-join %>%
-  filter(count_inner==1 | (count_inner>1 & order_inner==1))
-
-
-
-# create aggregated variables
-join <- join %>%
-  group_by(outer_id) %>%
-  mutate(operator= ifelse(count > 1, paste(unique(na.omit(operator)), collapse = "; "), operator)) %>%
-  mutate(addr_city= ifelse(count > 1, paste(unique(na.omit(addr_city)), collapse = "; "), addr_city)) %>%
-  mutate(addr_housenumber= ifelse(count > 1, paste(unique(na.omit(addr_housenumber)), collapse = "; "), addr_housenumber)) %>%
-  mutate(addr_street= ifelse(count > 1, paste(unique(na.omit(addr_street)), collapse = "; "), addr_street)) %>%
-  mutate(addr_postcode= ifelse(count > 1, paste(unique(na.omit(addr_postcode)), collapse = "; "), addr_postcode)) %>%
-  mutate(contact_email= ifelse(count > 1, paste(unique(na.omit(contact_email)), collapse = "; "), contact_email)) %>%
-  mutate(email= ifelse(count > 1, paste(unique(na.omit(email)), collapse = "; "), email)) %>%
-  mutate(website= ifelse(count > 1, paste(unique(na.omit(website)), collapse = "; "), website)) %>%
-  mutate(contact_website= ifelse(count > 1, paste(unique(na.omit(contact_website)), collapse = "; "), contact_website)) %>%
-  mutate(phone= ifelse(count > 1, paste(unique(na.omit(phone)), collapse = "; "), phone)) %>%
-  mutate(contact_phone= ifelse(count > 1, paste(unique(na.omit(contact_phone)), collapse = "; "), contact_phone)) %>%
-  mutate(opening_hours= ifelse(count > 1, paste(unique(na.omit(opening_hours)), collapse = "; "), opening_hours)) %>%
-  mutate(mobile= ifelse(count > 1, paste(unique(na.omit(mobile)), collapse = "; "), mobile)) %>%
-  mutate(contact_mobile= ifelse(count > 1, paste(unique(na.omit(contact_mobile)), collapse = "; "), contact_mobile)) %>%
-  mutate(check_date= ifelse(count > 1, paste(unique(na.omit(check_date)), collapse = "; "), check_date)) %>%
-  mutate(wikidata= ifelse(count > 1, paste(unique(na.omit(wikidata)), collapse = "; "), wikidata)) %>%
-  mutate(operator_wikidata= ifelse(count > 1, paste(unique(na.omit(operator_wikidata)), collapse = "; "), operator_wikidata)) %>%
-  mutate(phone_2= ifelse(count > 1, paste(unique(na.omit(phone_2)), collapse = "; "), phone_2)) %>%
-  mutate(alt_website= ifelse(count > 1, paste(unique(na.omit(alt_website)), collapse = "; "), alt_website)) %>%
-  mutate(operator_website= ifelse(count > 1, paste(unique(na.omit(operator_website)), collapse = "; "), operator_website)) %>%
-  mutate(shop= ifelse(count > 1, paste(unique(na.omit(shop)), collapse = "; "), shop)) %>%
-  mutate(min_level= ifelse(count > 1, paste(unique(na.omit(min_level)), collapse = "; "), min_level)) %>%
-  mutate(max_level= ifelse(count > 1, paste(unique(na.omit(max_level)), collapse = "; "), max_level))
-
-  
-  
-# aggregate names
-aggregate_names <- function(df, names_to_aggregate) {
-  for (col in names_to_aggregate) {
-    df <- df %>%
-      group_by(outer_id) %>%
-      mutate(
-        primary_name = ifelse(!is.na(get(col))[osm_id == outer_id][1], get(col)[osm_id == outer_id][1], NA),
-        other_names = paste(unique(na.omit(get(col)[osm_id != outer_id & get(col) != primary_name])), collapse = ", "),
-        across(col, ~ ifelse(!is.na(.), case_when(
-          count > 1 & !is.na(other_names) & other_names != "" ~ ifelse(is.na(primary_name) | primary_name == "", other_names, paste0(primary_name, " (", other_names, ")")),
-          TRUE ~ .
-        ), .))
-      ) %>%
-      ungroup() %>%
-      select(-primary_name, -other_names)  # Remove temporary columns if not needed
-  }
-  
-  return(df)
-}
-
-
-# Define your list of columns to aggregate
-names_to_aggregate <- c("name", "name_nl", "name_fr", "name_de", "alt_name", "short_name", "official_name", "old_name")
-
-# Call the function to aggregate names
-join <- aggregate_names(join, names_to_aggregate)
-
-
-
-# Filter records based on the count and outer_id conditions
-join_filtered <- join %>%
-  filter(count == 1 | (count > 1 & outer_id == osm_id)) %>%
-  select(-count,-outer_id)
-
-# confirm as SF dataset
-join_filtered <- st_as_sf(join_filtered, "geometry")
-
-# set all empty values in strings to missing
-replace_empty_with_null <- function(x) {
-  ifelse(x == "", NA_character_, x)
-}
-string_columns <- names(join_filtered)[sapply(join_filtered, is.character) & names(join_filtered) != "geometry"]
-join_filtered <- join_filtered %>%
-  mutate_at(vars(all_of(string_columns)), ~ replace_empty_with_null(.))
-
-
-return(join_filtered)  
   }, 
 error = function(e) {
   print(paste("Error downloading OSM:", e))
@@ -285,19 +170,8 @@ cleaned as (SELECT
               'fre', 'centre commercial',
               'ger', 'Einkaufszentrum',
               'eng', 'shopping mall') as legend_item,
-            CASE WHEN short_name IS NULL AND official_name IS NULL AND alt_name IS NULL AND old_name IS NULL THEN NULL 
-	ELSE CONCAT_WS('; ',short_name, official_name, alt_name, old_name) END AS other_names,
-CASE WHEN addr_street IS NULL THEN NULL 
-	ELSE LTRIM(CONCAT(addr_street, ' ' || CASE WHEN nohousenumber='yes' THEN 'w/n' ELSE addr_housenumber END, ', ' || CONCAT((addr_postcode || ' '), addr_city))) END
-	AS address,
-CASE WHEN contact_email IS NULL AND email IS NULL THEN NULL
-	ELSE CONCAT_WS('; ',contact_email, email) END AS local_email,
-operator_email,
-CASE WHEN contact_mobile IS NULL AND mobile IS NULL AND contact_phone IS NULL AND phone IS NULL AND phone_2 IS NULL THEN NULL
-	ELSE CONCAT_WS('; ',contact_mobile, mobile, contact_phone, phone, phone_2) END AS local_phone,
-CASE WHEN website IS NULL AND contact_website IS NULL THEN NULL
-	ELSE CONCAT_WS('; ',website, contact_website) END AS local_website,
-operator_website,operator_wikidata,operator,
+            other_names,address,local_email,operator_email,local_phone,local_website,
+operator_website,operator_wikidata, operator, operator_type, image, 
 min_level,max_level,
 	geometry FROM raw_data.osm_mall)
 INSERT INTO ingestion.mall 
@@ -321,7 +195,7 @@ JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
 	'building_lowest_level',min_level,
 	'building_highest_level',max_level
 )),
-geometry,
+ST_ReducePrecision(geometry, 1e-8) as geometry,
 CURRENT_DATE as created_at
 FROM cleaned;"),
 "ALTER TABLE IF EXISTS ingestion.mall OWNER to pgn_group_data_team_w;",
@@ -346,8 +220,7 @@ run_smart_update = function() {
 
 main_function = function() {
   if (!reuse_ingestion_data) {
-    join_filtered<-DownloadOSM()
-    CreateImportTable(dataset = join_filtered, schema = "raw_data", table_name = "osm_mall")
+    DownloadOSM()
     create_ingestion_table()
   }
   run_smart_update()

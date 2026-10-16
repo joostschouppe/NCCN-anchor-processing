@@ -61,20 +61,16 @@ get_con<-function(){
 # """""""""""""""""" ----
 
 
-download_and_extract_shp <- function(url) {
+download_and_extract <- function(url) {
   ## Download a ZIP -----------------------------------------------------------------
   zip_file <- tempfile()
   GET(url, write_disk(zip_file))
   
   ## Extract the content -----------------------------------------------------------------
   unzipped <- unzip(zip_file, exdir = tempdir(), overwrite = TRUE)
-  
-  ## Extract the .shp file path
-  shp_file <- unzipped[grep("\\.shp$", unzipped)]
-  
+
   # Read the shapefile into an SF object
-  sf_dataset <- st_read(shp_file)
-  
+  sf_dataset <- st_read(unzipped)
   
   ## Suppression du fichier ZIP -----------------------------------------------------------------
   file.remove(zip_file)
@@ -84,15 +80,14 @@ download_and_extract_shp <- function(url) {
 
 
 # check https://statbel.fgov.be/nl/open-data/datalab-grid-van-de-bevolking-met-cellen-van-variabele-grootte for updates
-grid <- download_and_extract("https://statbel.fgov.be/sites/default/files/files/opendata/SH_VARYING_CELL_SIZE_GRID/POP_GRID_2024_3035.shp.zip")
-
+grid <- download_and_extract("https://statbel.fgov.be/sites/default/files/files/opendata/SH_VARYING_CELL_SIZE_GRID/POP_GRID_2025_3035_geojson.zip")
 
 #reproject to 4326
 grid <- st_transform(grid, 4326)
 
 
 
-
+plot(grid$geometry)
 
 
 
@@ -126,9 +121,11 @@ CREATE TABLE IF NOT EXISTS transformation.population_grid
   );
 ",paste0("
 WITH cleaned as (SELECT CONCAT(x_3035,'_',y_3035) as original_id, 
-ms_len as cell_length, ms_pop as population, 
+ms_len as cell_length, 
+ms_pop as population, 
 --ms_hh as households,
-ms_km2 as area_km2, ms_pop/ms_km2 AS pop_density, 
+ms_km2 as area_km2, 
+ms_pop/ms_km2 AS pop_density, 
 --ms_hh/ms_km2 AS hh_density, 
 geometry  FROM raw_data.population_grid)
 INSERT INTO transformation.population_grid
@@ -168,7 +165,7 @@ create_transformation_table <- function() {execute_sql_commands(transformation_t
 
 CreateImportTable(dataset = grid, schema = "raw_data", table_name = "population_grid")  
 
-# Before running this, make sure you have a backup of the fdw and vt_fdw based on this table
+# IMPORTANT Before running this, make sure you have a backup of the fdw and vt_fdw based on this table (though we keep a backup at the scrips repo in the fdw folder)
 # Also, make a copy of the current table with name population_grid_2024 (if you're processing 2025 data)
 create_transformation_table()
 

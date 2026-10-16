@@ -26,6 +26,7 @@ db_name<- Sys.getenv("POSTGRES_DB_NAME_CURATED")
 
 temporary_folder <-Sys.getenv("TEMPORARY_STORAGE")
 
+svg_base_url <- "https://nccn-paragon.github.io/pgn-data-vectortiles/sprite/liberty-plus/paragon/"
 
 github_token <- Sys.getenv("GITHUB_TOKEN")
 
@@ -35,17 +36,17 @@ rscript_folder <- Sys.getenv("LOCAL_RSCRIPT_PATH")
 source(file.path(rscript_folder,"utils_updated_check_protoanchors.R"))
 source(file.path(rscript_folder,"utils.R"))
 
-
+### Add more libraries ----
 library(git2r)
+# Keep connection alive when the git clone gets a little slow - otherwise some network setting might close to connection without properly terminating it
+system2("git", c("config", "--global", "http.lowSpeedLimit", "0"))
+system2("git", c("config", "--global", "http.lowSpeedTime", "999"))
 
 # EXTRACT ----
 # """""""""""""""""" ----
 
 print("extracting current website")
 
-
-# set branch (by default we push straight to master)
-target_branch <- "master" 
 
 
 ## prepare local location
@@ -70,10 +71,11 @@ cred <- cred_user_pass(
 repo <- clone(
   url = "https://github.com/NCCN-Paragon/pgn-website",
   local_path = git_folder,
-  credentials = cred,
-  branch = target_branch
+  credentials = cred
 )
 
+# get the default branch
+target_branch <- repository_head(repo)$name
 
 print("extract anchor information")
 
@@ -101,6 +103,22 @@ dbDisconnect(con_pg)
 
 con_pg <- get_con()
 subcategory <- dbGetQuery(con_pg, "select id as subcategory_id, string_id as subcategory_string_id, name->>'dut' as name_dut, name->>'fre' as name_fre, name->>'ger' as name_ger, name->>'eng' as name_eng, has_support_page from parameterization.subcategory")
+dbDisconnect(con_pg)
+
+# download icon references ----
+
+con_pg <- get_con()
+used_icon <- dbGetQuery(con_pg, paste0("SELECT 
+    s.string_id as subcategory_string_id,
+    concat('", svg_base_url, "', li.icon, '-' || a.risk_level, '.svg') as url
+FROM fdw.fdw_all_anchors a
+LEFT JOIN parameterization.legend_item li ON li.id = a.legend_item_id
+LEFT JOIN parameterization.subcategory s ON s.id = li.subcategory_id
+where a.deleted_at is NULL AND li.icon is not null
+GROUP BY s.string_id,
+	a.risk_level,
+    li.icon
+ORDER BY s.string_id"))
 dbDisconnect(con_pg)
 
 # TRANSFORM ----
@@ -172,6 +190,16 @@ anchors_dl_expanded <- anchors_dl_expanded %>%
     name_eng = gsub('"', '', name_eng)
   )
 
+# prepare icon MD code
+used_icon_agg <- used_icon %>%
+  mutate(icon_img=paste0("![icon](",url,")")) %>%
+  group_by(subcategory_string_id) %>%
+  summarize(icon_img=paste0(na.omit(unique(icon_img)), collapse = ''))
+
+# add to main dataset
+anchors_dl_expanded <- anchors_dl_expanded %>%
+  left_join(used_icon_agg, by="subcategory_string_id")
+
 # Transform to markdown ----
 
 
@@ -180,15 +208,24 @@ table_dut <- anchors_dl_expanded %>%
   reframe(
     "Naam (aantal)" = {
       name <- unique(name_dut)
+      icon_img <- na.omit(unique(icon_img))
       count <- format(as.numeric(sum(count_existing)), big.mark = ".", decimal.mark = ",", scientific = FALSE)
       has_page <- any(has_support_page, na.rm = TRUE)
       subcat_id <- unique(subcategory_string_id)
       
-      if (has_page && !is.na(subcat_id)) {
-        paste0("[**", name, "**]({{% ref \"/data/anchor-status/", subcat_id, "\" %}}) (", count, ")")
-      } else {
-        paste0("**", name, "** (", count, ")")
-      }},
+      # base text (text + link if possible)
+      base <- if (has_page && !is.na(subcat_id)) {
+          paste0("[**", name, "**]({{% ref \"/data/anchor-status/", subcat_id, "\" %}}) (", count, ")")
+        } else {
+          paste0("**", name, "** (", count, ")")
+        }
+      # append icon_img only if it exists
+      if (!is.null(icon_img) && length(icon_img) > 0 && any(nzchar(icon_img))) {
+          paste(base, icon_img)
+        } else {
+          base
+        }
+      },
     "Laatste aanpassing per bron" = paste(
       unique(paste(latest_change, source_string_id)),
       collapse = "<br>"
@@ -203,15 +240,24 @@ table_fre <- anchors_dl_expanded %>%
   reframe(
     "Nom (numéro)" = {
       name <- unique(name_fre)
+      icon_img <- na.omit(unique(icon_img))
       count <- format(as.numeric(sum(count_existing)), big.mark = ".", decimal.mark = ",", scientific = FALSE)
       has_page <- any(has_support_page, na.rm = TRUE)
       subcat_id <- unique(subcategory_string_id)
       
-      if (has_page && !is.na(subcat_id)) {
+      # base text (text + link if possible)
+      base <- if (has_page && !is.na(subcat_id)) {
         paste0("[**", name, "**]({{% ref \"/data/anchor-status/", subcat_id, "\" %}}) (", count, ")")
       } else {
         paste0("**", name, "** (", count, ")")
-      }},
+      }
+      # append icon_img only if it exists
+      if (!is.null(icon_img) && length(icon_img) > 0 && any(nzchar(icon_img))) {
+        paste(base, icon_img)
+      } else {
+        base
+      }
+    },
     "Dernière modification par source" = paste(
       unique(paste(latest_change, source_string_id)),
       
@@ -228,15 +274,24 @@ table_ger <- anchors_dl_expanded %>%
   reframe(
     "Name (Nummer)" = {
       name <- unique(name_ger)
+      icon_img <- na.omit(unique(icon_img))
       count <- format(as.numeric(sum(count_existing)), big.mark = ".", decimal.mark = ",", scientific = FALSE)
       has_page <- any(has_support_page, na.rm = TRUE)
       subcat_id <- unique(subcategory_string_id)
       
-      if (has_page && !is.na(subcat_id)) {
+      # base text (text + link if possible)
+      base <- if (has_page && !is.na(subcat_id)) {
         paste0("[**", name, "**]({{% ref \"/data/anchor-status/", subcat_id, "\" %}}) (", count, ")")
       } else {
         paste0("**", name, "** (", count, ")")
-      }},
+      }
+      # append icon_img only if it exists
+      if (!is.null(icon_img) && length(icon_img) > 0 && any(nzchar(icon_img))) {
+        paste(base, icon_img)
+      } else {
+        base
+      }
+    },
     "Letzte Änderung pro Quelle" = paste(
       unique(paste(latest_change, source_string_id)),
       collapse = "<br>"
@@ -249,15 +304,24 @@ table_eng <- anchors_dl_expanded %>%
   reframe(
     "Name (number)" = {
       name <- unique(name_eng)
+      icon_img <- na.omit(unique(icon_img))
       count <- format(as.numeric(sum(count_existing)), big.mark = ".", decimal.mark = ",", scientific = FALSE)
       has_page <- any(has_support_page, na.rm = TRUE)
       subcat_id <- unique(subcategory_string_id)
       
-      if (has_page && !is.na(subcat_id)) {
+      # base text (text + link if possible)
+      base <- if (has_page && !is.na(subcat_id)) {
         paste0("[**", name, "**]({{% ref \"/data/anchor-status/", subcat_id, "\" %}}) (", count, ")")
       } else {
         paste0("**", name, "** (", count, ")")
-      }},
+      }
+      # append icon_img only if it exists
+      if (!is.null(icon_img) && length(icon_img) > 0 && any(nzchar(icon_img))) {
+        paste(base, icon_img)
+      } else {
+        base
+      }
+    },
     "Last change per source" = paste(
       unique(paste(latest_change, source_string_id)),
       collapse = "<br>"
@@ -283,12 +347,12 @@ config(repo, user.name = "Airflow User", user.email = "paragon-data@nccn.fgov.be
 # Replace table with new content ----
 update_anchor_status_table <- function(lang, table) {
   file<-readLines(file.path(git_folder, "content", "data", "anchor-status", paste0("_index.",lang,".md")))
-  pattern <- "(?s)(?<=<!-- START-TABLE-ANCHOR-RECENCY -->).*?(?=<!-- END-TABLE-ANCHOR-RECENCY -->)"
+  pattern <- "(?s)(?<=\\[//\\]: # \\(START-TABLE-ANCHOR-RECENCY\\)).*?(?=\\[//\\]: # \\(END-TABLE-ANCHOR-RECENCY\\))"
   test <- sub(pattern, "TEST IS OK", paste(file, collapse = "\n"), perl = TRUE)
   if (nchar(test)>=sum(nchar(file))) {
-    stop(paste0("File in language ",lang," is not updated because the expected HTML comments were not found."))
+    stop(paste0("File in language ",lang," is not updated because the expected Markdown comments were not found."))
   }
-  file_updated <- sub(pattern, paste("\n",paste(table, collapse="\n"),"\n"), paste(file, collapse = "\n"), perl = TRUE)
+  file_updated <- sub(pattern, paste("\n",paste(table, collapse="\n"),"\n\n"), paste(file, collapse = "\n"), perl = TRUE)
   writeLines(file_updated, file.path(git_folder, "content", "data", "anchor-status", paste0("_index.",lang,".md")))
 }
 

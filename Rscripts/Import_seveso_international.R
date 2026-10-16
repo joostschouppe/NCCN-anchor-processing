@@ -21,6 +21,11 @@ library(tidygeocoder)
 
 #readRenviron("C:/projects/pgn-data-airflow/.Renviron")
 
+# Local files
+# if the source file is updated, set use_raw_excel to TRUE
+use_raw_excel <- FALSE
+seveso_NRW_filename <- "seveso/250616_Seveso_III_NRW_testing.xlsx"
+
 # Load external IDs
 legend_item_id <- "70088593-ec60-42c0-952d-81968e3b273f"
 data_list_id_fr<-"b3677bb3-2508-49df-ab1a-72a54590bd13"
@@ -80,6 +85,7 @@ process_fresh_data <- function(){
     
     # The Netherlands ----
     
+    
     wfs_service <- "https://service.pdok.nl/rws/faciliteiten-voor-productie-en-industrie/productie-installaties/wfs/v1_0"
     
     
@@ -137,13 +143,14 @@ process_fresh_data <- function(){
     # Combine into one sf object
     nl_raw <- do.call(rbind, all_features)
     
+
     
     # Reverse the coordinates
-    # Extract X (lon) and Y (lat) from geometries
+    # Extract X (lon, but provided where you expect lat) and Y (lat, but provided where you expect lon) from geometries
     nl_select <- nl_raw %>%
       mutate(
-        x = st_coordinates(geom)[,1],
-        y = st_coordinates(geom)[,2]
+        x = st_coordinates(geom)[,2],
+        y = st_coordinates(geom)[,1]
       )
     
     nl_select<-as.data.frame(nl_select) %>%
@@ -153,10 +160,10 @@ process_fresh_data <- function(){
       coords = c("x", "y"),
       crs = 4326
     )
-   
+    
     
     # only these appear to actually exist
-    table(nl_raw$statusXlinkHref)
+    #table(nl_raw$statusXlinkHref)
     nl_select <- nl_select %>%
       filter(statusXlinkHref == "https://inspire.ec.europa.eu/codelist/ConditionOfFacilityValue/functional")
     
@@ -173,6 +180,9 @@ process_fresh_data <- function(){
       select(original_id=gmlid) %>%
       mutate(name="Seveso installatie", data_list_id=data_list_id_nl, risk_level=3)
     
+    #remove full duplicates
+    nl_select <- dplyr::distinct(nl_select)
+    
     
     # France ----
     
@@ -184,7 +194,7 @@ process_fresh_data <- function(){
       service = "WFS",
       version = "1.1.0",  # force a WFS version
       request = "GetFeature",
-      typenames = "ms:SEVESO_GE_FXX",  # maybe remove "ms:" if still error
+      typename = "ms:SEVESO_GE_FXX",  # maybe remove "ms:" if still error
       srsName = "EPSG:4326"
     )
     
@@ -304,7 +314,7 @@ process_fresh_data <- function(){
     
     # Try reading the data
     sl_raw <- read_sf(final_url)
-    plot(sl_raw$geometry)
+    #plot(sl_raw$geometry)
     
     sl_select <- sl_raw %>%
       select(original_id=localId, name) %>%
@@ -313,41 +323,58 @@ process_fresh_data <- function(){
     
     
     # NRW ----
-    nrw_raw <- read_excel("C:/projects/pgn-data-airflow/data/seveso/250616_Seveso_III_NRW_testing.xlsx")
+    if (use_raw_excel == TRUE) {
     
-    
-    nrw_raw <- nrw_raw %>%
-      mutate(full_address = paste(Adresse, PLZ, Stadt, "Germany"))
-    
-    nrw_geocoded <- nrw_raw %>%
-      geocode(
-        address = full_address,
-        method = "osm",
-        lat = latitude, 
-        long = longitude,
-        limit = 1
+      nrw_raw <- read_excel(file.path(offline_storage,seveso_NRW_filename))
+      
+      
+      nrw_raw <- nrw_raw %>%
+        mutate(full_address = paste(Adresse, PLZ, Stadt, "Germany"))
+      
+      nrw_geocoded <- nrw_raw %>%
+        geocode(
+          address = full_address,
+          method = "osm",
+          lat = latitude, 
+          long = longitude,
+          limit = 1
+        )
+      
+      # set all column names lowercase
+      colnames(nrw_geocoded) <- tolower(colnames(nrw_geocoded))
+      
+      # remove cases we couldn't geocode
+      nrw_geocoded <- nrw_geocoded %>%
+        filter(!is.na(latitude) & !is.na(longitude))
+      
+      # make SF dataset based on lat and lon
+      nrw_geocoded <- st_as_sf(
+        nrw_geocoded,
+        coords = c("longitude", "latitude"),
+        crs = 4326
       )
-    
-    # set all column names lowercase
-    colnames(nrw_geocoded) <- tolower(colnames(nrw_geocoded))
-    
-    # remove cases we couldn't geocode
-    nrw_geocoded <- nrw_geocoded %>%
-      filter(!is.na(latitude) & !is.na(longitude))
-    
-    # make SF dataset based on lat and lon
-    nrw_geocoded <- st_as_sf(
-      nrw_geocoded,
-      coords = c("longitude", "latitude"),
-      crs = 4326
-    )
-    
-    # keep only address, name, risk_level
-    nrw_select <- nrw_geocoded %>%
-      mutate(zip=as.character(plz)) %>%
-      select(name='name des betriebsbereichs',streetname=adresse, city=stadt, zip) %>%
-      mutate(original_id=as.character(row_number()), data_list_id=data_list_id_nrw, risk_level=3)
-    
+      
+      # keep only address, name, risk_level
+      nrw_select <- nrw_geocoded %>%
+        mutate(zip=as.character(plz)) %>%
+        select(name='name des betriebsbereichs',streetname=adresse, city=stadt, zip) %>%
+        mutate(original_id=as.character(row_number()), data_list_id=data_list_id_nrw, risk_level=3)
+      
+      
+    } else if (use_raw_excel == FALSE) {
+      
+      # get the previously run data, select only the NRW data
+      con_pg <- get_con()
+      nrw_select <- dbGetQuery(con_pg, paste0("SELECT * ,ST_AsHEXEWKB(geometry) as geometry_wkt FROM raw_data.seveso_international
+                                             WHERE data_list_id='",data_list_id_nrw,"'"))
+      dbDisconnect(con_pg)
+      nrw_select<-nrw_select %>% select(-geometry, -ogc_fid)
+      nrw_select<-rename(nrw_select, geometry=geometry_wkt)
+      nrw_select$geometry <- st_as_sfc(structure(nrw_select$geometry, class = "WKB"), EWKB = TRUE)
+      nrw_select$geometry <- st_set_crs(nrw_select$geometry, 4326)
+      nrw_select <- st_as_sf(nrw_select)
+      # make sure it fits with the other datasets
+    }
     
     # merge datasets ----
     
@@ -358,9 +385,19 @@ process_fresh_data <- function(){
       sl_select,
       nrw_select
     )
+
+    seveso_all <- clean_empty_strings(seveso_all)
+    
+    seveso_dedup <- summarize_by_value(
+      df           = seveso_all,
+      group_col    = c("geometry", "data_list_id"),
+      id_col       = "original_id",
+      summary_cols = c("name", "risk_level", "streetname", "city", "zip"),
+      max_cols     = "risk_level"
+    )
     
     # Import to raw data ----
-    CreateImportTable(dataset = seveso_all, schema = "raw_data", table_name = "seveso_international")
+    CreateImportTable(dataset = seveso_dedup, schema = "raw_data", table_name = "seveso_international")
     
   } else {
     print("No fresh data downloaded because user requested to re-use existing data")
@@ -403,7 +440,7 @@ CREATE TABLE IF NOT EXISTS ingestion.seveso_international
 INSERT INTO ingestion.seveso_international
 (original_id, name, legend_item, legend_item_id, data_list_id, risk_level, properties, created_at, geometry)
 SELECT original_id, 
-jsonb_build_object('und',name) as name,
+jsonb_build_object('und', CASE WHEN name IS NULL THEN 'seveso' ELSE name END) as name,
 jsonb_build_object(
 	'dut', 'Sevesobedrijf',
 	'fre', 'entreprise Seveso',
@@ -412,9 +449,9 @@ jsonb_build_object(
 '", legend_item_id, "'::uuid AS legend_item_id,
 data_list_id::uuid,
 risk_level,
-jsonb_build_object('address', LTRIM(CONCAT(streetname, ', ' || zip, ' ' || city),', ')) as properties,
+jsonb_strip_nulls(jsonb_build_object('address', NULLIF(LTRIM(CONCAT(streetname, ', ' || zip, ' ' || city),', '),''))) as properties,
 CURRENT_DATE as created_at,
-geometry
+ST_ReducePrecision(geometry, 1e-8)
 FROM raw_data.seveso_international;"),
 "ALTER TABLE ingestion.seveso_international OWNER to pgn_group_data_team_w;",
 "GRANT ALL ON TABLE ingestion.seveso_international TO pgn_group_data_team_w;",
@@ -430,9 +467,8 @@ create_ingestion_table <- function() {execute_sql_commands(ingestion_table_sql, 
 
 
 run_smart_update = function() {
-  smart_update_process("seveso_international", 100, 150, 100, format(Sys.Date(), "%Y-%m-%d"), allow_update_even_if_checks_fail=overrule_checks, dry_run=do_dry_run,reuse_ingestion_data=reuse_ingestion_data)
+  smart_update_process("seveso_international", 500, 750, 500, format(Sys.Date(), "%Y-%m-%d"), allow_update_even_if_checks_fail=overrule_checks, dry_run=do_dry_run,reuse_ingestion_data=reuse_ingestion_data)
 }
-
 
 
 

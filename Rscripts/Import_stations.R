@@ -79,7 +79,10 @@ process_fresh_data <- function(){
 ### OSM DOWNLOAD PARAMETERS ----
 
 # Define the list of features
-features_list <- list("railway" = "station", "railway"="halt")
+features_list <- list(or_group(
+  tag_filter("railway", "station"),
+  tag_filter("railway", "halt")
+))
 
 # Define extra tags to use as columns for properties
 extra_columns <- c("network:wikidata", "train", "station", "subway", 
@@ -91,13 +94,19 @@ datatypes <- c("points", "mpolygon")
 
 ### Actual OSM download & transformation ----
 osm_all <- run_process(
-  download_osm_process(features_list, datatypes, extra_columns, postgres=TRUE),
-  paste0("OSM download & processing for ", paste(paste(names(features_list), unlist(features_list), sep = "="), collapse = ", "), collapse = ", ")
+  download_osm_process(features_list, datatypes, extra_columns),
+  paste0("OSM download & processing for ", describe_features_list(features_list))
 )
+
+### Deduplicate railway stations ----
+result <- osmspatial_deduplication(osm_all, c("network_wikidata", "train",
+     "station", "subway", "ref_stib_mivb", "network", "railway_ref", "uic_ref", "highspeed", "ref", "railway_ref_db", "usage"))
+join_filtered <- result$data
+#osm_diagnostic <- result$diagnostic
 
 
 # Upload to raw data ----
-CreateImportTable(dataset = osm_all, schema = "raw_data", table_name = "osm_stations") 
+CreateImportTable(dataset = join_filtered, schema = "raw_data", table_name = "osm_stations") 
 
   } else {
     print("No fresh data downloaded because user requested to re-use existing data")
@@ -165,9 +174,7 @@ CREATE TABLE IF NOT EXISTS ingestion.stations
             as legend_item_id,
             CASE WHEN short_name IS NULL AND official_name IS NULL AND alt_name IS NULL AND old_name IS NULL THEN NULL 
 	ELSE CONCAT_WS('; ',short_name, official_name, alt_name, old_name) END AS other_names,
-CASE WHEN addr_street IS NULL THEN NULL 
-	ELSE LTRIM(CONCAT(addr_street, ' ' || CASE WHEN nohousenumber='yes' THEN 'w/n' ELSE addr_housenumber END, ', ' || CONCAT((addr_postcode || ' '), addr_city))) END
-	AS address,
+address,
 CASE WHEN contact_email IS NULL AND email IS NULL THEN NULL
 	ELSE CONCAT_WS('; ',contact_email, email) END AS local_email,
 operator_email,
@@ -213,7 +220,7 @@ JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
 'ref', ref,
 'railway_ref_db', railway_ref_db
 )),
-geometry,
+ST_ReducePrecision(geometry, 1e-8),
 CURRENT_DATE as created_at
 FROM cleaned;"),
 "ALTER TABLE ingestion.stations OWNER to pgn_group_data_team_w;",

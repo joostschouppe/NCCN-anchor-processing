@@ -93,18 +93,18 @@ datatypes_dam <- c("lines", "mpolygon")
 ### Actual OSM download & transformation ----
 
 osm_lock <- run_process(
-  download_osm_process(features_lock, datatypes_lock, extra_columns, postgres=TRUE),
-  paste0("OSM download & processing for ", paste(paste(names(features_lock), unlist(features_lock), sep = "="), collapse = ", "), collapse = ", ")
+  download_osm_process(features_lock, datatypes_lock, extra_columns),
+  paste0("OSM download & processing for ", describe_features_list(features_lock))
 )
 
 osm_boatlift <- run_process(
-  download_osm_process(features_boatlift, datatypes_boatlift, extra_columns, postgres=TRUE),
-  paste0("OSM download & processing for ", paste(paste(names(features_boatlift), unlist(features_boatlift), sep = "="), collapse = ", "), collapse = ", ")
+  download_osm_process(features_boatlift, datatypes_boatlift, extra_columns),
+  paste0("OSM download & processing for ", describe_features_list(features_boatlift))
 )
 
 osm_dam <- run_process(
-  download_osm_process(features_dam, datatypes_dam, extra_columns, postgres=TRUE),
-  paste0("OSM download & processing for ", paste(paste(names(features_dam), unlist(features_dam), sep = "="), collapse = ", "), collapse = ", ")
+  download_osm_process(features_dam, datatypes_dam, extra_columns),
+  paste0("OSM download & processing for ", describe_features_list(features_dam))
 )
 
 
@@ -137,9 +137,7 @@ osm_dam <- osm_dam %>%
     )
   )
 
-
-
-
+# we don't run a duplicate check because there are none to speak of
 
 # merge points and polygons
 osm_all <- bind_rows(osm_lock, osm_boatlift, osm_dam)
@@ -196,10 +194,10 @@ cleaned as (SELECT
 legend_item AS legend_item_orig,
 CASE WHEN legend_item = 'lock' THEN
     	jsonb_strip_nulls(jsonb_build_object(
-			'und', CASE WHEN lock_name IS NULL THEN 'lock' ELSE lock_name END, --we dont use name because thats the name of the river not the lock
-    		'fre', CONCAT_WS(lock_name_fr,' (' || lock_ref || ')'),
-    		'ger', CONCAT_WS(lock_name_de::text,' (' || lock_ref || ')'),
-    		'dut', CONCAT_WS(lock_name_nl,' (' || lock_ref || ')')))
+			'und', CASE WHEN lock_name IS NULL THEN 'lock' ELSE CONCAT(lock_name,' (' || lock_ref || ')') END, --we dont use name because thats the name of the river not the lock
+    		'fre', CASE WHEN lock_name_fr IS NULL THEN NULL ELSE CONCAT(lock_name_fr,' (' || lock_ref || ')') END,
+    		'ger', CASE WHEN lock_name_de IS NULL THEN NULL ELSE CONCAT(lock_name_de::text,' (' || lock_ref || ')') END,
+    		'dut', CASE WHEN lock_name_nl IS NULL THEN NULL ELSE CONCAT(lock_name_nl,' (' || lock_ref || ')') END))
 	WHEN legend_item = 'dam' THEN
     	jsonb_strip_nulls(jsonb_build_object('und', CASE WHEN name IS NULL THEN 'dam' ELSE name END,
     	'fre', name_fr,
@@ -258,7 +256,7 @@ legend_item_id,
 '",data_list_id,"'::uuid as data_list_id,
 CASE WHEN legend_item_orig = 'lock' THEN
 JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
-	'CEMT', cemt,
+	'cemt', cemt,
 	'lock_height', lock_height, 
 	'lock_length', length, 
 	'lock_maxdraft', maxdraught,
@@ -286,7 +284,7 @@ JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
 	'operator_type',operator_type,
 	'image', image))
 END as properties,
-geometry,
+ST_ReducePrecision(geometry, 1e-8) as geometry,
 CURRENT_DATE as created_at
 FROM cleaned;"),
 "ALTER TABLE IF EXISTS ingestion.locks_dams OWNER to pgn_group_data_team_w;",
@@ -304,7 +302,7 @@ create_ingestion_table <- function() {execute_sql_commands(ingestion_table_sql, 
 # """"""""""""""""""""----
 
 # set to TRUE if you want to update the transformation table even if the checks fail. 
-update_even_if_checks_fail<-overrule_checks
+#overrule_checks<-TRUE
 
 
 run_smart_update = function() {

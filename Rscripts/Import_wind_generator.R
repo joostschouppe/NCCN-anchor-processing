@@ -91,25 +91,40 @@ process_fresh_data <- function(){
     ### Actual OSM download & transformation ----
     
     osm_all <- run_process(
-    download_osm_process(features_list, datatypes, extra_columns, postgres=TRUE),
-    paste0("OSM download & processing for ", paste(paste(names(features_list), unlist(features_list), sep = "="), collapse = ", "), collapse = ", ")
+    download_osm_process(features_list, datatypes, extra_columns),
+    paste0("OSM download & processing for ", describe_features_list(features_list))
   )
     
     
     # remove if power=* is missing (this is usually because that tag has been used to archive the object with a lifecycle tag) or generator:output:electricity=small_installation
     osm_all <- osm_all %>%
-      filter(!is.na(power)) %>%
+      filter(power=='generator') %>%
       filter(!(generator_output_electricity=='small_installation') | is.na(generator_output_electricity))
     
     # if generator_output_electricity contains kW or kw, create new numeric column output_kw
     osm_all <- osm_all %>%
       mutate(output_kw = ifelse(grepl("kW", generator_output_electricity, ignore.case = TRUE),
                                 as.numeric(gsub(" kW", "", generator_output_electricity, fixed = TRUE)),NA))
-    
-    # keep if output_kw>300 or output_kw is NA and make available outside the function
-    ## reasoning: we throw out 'small installations' and things with a very small production. We don't expect things written in MW to have a value of 0.3 MW or less. We also expect a lot of missing data, and assume it's a large installation when there is no data
+    # standardize output format
     osm_all <- osm_all %>%
-        filter(is.na(output_kw) | output_kw>300)
+      mutate(generator_output_electricity_mw = case_when(
+        grepl("kw", generator_output_electricity, ignore.case = TRUE) ~ as.numeric(sub(" ?KW.*", "", generator_output_electricity,ignore.case = TRUE))/1000,
+        grepl("mw", generator_output_electricity, ignore.case = TRUE) ~ as.numeric(sub(" ?MW.*", "", generator_output_electricity,ignore.case = TRUE)),
+        TRUE ~ NA))
+    
+    # keep if output_kw>300 or output_kw is NA
+    ## reasoning: we throw out 'small installations' and things with a very small production. We also expect a lot of missing data, and assume it's a large installation when there is no data
+    osm_all <- osm_all %>%
+      filter(is.na(generator_output_electricity_mw) | generator_output_electricity_mw>0.3)
+    
+    # detect objects on top of other objects in the dataset
+    result <- osmspatial_deduplication(osm_all, c("generator_output_electricity_mw", "generator_type", "manufacturer_ref", "generator_model", "manufacturer_type", "model",
+                                                   "manufacturer", "manufacturer_url", "rotor_diameter", "diameter", "est_height_hub", "hub_height", "height_hub", "height", "offshore"))
+	osm_all <- result$data
+	#osm_diagnostic <- result$diagnostic
+	
+	# standardize the usual OSM columns
+    osm_all <- build_osm_derived_columns(osm_all)
 
     CreateImportTable(dataset = osm_all, schema = "raw_data", table_name = "osm_wind_generators") 
     
@@ -171,17 +186,15 @@ jsonb_build_object(
     	'ger', 'Windkraftanlage',
     	'dut', 'windturbine',
     	'eng', 'wind turbine') as legend_item,
-NULLIF(CONCAT_WS('; ',name, short_name, official_name, alt_name, old_name), '') AS names,
-CASE WHEN addr_street IS NULL THEN NULL 
-	ELSE LTRIM(CONCAT(addr_street, ' ' || CASE WHEN nohousenumber='yes' THEN 'w/n' ELSE addr_housenumber END, ', ' || CONCAT((addr_postcode || ' '), addr_city))) END
-	AS address,
-NULLIF(CONCAT_WS('; ',contact_email, email), '') AS local_email,
+other_names,
+address,
+local_email,
 operator_email,
-NULLIF(CONCAT_WS('; ',contact_mobile, mobile, contact_phone, phone, phone_2),'') AS local_phone,
-NULLIF(CONCAT_WS('; ',website, contact_website),'') AS local_website,
+local_phone,
+local_website,
 operator_website,
 operator_wikidata, operator, operator_type, image, 
-generator_output_electricity as generator_output, 
+generator_output_electricity_mw || ' MW' as generator_output, 
 CASE WHEN generator_type = 'horizontal_axis' THEN 'vertical rotor'
 	 WHEN generator_type = 'vertical_axis' THEN 'horizontal rotor'
 	 ELSE NULL END as rotor_orientation,
@@ -192,7 +205,7 @@ NULLIF(CASE WHEN est_height_hub IS NOT NULL THEN CONCAT(est_height_hub,' (estima
 	ELSE TRIM(TRAILING 'mM ' FROM CONCAT_WS(',',hub_height,hub_height,height_hub)) END, '')
 	as hub_height,
 height as total_height,
-CASE WHEN offshore='yes' THEN 'yes' ELSE NULL END AS offshore,ref as reference,
+CASE WHEN offshore='yes' THEN 'yes' ELSE NULL END AS offshore,ref,
 geometry
 FROM raw_data.osm_wind_generators)
 
@@ -215,8 +228,8 @@ JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
 	'hub_height', hub_height,
 	'total_height', total_height,
 	'offshore', offshore,
-	'reference', reference,
-	'names', names,
+	'ref', ref,
+	'other_names', other_names,
 	'local_email',local_email,
 	'local_phone',local_phone,
 	'local_website',local_website,
@@ -226,7 +239,7 @@ JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
 	'operator',operator,
 	'operator_type',operator_type,
 	'image', image)) as properties,
-geometry,
+ST_ReducePrecision(geometry, 1e-8) as geometry,
 CURRENT_DATE as created_at
 FROM cleaned;"),
 "ALTER TABLE IF EXISTS ingestion.wind_generators OWNER to pgn_group_data_team_w;",
@@ -239,7 +252,7 @@ FROM cleaned;"),
 create_ingestion_table <- function() {execute_sql_commands(ingestion_table_sql, "Ingestion table")}
 
 # set to TRUE if you want to update the transformation table even if the checks fail. 
-update_even_if_checks_fail<-overrule_checks
+#overrule_checks<-TRUE
 
 
 

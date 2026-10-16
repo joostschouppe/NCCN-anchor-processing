@@ -178,10 +178,11 @@ WHEN languagestatute=8 THEN 'ger'
 WHEN languagestatute=7 THEN 'fre'		
 WHEN languagestatute=6 THEN 'fre'
 WHEN languagestatute=2 THEN 'fre'
-ELSE 'und' END as language, nameger, namefre, namedut, ST_AsText(shape) as geometry FROM raw_data.ngi_ign_municipality")
+ELSE 'und' END as language, nameger, namefre, namedut, ST_AsHEXEWKB(shape) as geometry FROM raw_data.ngi_ign_municipality")
 dbDisconnect(con_pg)
-ngi_muni<-st_as_sf(ngi_muni, wkt="geometry")
+ngi_muni$geometry <- st_as_sfc(structure(ngi_muni$geometry, class = "WKB"), EWKB = TRUE)
 ngi_muni$geometry <- st_set_crs(ngi_muni$geometry, 4326)
+ngi_muni <- st_as_sf(ngi_muni)
 
 
 # spatial join to main data
@@ -275,7 +276,7 @@ legend_item,
 legend_item_id,
 '",data_list_id,"'::uuid as data_list_id,
 1 as risk_level,
-geometry,
+ST_ReducePrecision(geometry, 1e-8) as geometry,
 CURRENT_DATE as created_at
 FROM cleaned;"),
 "ALTER TABLE IF EXISTS ingestion.town_halls OWNER to pgn_group_data_team_w;",

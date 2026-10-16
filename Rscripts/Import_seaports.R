@@ -246,7 +246,7 @@ legend_item,
 '",legend_item_id,"'::uuid as legend_item_id,
 '",data_list_id,"'::uuid as data_list_id,
 2 as risk_level,
-geometry,
+ST_ReducePrecision(geometry, 1e-8) as geometry,
 CURRENT_DATE as created_at
 FROM cleaned;"),
 "ALTER TABLE IF EXISTS ingestion.seaports OWNER to pgn_group_data_team_w;",
@@ -298,7 +298,7 @@ create_transformation_table <- function() {execute_sql_commands(transformation_t
 # """"""""""""""""""""----
 
 # set to TRUE if you want to update the transformation table even if the checks fail. 
-update_even_if_checks_fail<-FALSE
+#overrule_checks<-TRUE
 # Don't forget to also set checks_failed<-0 if there were already some issues in the base data
 
 run_smart_update = function() {

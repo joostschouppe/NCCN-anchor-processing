@@ -1,0 +1,2777 @@
+## ---------------------------
+##
+## Script name: ETL flow for schools
+##
+## Purpose of script: Merge data about schools from several sources and transform into proto-anchors for Paragon
+##
+## Author: Joost Schouppe
+##
+## Date Created: 2023-10-19
+##
+##
+## ---------------------------
+
+
+# Load variables -----------------------------------------------------------
+#  """""""""""""""""" ----------------------
+
+
+#readRenviron("C:/projects/pgn-data-airflow/.Renviron")
+
+db_host_name <- Sys.getenv("POSTGRES_HOST_NAME")
+postgres_user <- Sys.getenv("POSTGRES_USER")
+postgres_password <- Sys.getenv("POSTGRES_PASSWORD")
+db_name<- Sys.getenv("POSTGRES_DB_NAME_CURATED")
+
+
+# run status
+run_status<-Sys.getenv("RUN_STATUS")
+## this is set to false and prevents any accidental changes to the database by switching off the main_function(). On Airflow, this is set to true.
+run_status<-ifelse(tolower(run_status) == "true", TRUE, FALSE)
+
+# overrule the checks
+overrule_checks<-Sys.getenv("OVERRULE_CHECKS")
+## Set to FALSE by default. That means we do not update the anchors if some tests fail. Those tests include "the data has grown or shrunk by a lot of objects". If, after review of the log, you decide that nothing is wrong, set this manually to TRUE.
+# If the input is not correctly understood as boolean, this will force it to it.
+overrule_checks<-ifelse(tolower(overrule_checks) == "true", TRUE, FALSE)
+
+# Do not run the main part of the processing, but just do an update based on the ingestion table already in the dbase
+reuse_ingestion_data<-Sys.getenv("REUSE_INGESTION_DATA")
+reuse_ingestion_data<-ifelse(tolower(reuse_ingestion_data) == "true", TRUE, FALSE)
+
+# Only run the comparison script & update the ingestion table, but do not attempt to update the transformation table
+do_dry_run<-Sys.getenv("DO_DRY_RUN")
+do_dry_run<-ifelse(tolower(do_dry_run) == "true", TRUE, FALSE)
+
+# Set location for files received by email
+offline_storage <-Sys.getenv("OFFLINE_STORAGE")
+ostbelgien_data <- paste0(offline_storage,"/school/schuladressen.csv")
+
+# Set log folder
+log_folder <- Sys.getenv("RSCRIPT_LOG_FOLDER")
+
+# Set conditions -----------------------------------------------------------
+distance_matched_threshold <- 50
+distance_raw_threshold <- 250
+
+
+#datalist ids
+dl_fwb <- "540c2fc1-9fe8-48eb-81eb-ce073b3de521"
+dl_dov <- "187cde3b-8036-40e5-a4cb-9e1354a5251b"
+dl_ob <- "678821e4-1f4f-46ef-8d8f-caca8afabec8"
+dl_osm <- "2f8f3d0b-1137-44e6-a5cb-4dcf25ef1330"
+
+
+# legend item
+legend_item_id <- '6fda22de-818d-4f55-9093-a7aa560eb441'
+
+### Load external functions ------
+
+rscript_folder <- Sys.getenv("LOCAL_RSCRIPT_PATH")
+source(paste0(rscript_folder,"/utils_updated_check_protoanchors.R"))
+source(paste0(rscript_folder,"/utils.R"))
+
+
+# Libraries -------------------------------
+# """""""""""""""""" ----------------------
+
+
+# to remove the é etc special characters
+library(stringi)
+
+# to find the longest common string
+library(PTXQC)
+
+
+
+# Download data -----------------------------------------------------------
+# """"""""""""""""""----------------------
+### Vlaanderen ----
+
+#split up to get over the default limit of 10000 objects
+# extract and format the features
+
+DownloadFlanders <- function(){
+  tryCatch({
+  print("Start download Flanders")
+    
+    
+    # Define the base WFS URL
+    wfs_url <- "https://geo.api.vlaanderen.be/POI/wfs"
+    
+    # Build the request URL
+    build_request_url <- function(start_index) {
+      url <- parse_url(wfs_url)
+      url$query <- list(
+        service = "wfs",
+        request = "GetFeature",
+        typename = "POI",
+        srsName = "EPSG:31370",
+        startIndex = start_index,
+        maxFeatures = 10000,
+        outputFormat = "application/json",
+        CQL_FILTER = "CATEGORIE IN ('Basisonderwijs','Hoger onderwijs','Secundair onderwijs','Deeltijds kunstonderwijs')"
+      )
+      return(build_url(url))
+    }
+    
+    # Initialize variables
+    all_features <- list()
+    start_index <- 0
+    batch_size <- 10000
+    has_more_features <- TRUE
+    
+    # Loop to fetch data in batches
+    while (has_more_features) {
+      # Build the request URL for the current batch
+      request_url <- build_request_url(start_index)
+      
+      # Fetch the data
+      batch <- read_sf(request_url)
+      
+      # Check if there are no more features to fetch
+      if (nrow(batch) == 0) {
+        has_more_features <- FALSE
+      } else {
+        # Append the fetched features to the list
+        all_features <- append(all_features, list(batch))
+        # Increment the start index for the next batch
+        start_index <- start_index + batch_size
+      }
+    }
+    
+    # Combine all fetched features into a single data frame
+    geojson_vl <- do.call(rbind, all_features) 
+
+    ## we like our variable names in lowercase
+    names(geojson_vl) <- tolower(names(geojson_vl))
+
+}, error = function(e) {
+    stop(paste("Error downloading VL:", e))
+  })
+
+print("Download Flanders is done")
+return(geojson_vl)
+
+}
+
+### French community ----
+
+DownloadBRWA <- function(){ 
+  tryCatch({
+geojson_brwa <- st_read(httr::GET("https://www.odwb.be/api/explore/v2.1/catalog/datasets/fwb-age-fichier-signaletique-des-etablissements-d-enseignement-de-la-federation-/exports/geojson?lang=nl&timezone=Europe%2FBrussels"), quiet=TRUE)
+# if column nom_de_etablissement exists, rename to nom_de_l_etablissement
+if("nom_d_etablissement" %in% colnames(geojson_brwa)){
+  geojson_brwa <- geojson_brwa %>% rename(nom_de_l_etablissement = nom_d_etablissement)
+}
+if("ndeg_fase_de_l_etablissement" %in% colnames(geojson_brwa)){
+  geojson_brwa <- geojson_brwa %>% rename(ndegfase_de_l_etablissement = ndeg_fase_de_l_etablissement)
+}
+if("ndeg_fase_de_l_implantation" %in% colnames(geojson_brwa)){
+  geojson_brwa <- geojson_brwa %>% rename(ndegfase_de_l_implantation = ndeg_fase_de_l_implantation)
+}
+
+
+geojson_brwa <- geojson_brwa %>% filter(!is.na(nom_de_l_etablissement))
+  }, 
+  error = function(e) {
+    stop(paste("Error downloading BRWA:", e))
+  })
+  print("Download BRWA is done")
+  return(geojson_brwa)
+}
+
+
+
+
+### German community  ----
+
+DownloadGER <- function(){  
+  tryCatch({
+ger <- read.csv(ostbelgien_data, sep=";")
+#lower case names
+names(ger) <- tolower(names(ger))
+  }, 
+  error = function(e) {
+  stop(paste("Error downloading GER:", e))
+  })
+print("Download GER is done")
+return(ger)
+}
+
+
+### OSM data  ----
+
+
+#### Download OSM data ----
+
+osm_points <- data.frame() 
+osm_mpoly <- data.frame() 
+
+DownloadOSM <- function(){
+  tryCatch({
+    start_time <- Sys.time()
+### OSM DOWNLOAD PARAMETERS ----
+
+# Define the list of features
+features_list <- list(or_group(
+  tag_filter("amenity", "university"),
+  tag_filter("amenity", "school"),
+  tag_filter("amenity", "kindergarten"),
+  tag_filter("amenity", "college"),
+  tag_filter("landuse", "education")
+))
+
+# Define extra tags to use as columns for properties
+extra_columns <- c("amenity","landuse","faculty","grades","isced:level","max_age","min_age","operator:type","pedagogy","religion","school:language","language:nl","language:de","language:fr","school", "school:special_needs",
+"special_needs:intellectual_disability",
+"special_needs:emotional_behavioural_disorder",
+"special_needs:physical_disability",
+"special_needs:blind",
+"special_needs:deaf",
+"special_needs:language_disorder",
+"special_needs:autism",
+"special_needs:learning_disabilities",
+"special_needs:intellectually_gifted")
+
+# Choose which datatypes are needed, as a list of datatypes, using any of "points", "lines", "mpolygons" (this is polygons+multipolygons together)
+datatypes <- c("points", "mpolygon")
+
+
+### Actual OSM download & transformation ----
+osm_all <- run_process(
+  download_osm_process(features_list, datatypes, extra_columns, keep_region = TRUE),
+  paste0("OSM download & processing for ", describe_features_list(features_list))
+)
+
+
+osm_all <- osm_all %>% filter(amenity %in% c('university','kindergarten','school','college') | landuse=='education')
+
+osm_all <- osm_all %>%
+  mutate(isced_level = ifelse((grades=='1-4' | grades=='1-6' | grades=='1-5') & is.na(isced_level), '1', isced_level)) %>%
+  mutate(isced_level = ifelse((grades=='7-12' & is.na(isced_level)), '2', isced_level)) %>%
+  mutate(isced_level = ifelse((grades=='0-6' & is.na(isced_level)), '0;1', isced_level)) %>%
+  mutate(isced_level = ifelse(((grades=='5-13' | grades=='0-12' | grades=='1-8') & is.na(isced_level)), '1;2', isced_level))
+
+
+osm_all <- osm_all %>% 
+  mutate(type_kindergarten = ifelse((grepl("kindergarten", osm_all$school, ignore.case = TRUE) | amenity=='kindergarten' | grepl("0", osm_all$isced_level, ignore.case = TRUE)), 1, NA),
+         type_primary = ifelse((grepl("primary", osm_all$school, ignore.case = TRUE) | grepl("1", osm_all$isced_level, ignore.case = TRUE)), 1, NA),
+         type_secondary = ifelse((grepl("secondary", osm_all$school, ignore.case = TRUE)| grepl("2", osm_all$isced_level, ignore.case = TRUE) | grepl("3", osm_all$isced_level, ignore.case = TRUE)), 1, NA),
+         type_tertiary = ifelse((amenity=='university' | amenity=='college'), 1, NA),
+         type_special_needs = ifelse(
+           grepl("special_education_needs", osm_all$school, ignore.case = TRUE) |
+             school_special_needs %in% c('yes', 'only', 'mixed', 'separated'),
+           1, NA))
+
+
+# filter points with a name
+osm_points <- osm_all %>% filter(st_geometry_type(.) %in% c("POINT"))
+osm_points <- osm_points %>% filter(!(is.na(name)))
+# remove points without one of the expected amenity types (artefact of site relations)
+osm_points <- osm_points %>% filter(amenity=='university' | amenity=='college' | amenity=='school' | amenity=='kindergarten')
+
+# keep only one case if osm_id has duplicates (unclear how exactly duplicates arise here)
+osm_points <- osm_points %>% distinct(osm_id, .keep_all = TRUE)
+
+# make available outside the function
+osm_points <<- osm_points
+
+# filter polygons from the relevant types
+osm_mpoly <- osm_all %>% filter(st_geometry_type(.) %in% c("POLYGON", "MULTIPOLYGON"))
+# set all geometries as multipolygons
+osm_mpoly$geometry <- st_cast(osm_mpoly$geometry, "MULTIPOLYGON")
+
+# remove that one part of ugent that is in Korea if it is included
+osm_mpoly <- osm_mpoly %>% filter(osm_id!='way/384532065')
+
+# make available outside the function
+osm_mpoly <<- osm_mpoly
+
+
+# paste the list of columns in osm_points (for visual checking)
+#osm_points_cols <- paste0(colnames(osm_points), collapse = ",")
+#osm_mpoly_cols <- paste0(colnames(osm_mpoly), collapse = ",")
+#print(osm_points_cols)
+#print(osm_mpoly_cols)
+
+  }, 
+error = function(e) {
+  stop(paste("Error downloading OSM:", e))
+})
+  # status message
+  finish<-Sys.time()
+  total_time <- round(as.numeric(difftime(finish, start_time, units = "secs")), 2)
+  print(paste0("Download of OSM data took ",total_time," seconds"))
+}
+
+
+
+# Upload to Postgresql ------------------------------
+# """""""""""""""""" ----------------------
+
+# this happens at runtime
+
+# Geocoding ----
+
+geocoder <- function(){
+  # geocoding library
+  library(phacochr)
+  phaco_setup_data()
+  phacochr::phaco_best_data_update()
+
+
+### BRWA subfunction ----
+
+GeocodeAndUploadBRWA <-function(){
+
+  brwa_cfwb_odata_schools   <- phaco_geocode(data_to_geocode=t_adresse <- dbGetQuery (con_pg<-get_con(),"SELECT ogc_fid, adresse_de_l_implantation, code_postal_de_l_implantation FROM raw_data.brwa_cfwb_odata_schools") ,colonne_num_rue = "adresse_de_l_implantation",  colonne_code_postal = "code_postal_de_l_implantation")
+  brwa_cfwb_odata_schools <- brwa_cfwb_odata_schools[["data_geocoded_sf"]]
+  return(brwa_cfwb_odata_schools)
+}
+
+### German speaking area ----
+
+GeocodeAndUploadGer <-function(){
+  ger_dgov_email_schools  <- phaco_geocode(data_to_geocode=t_adresse <- dbGetQuery (con_pg<-get_con(),"SELECT * FROM raw_data.ger_dgov_email_schools ") ,colonne_num_rue = "straße",  colonne_code_postal = "plz.und.ort")
+  ger_dgov_email_schools <- ger_dgov_email_schools[["data_geocoded_sf"]]
+  return(ger_dgov_email_schools)
+}
+
+  # Return the list of functions
+  list(GeocodeAndUploadBRWA = GeocodeAndUploadBRWA, GeocodeAndUploadGer = GeocodeAndUploadGer)
+}  # end of geocoder function 
+  
+# Data transformations ----
+
+### OSM points SQL----
+
+
+
+# Define and execute each SQL command separately
+sql_commands_osm_points <- c(
+  "DROP TABLE IF EXISTS ingestion.osm_school_point CASCADE;",
+  "CREATE TABLE IF NOT EXISTS ingestion.osm_school_point (local_id uuid NOT NULL DEFAULT gen_random_uuid(), original_id text, name jsonb, legend_item jsonb, name_source text, categorie_name text, properties jsonb, properties_secondary jsonb, geometry geometry(point, 4326), created_at date, CONSTRAINT osm_school_point_pkey PRIMARY KEY (local_id));",
+  "-- prepare the data for OSM school points outside of Belgium
+-- spatial join of the region
+WITH
+join_region AS (
+SELECT 
+r.niscode as niscode,
+osm.osm_id as id,
+osm.geometry as osm_geometry
+FROM raw_data.ngi_ign_region r, raw_data.osm_school_point osm
+WHERE ST_Intersects(r.shape,osm.geometry) AND (osm.amenity='kindergarten' OR osm.amenity='school' OR osm.amenity='university' OR osm.amenity='college')
+),
+
+
+-- prepare data and filter just the data outside of Belgium
+final_table AS (
+  SELECT
+	b.osm_id as id,
+	b.name, b.name_nl, b.name_fr, b.name_de,
+	NULLIF(CONCAT_WS('; ',b.short_name, b.official_name, b.alt_name, b.old_name),'') AS other_names,
+CASE WHEN addr_street IS NULL THEN NULL 
+	ELSE LTRIM(CONCAT(b.addr_street, ' ' || CASE WHEN b.nohousenumber='yes' THEN 'w/n' ELSE b.addr_housenumber END, ', ' || CONCAT((b.addr_postcode || ' '), b.addr_city))) END
+	AS address,
+ NULLIF(CONCAT_WS('; ',b.contact_email, b.email),'') AS local_email,
+operator_email,
+ NULLIF(CONCAT_WS('; ',b.contact_mobile, b.mobile, b.contact_phone, b.phone, b.phone_2),'') AS local_phone,
+ NULLIF(CONCAT_WS('; ',b.website, b.contact_website),'') AS local_website,
+	b.operator_website,
+	j.niscode as region,
+	b.type_kindergarten, b.type_primary, b.type_secondary, b.type_tertiary, b.type_special_needs,
+	b.special_needs_intellectual_disability,
+b.special_needs_emotional_behavioural_disorder,
+b.special_needs_physical_disability,
+b.special_needs_blind,
+b.special_needs_deaf,
+b.special_needs_language_disorder,
+b.special_needs_autism,
+b.special_needs_learning_disabilities,
+b.special_needs_intellectually_gifted,
+	b.geometry as geometry
+FROM raw_data.osm_school_point b 
+LEFT JOIN join_region j ON b.osm_id=j.id
+WHERE j.niscode IS null AND (b.amenity='kindergarten' OR b.amenity='school' OR b.amenity='university' OR b.amenity='college')
+)
+
+
+-- load the data
+INSERT INTO ingestion.osm_school_point (original_id, name, legend_item, name_source, properties, geometry, created_at)
+SELECT
+		CONCAT('https://osm.org/',id) AS original_id,
+jsonb_strip_nulls(jsonb_build_object(
+              'und', CASE WHEN name IS NULL OR name='' THEN 'school' ELSE name END,
+              'fre', name_fr,
+              'ger', name_de::text,
+              'dut', name_nl)) as name,
+	jsonb_build_object('und', 'school') AS legend_item,
+	'OpenStreetMap (point data)' AS name_source,
+    	jsonb_strip_nulls(jsonb_build_object(
+        	'other_names', other_names,
+			'local_email', local_email,
+			'operator_email',operator_email,
+			'local_phone',local_phone,
+			'local_website', local_website,
+			'operator_website', operator_website,
+			'type_kindergarten',type_kindergarten,
+			'type_primary',type_primary,
+			'type_secondary',type_secondary,
+			'type_tertiary',type_tertiary,
+			'type_special_needs',type_special_needs,
+			'special_needs_intellectual_disability',special_needs_intellectual_disability,
+			'special_needs_emotional_behavioural_disorder',special_needs_emotional_behavioural_disorder,
+			'special_needs_physical_disability',special_needs_physical_disability,
+			'special_needs_blind',special_needs_blind,
+			'special_needs_deaf',special_needs_deaf,
+			'special_needs_language_disorder',special_needs_language_disorder,
+			'special_needs_autism',special_needs_autism,
+			'special_needs_learning_disabilities',special_needs_learning_disabilities,
+			'special_needs_intellectually_gifted',special_needs_intellectually_gifted)	
+    	) AS properties,
+    geometry,
+	CURRENT_DATE as created_at
+FROM final_table;",
+"ALTER TABLE IF EXISTS ingestion.osm_school_point OWNER to pgn_group_data_team_w;",
+"GRANT ALL ON TABLE ingestion.osm_school_point TO pgn_group_data_team_w;",
+"GRANT ALL ON TABLE ingestion.osm_school_point TO pgn_user_airflow;"
+)
+
+
+
+### OSM polygons SQL----
+
+sql_commands_osm_polygons <- c(
+  "-- we make a temporary table with fixed and indexed geometries
+  DROP TABLE IF EXISTS tst.osm_school_polygon CASCADE;",
+  "CREATE TABLE IF NOT EXISTS tst.osm_school_polygon
+  AS SELECT * FROM raw_data.osm_school_polygon;",
+  "
+  ALTER TABLE tst.osm_school_polygon
+  RENAME COLUMN geometry to original_geometry;",
+  "ALTER TABLE tst.osm_school_polygon
+  ADD wkb_geometry geometry(multipolygon, 4326);",
+  "UPDATE tst.osm_school_polygon
+  SET wkb_geometry=ST_CollectionExtract(ST_MakeValid(original_geometry),3);",
+  "ALTER TABLE tst.osm_school_polygon
+  DROP COLUMN original_geometry;",
+  "DROP INDEX IF EXISTS tst.osm_idx_fixed_geom CASCADE;",
+  "CREATE INDEX IF NOT EXISTS osm_idx_fixed_geom ON tst.osm_school_polygon USING GIST(wkb_geometry);",
+  "  
+  DROP TABLE IF EXISTS ingestion.osm_school_polygon CASCADE;",
+  " CREATE TABLE IF NOT EXISTS ingestion.osm_school_polygon
+  (
+    local_id uuid NOT NULL DEFAULT gen_random_uuid(),
+    original_id text,    
+    name jsonb,
+    legend_item jsonb,
+    name_source text,
+    categorie_name text,
+    properties jsonb,
+    geometry geometry,
+    REGION text,
+    addr_street text,
+    addr_housenumber text,
+    created_at date,
+    CONSTRAINT osm_school_polygon_pkey PRIMARY KEY (local_id)
+  );",
+  "  
+  -- some steps to create the content
+  -- basic problem: some schools have schools on top of them. When one school is entirely on top of another one, we want to merge them into one object
+  -- we merge all rows to all rows, keeping only the ones that have an overlapping geometry
+  -- we then have a list of 'outers' with their associate 'inners'
+  WITH overlapping_poly AS (
+    SELECT
+        out.osm_id AS outer_id,
+	    CASE WHEN 
+	  		((out.amenity!='kindergarten' AND out.amenity!='school' AND out.amenity!='university' AND out.amenity!='college') OR out.amenity IS NULL)
+	  		AND out.landuse='education' 
+	  		THEN '1' END AS landuse_indicator,
+        inn.osm_id AS inner_id
+    FROM
+		tst.osm_school_polygon out
+    JOIN
+        tst.osm_school_polygon inn
+    ON
+        out.osm_id <> inn.osm_id
+    WHERE
+        ST_Contains(out.wkb_geometry, inn.wkb_geometry)
+  ),
+
+  
+  --- we also want background info from points in the polygon
+  point_in_poly AS (
+    SELECT
+        out.osm_id AS outer_id,
+	    CASE WHEN 
+	  		((out.amenity!='kindergarten' AND out.amenity!='school' AND out.amenity!='university' AND out.amenity!='college') OR out.amenity IS NULL)
+	  		AND out.landuse='education' 
+	  		THEN '1' END AS landuse_indicator,
+        inn.osm_id AS inner_id
+    FROM
+		tst.osm_school_polygon out
+    JOIN
+        raw_data.osm_school_point inn
+    ON
+        out.osm_id <> inn.osm_id
+    WHERE
+        ST_Contains(out.wkb_geometry, inn.geometry) AND (inn.amenity='kindergarten' OR inn.amenity='school' OR inn.amenity='university' OR inn.amenity='college')
+  ),
+  overlapping AS (
+	  select * from overlapping_poly UNION ALL select * from point_in_poly),
+
+
+  -- we prepare a big attribute table from both points & polygons
+  attributes AS (
+  	select osm_id,name,name_nl,operator_wikidata,operator,operator_type,addr_city,addr_housenumber,addr_street,addr_postcode,short_name,alt_name,contact_email,email,website,contact_website,phone,contact_phone,opening_hours,check_date,image,wikidata,amenity,faculty,religion,name_fr,name_de,nohousenumber,old_name,official_name,phone_2,mobile,contact_mobile,alt_website,operator_email,operator_website,landuse,grades,isced_level,max_age,min_age,pedagogy,school_language,language_nl,language_de,language_fr,school,language,type_kindergarten,type_primary,type_secondary,type_tertiary,type_special_needs,special_needs_intellectual_disability,special_needs_emotional_behavioural_disorder,special_needs_physical_disability,special_needs_blind,special_needs_deaf,special_needs_language_disorder,special_needs_autism,special_needs_learning_disabilities,special_needs_intellectually_gifted,geometry, 'poly' AS source FROM raw_data.osm_school_polygon
+	  UNION ALL
+    select osm_id,name,name_nl,operator_wikidata,operator,operator_type,addr_city,addr_housenumber,addr_street,addr_postcode,short_name,alt_name,contact_email,email,website,contact_website,phone,contact_phone,opening_hours,check_date,image,wikidata,amenity,faculty,religion,name_fr,name_de,nohousenumber,old_name,official_name,phone_2,mobile,contact_mobile,alt_website,operator_email,operator_website,landuse,grades,isced_level,max_age,min_age,pedagogy,school_language,language_nl,language_de,language_fr,school,language,type_kindergarten,type_primary,type_secondary,type_tertiary,type_special_needs,special_needs_intellectual_disability,special_needs_emotional_behavioural_disorder,special_needs_physical_disability,special_needs_blind,special_needs_deaf,special_needs_language_disorder,special_needs_autism,special_needs_learning_disabilities,special_needs_intellectually_gifted,geometry, 'point' AS source FROM raw_data.osm_school_point
+	  where amenity='kindergarten' OR amenity='school' OR amenity='university' OR amenity='college'
+  ),
+  
+  
+  -- we now enrich the entire list with the shared 'outer' identifier
+  merged AS (
+	  select 
+             a.*,
+             b.outer_id,
+	  		 b.landuse_indicator
+             FROM attributes a
+             LEFT JOIN overlapping b
+             ON a.osm_id=b.inner_id),
+
+  -- if there is no outer, we can just keep using the current id
+ finalid AS (
+  select * ,
+              CASE WHEN outer_id IS NOT null THEN outer_id
+              ELSE osm_id
+              END
+              as final_id
+              FROM merged
+	  		  ORDER BY final_id
+  ),
+
+
+count_landuse AS (select *, 
+				  SUM(landuse_indicator::integer) OVER (PARTITION BY final_id) as landuse_count,
+				  SUM(CASE WHEN source='point' THEN 1 ELSE 0 END) OVER (PARTITION BY final_id) as point_count,
+				  SUM(CASE WHEN source='poly' THEN 1 ELSE 0 END) OVER (PARTITION BY final_id) as poly_count,
+				  CASE WHEN landuse='education' AND (amenity!='kindergarten' AND amenity!='school' AND amenity!='university' AND amenity!='college') OR amenity IS NULL
+					THEN 1 ELSE 0 END as inner_landuse
+				  from finalid),
+
+
+dealt_with_landuse AS (select *,
+-- if no landuse involved, keep the case
+	CASE when 
+		-- no landuse at all
+		landuse_count IS NULL AND (inner_landuse=0 
+		-- the inner is landuse, but it is part of a bigger cluster)
+		OR (inner_landuse=1 AND (point_count>1 OR poly_count>1))) THEN final_id
+-- else if more than one way and no points involved, keep only the ways and remove the landuse object
+	-- NULLs to be removed next
+	WHEN poly_count>1 AND point_count=0 AND landuse_indicator IS NULL THEN NULL
+	WHEN poly_count>1 AND point_count=0 THEN osm_id				   
+-- else if landuse involved, keep landuse as outer for all inners if there are any
+	WHEN landuse_count>0 AND point_count+poly_count>1 THEN final_id
+-- else if it is landuse, but there are no inners, and there is no name, remove the object
+    WHEN inner_landuse=1 AND name IS NOT NULL THEN final_id
+	WHEN inner_landuse=1 THEN NULL 
+-- there should be no else
+	ELSE 'undefined' END AS aggregation_id
+	FROM count_landuse),
+	
+
+ 
+  -- before we group, we simplify into just the columns we need
+  -- the complex concat makes sure all the data that could be under different tags is merged into one column, without there being separators when not needed
+  -- we only keep the geometry if you don't have an outer school or if you are the outer school
+ simplified AS (
+    SELECT b.aggregation_id, b.name, b.name_nl, b.name_fr, b.name_de,
+	  	NULLIF(CONCAT_WS('; ',b.short_name, b.official_name, b.alt_name, b.old_name),'') AS other_names,
+CASE WHEN b.addr_street IS NULL THEN NULL 
+	ELSE LTRIM(CONCAT(b.addr_street, ' ' || CASE WHEN b.nohousenumber='yes' THEN 'w/n' ELSE b.addr_housenumber END, ', ' || CONCAT((b.addr_postcode || ' '), b.addr_city))) END
+	AS address,
+	b.addr_street AS addr_street,
+	b.addr_housenumber AS addr_housenumber,
+  NULLIF(CONCAT_WS('; ',b.contact_email, b.email),'') AS local_email,
+operator_email,
+  NULLIF(CONCAT_WS('; ',b.contact_mobile, b.mobile, b.contact_phone, b.phone, b.phone_2),'') AS local_phone,
+  NULLIF(CONCAT_WS('; ',b.website, b.contact_website),'') AS local_website,
+	b.operator_website,
+	b.type_kindergarten, b.type_primary, b.type_secondary, type_tertiary,b.type_special_needs, b.special_needs_intellectual_disability,
+b.special_needs_emotional_behavioural_disorder,
+b.special_needs_physical_disability,
+b.special_needs_blind,
+b.special_needs_deaf,
+b.special_needs_language_disorder,
+b.special_needs_autism,
+b.special_needs_learning_disabilities,
+b.special_needs_intellectually_gifted,
+b.landuse_count, 
+b.landuse_indicator,
+	  b.source,
+     CASE 
+	    WHEN aggregation_id=osm_id THEN geometry
+    	ELSE NULL
+	    END
+        AS geometry
+    FROM dealt_with_landuse b
+	WHERE aggregation_id IS NOT NULL AND aggregation_id!='undefined' 
+  ),
+
+
+
+  join_region AS (
+    SELECT 
+    r.niscode as niscode,
+    osm.aggregation_id as id,
+    osm.geometry as geometry
+    FROM raw_data.ngi_ign_region r, simplified osm
+    WHERE ST_Intersects(r.shape,osm.geometry)
+  ),
+  
+  
+  table_joined AS (
+    SELECT
+    s.aggregation_id as id,
+    STRING_AGG(DISTINCT s.name,'; ') as name,
+    STRING_AGG(DISTINCT s.name_nl,'; ') as name_nl,
+    STRING_AGG(DISTINCT s.name_fr,'; ') as name_fr,
+    STRING_AGG(DISTINCT s.name_de,'; ') as name_de,
+    STRING_AGG(DISTINCT s.other_names,'; ') as other_names,
+    STRING_AGG(DISTINCT s.address, '; ') AS address,
+    STRING_AGG(DISTINCT s.local_email, '; ') AS local_email,
+    STRING_AGG(DISTINCT s.operator_email, '; ') AS operator_email,
+    STRING_AGG(DISTINCT s.local_phone, '; ') AS local_phone,
+    STRING_AGG(DISTINCT s.local_website, '; ') AS local_website,
+    STRING_AGG(DISTINCT s.operator_website, '; ') AS operator_website,
+    STRING_AGG(DISTINCT s.addr_street, '; ') AS addr_street,
+    STRING_AGG(DISTINCT s.addr_housenumber, '; ') AS addr_housenumber,
+    max(s.type_kindergarten) AS type_kindergarten,
+    max(s.type_primary) AS type_primary,
+    max(s.type_secondary) AS type_secondary,
+    max(s.type_tertiary) AS type_tertiary,
+    max(s.type_special_needs) AS type_special_needs,
+    MAX(CASE WHEN s.special_needs_intellectual_disability = 'yes' THEN 'yes' END) AS special_needs_intellectual_disability,
+    MAX(CASE WHEN s.special_needs_emotional_behavioural_disorder = 'yes' THEN 'yes' END) AS special_needs_emotional_behavioural_disorder,
+    MAX(CASE WHEN s.special_needs_physical_disability = 'yes' THEN 'yes' END) AS special_needs_physical_disability,
+    MAX(CASE WHEN s.special_needs_blind = 'yes' THEN 'yes' END) AS special_needs_blind,
+    MAX(CASE WHEN s.special_needs_deaf = 'yes' THEN 'yes' END) AS special_needs_deaf,
+    MAX(CASE WHEN s.special_needs_language_disorder = 'yes' THEN 'yes' END) AS special_needs_language_disorder,
+    MAX(CASE WHEN s.special_needs_autism = 'yes' THEN 'yes' END) AS special_needs_autism,
+    MAX(CASE WHEN s.special_needs_learning_disabilities = 'yes' THEN 'yes' END) AS special_needs_learning_disabilities,
+    MAX(CASE WHEN s.special_needs_intellectually_gifted = 'yes' THEN 'yes' END) AS special_needs_intellectually_gifted,
+    MIN(j.niscode) as region,
+	STRING_AGG(DISTINCT s.source, '; ') AS source,
+    MIN(s.geometry) as geometry
+    FROM simplified s 
+    LEFT JOIN join_region j ON s.aggregation_id=j.id
+    GROUP BY
+    aggregation_id),
+	
+
+-- remove cases only derived from points
+final_table AS (
+select * from table_joined t
+WHERE source!='point')
+
+-- include at 
+    INSERT INTO ingestion.osm_school_polygon (original_id, name, legend_item, name_source, categorie_name, properties, addr_street, addr_housenumber, REGION, created_at,geometry)
+  SELECT
+  id AS original_id,
+               jsonb_strip_nulls(jsonb_build_object(
+              'und', CASE WHEN name IS NULL OR name='' THEN 'school' ELSE name END,
+              'fre', name_fr,
+              'ger', name_de::text,
+              'dut', name_nl)) as name,
+  jsonb_build_object('und', 'school') AS legend_item,
+  'OpenStreetMap (polygon data)' AS name_source,
+  'school' as categorie_name,
+  jsonb_strip_nulls(jsonb_build_object(
+    'other_names',other_names,
+	  'address',address,
+	  'local_email',local_email,
+	  'operator_email',operator_email,
+	  'local_phone',local_phone,
+	  'local_website',local_website,
+	  'operator_website',operator_website,
+	  'type_kindergarten',type_kindergarten,
+	  'type_primary',type_primary,
+	  'type_secondary',type_secondary,
+	  'type_tertiary',type_tertiary,
+	  'type_special_needs',type_special_needs,
+	  'special_needs_intellectual_disability',special_needs_intellectual_disability,
+		'special_needs_emotional_behavioural_disorder',special_needs_emotional_behavioural_disorder,
+		'special_needs_physical_disability',special_needs_physical_disability,
+		'special_needs_blind',special_needs_blind,
+		'special_needs_deaf',special_needs_deaf,
+		'special_needs_language_disorder',special_needs_language_disorder,
+		'special_needs_autism',special_needs_autism,
+		'special_needs_learning_disabilities',special_needs_learning_disabilities,
+		'special_needs_intellectually_gifted',special_needs_intellectually_gifted)	
+  ) AS properties,
+  addr_street AS addr_street,
+  addr_housenumber AS addr_housenumber,
+  region AS REGION,
+  CURRENT_DATE as created_at,
+  geometry AS geometry
+  FROM final_table;",
+  
+  " DROP TABLE IF EXISTS tst.osm_school_polygon CASCADE;",
+  " ALTER TABLE ingestion.osm_school_polygon
+  DROP COLUMN REGION;",
+  "ALTER TABLE IF EXISTS ingestion.osm_school_polygon OWNER to pgn_group_data_team_w;",
+  "GRANT ALL ON TABLE ingestion.osm_school_polygon TO pgn_group_data_team_w;",
+  "GRANT ALL ON TABLE ingestion.osm_school_polygon TO pgn_user_airflow;")
+
+
+### Make OSM polygons available ----
+
+DownloadProcessedOSMpoly <- function(){ 
+  tryCatch({
+    print("Start downloading processed OSM polygon data")
+    start_time <- Sys.time()
+
+con_pg <- get_con()
+
+osm_cleaned <- dbGetQuery(con_pg, "SELECT 
+  original_id, name, legend_item, name_source, categorie_name, properties, addr_street, addr_housenumber, created_at, ST_AsHEXEWKB(geometry) as osm_geometry_wkb
+  FROM ingestion.osm_school_polygon;")
+
+dbDisconnect(con_pg)
+
+# make sf and reproject to lambert72
+osm_cleaned<-osm_cleaned %>% filter( !is.na(osm_geometry_wkb) & osm_geometry_wkb != "")
+osm_cleaned$osm_geometry_wkb <- st_as_sfc(structure(osm_cleaned$osm_geometry_wkb, class = "WKB"), EWKB = TRUE)
+osm_cleaned$osm_geometry_wkb <- st_set_crs(osm_cleaned$osm_geometry_wkb, 4326)
+osm_cleaned <- st_as_sf(osm_cleaned)
+osm_cleaned_orig <<- osm_cleaned
+osm_cleaned <<- st_transform(osm_cleaned, 31370)
+
+  }, 
+error = function(e) {
+  stop(paste("Error downloading OSM polygons:", e))
+})
+  
+  # status message
+  finish<-Sys.time()
+  total_time <- round(as.numeric(difftime(finish, start_time, units = "secs")), 2)
+  print(paste0("Downloading processed OSM poly data done (took ",total_time," seconds)"))
+}
+
+
+### BRWA transformation ----
+
+TransformBRWA <- function(){ 
+  tryCatch({
+    print("Start transformation of BRWA data")
+    start_time <- Sys.time()
+  
+con_pg <- get_con()
+brwa <- dbGetQuery(con_pg, " SELECT 
+  o.ogc_fid,
+  o.ndegfase_de_l_etablissement, 
+  o.ndegfase_de_l_implantation,
+  o.nom_de_l_etablissement,
+  o.type_d_enseignement, 
+  o.niveau,
+  o.numero_bce_de_l_etablissement,
+  o.genre,
+  o.adresse_de_l_implantation,
+  o.code_postal_de_l_implantation,
+  o.commune_de_l_implantation,
+  o.latitude,
+  o.longitude,
+  ST_AsHEXEWKB(o.geometry) as original_geometry_wkb, --4326
+  ST_AsHEXEWKB(g.geometry) as geocoded_geometry_wkb --31370
+  FROM raw_data.brwa_cfwb_odata_schools o
+  LEFT JOIN raw_data.brwa_cfwb_odata_schools_gl g ON o.ogc_fid=g.ogc_fid;")
+
+dbDisconnect(con_pg)
+
+
+
+# fix geometry issues caused by geocoding: if ndegfase_de_l_etablissement & ndegfase_de_l_implantation are identical, copy the first geocoded_geometry to all the records in the group
+brwa <- brwa %>%
+  group_by(ndegfase_de_l_etablissement, ndegfase_de_l_implantation) %>%
+  mutate(geocoded_geometry_wkb = ifelse(n() > 1, first(geocoded_geometry_wkb), geocoded_geometry_wkb)) %>%
+  ungroup()
+
+# create brwa as sf with the original geometry
+brwa_orig <- brwa %>%
+  filter(!is.na(original_geometry_wkb)) %>%
+  mutate(geometry = st_as_sfc(structure(original_geometry_wkb, class = "WKB"), EWKB = TRUE)) %>%
+  st_as_sf(sf_column_name = "geometry", crs = 4326) %>%
+  filter(!st_is_empty(geometry)) %>%
+  st_transform(31370)
+brwa_orig$source <- "original"
+
+# create brwa as sf with the geocoded geometry
+brwa_geocode <- brwa %>%
+  filter(!is.na(geocoded_geometry_wkb)) %>%
+  mutate(geometry = st_as_sfc(structure(geocoded_geometry_wkb, class = "WKB"), EWKB = TRUE)) %>%
+  st_as_sf(sf_column_name = "geometry", crs = 31370) %>%
+  filter(!st_is_empty(geometry))
+brwa_geocode$source <- "geocoded"
+
+# add cases from both brwa geometry versions together
+brwa_all <- rbind(brwa_orig, brwa_geocode)
+
+# status message
+download_time<-Sys.time()
+downloading_time <- round(as.numeric(difftime(download_time, start_time, units = "secs")), 2)
+print(paste0("Downloaded BRWA data (took ",downloading_time," seconds), now joining to OSM data"))
+
+      
+# join nearby objects from both datasets
+join <- st_join(brwa_all, osm_cleaned, join = st_is_within_distance, dist = distance_raw_threshold)
+join <- as.data.frame(join)
+
+# add the geometry from the osm objects
+osm_cleaned_geo<-osm_cleaned %>% select(original_id, osm_geometry_wkb)
+osm_cleaned_geo<-as.data.frame(osm_cleaned_geo)
+join <- left_join(join, osm_cleaned_geo, by = "original_id")
+
+# Calculate distance between potential matches
+#join$distance <- mapply(calculate_distance, join$osm_geometry_wkb, join$geometry)
+# we use euclidian distance, as our default Hausdorf distance isn't great for point vs polygon comparisons (de facto it gives the furthest point from the nearby polygons)
+join$distance <- mapply(calculate_eucl_distance, join$osm_geometry_wkb, join$geometry)
+
+# keep a backup with all records, including the ones that do not have a link to an OSM geometry
+#join_all <- join
+#join<-join_all
+
+# status message
+join_time<-Sys.time()
+joining_time <- round(as.numeric(difftime(join_time, download_time, units = "secs")), 2)
+print(paste0("Joined BRWA data to OSM (took ",joining_time," seconds), now preparing choosing which links to keep"))
+
+
+
+# if there are two ogc_id with the same osm original_id, keep the one with the lowest distance
+join <- join %>%
+  group_by(ogc_fid,original_id) %>% 
+  arrange(distance) %>%
+  mutate(
+    count = n(),
+    within_id_number = row_number()
+  ) %>%
+  ungroup()
+join <- join %>%
+  filter(within_id_number == 1) %>%
+  select(-within_id_number, -count)
+
+# keep only the records with a link to an OSM geometry
+join <- join %>% filter(!is.na(original_id))
+
+# acceptance elements:
+### 1. name similarity ----
+
+
+
+
+#extract name from languaged name + extract other_names from properties
+join$name_1<-tolower(join$nom_de_l_etablissement)
+join$name_2 <- tolower(mapply(extract_json_value, join$name, "und"))
+join$other_names <- tolower(mapply(extract_json_value, join$properties, "other_names"))
+#note: extract_json_value requires loading utils.R
+
+# remove accents
+join <- join %>%
+  mutate(
+    name_1=stri_trans_general(name_1, "Latin-ASCII"),
+    name_2=stri_trans_general(name_2, "Latin-ASCII"),
+    other_names=stri_trans_general(other_names, "Latin-ASCII"),
+  )
+
+# check for identical names
+join <- join %>%
+  mutate(
+    same_name = ifelse(name_1==name_2 | name_1==other_names, 1, 0)
+    )
+  
+
+
+
+# apply to these columns:
+columns_to_clean <- c("name_1", "name_2", "other_names")
+
+# default removals
+patterns_to_remove <- c("\"", "”", "“", "´")
+join <- string_removal(join, columns_to_clean, patterns_to_remove)
+# string_removal is a function defined in utils.R
+
+# remove words specific to the context
+patterns_to_remove <- c("college","institut","instituts","communale","fondamentale","fondamental","enseignement","provincial","specialize", "ecole","athenee","secondair","secondaire")
+join <- string_removal(join, columns_to_clean, patterns_to_remove)
+
+
+
+# remove leading and trailing whitespaces
+join <- join %>%
+  mutate(
+    name_1 = trimws(name_1),
+    name_2 = trimws(name_2),
+    other_names = trimws(other_names)
+  )
+
+# find the longest common substring
+join <- join %>%
+  rowwise() %>%
+  mutate(lcs=LCSn(c(tolower(name_1), tolower(name_2)))) %>%
+  mutate(longest_common_str_length=nchar(lcs)) %>%
+  mutate(other_names=ifelse(is.na(other_names), " ", other_names)) %>%
+  mutate(alt_lcs=LCSn(c(tolower(name_1), tolower(other_names)))) %>%
+  mutate(alt_longest_common_str_length=nchar(alt_lcs)) %>%
+  mutate(longest_common_str_length=max(longest_common_str_length, alt_longest_common_str_length)) %>%
+  ungroup()
+
+
+# shorten name before calculating length
+patterns_to_remove <- c("maternelle", "libre", "primaire", "specialisee", "specialise", "anexee")
+columns_to_clean <- c("name_1", "name_2")
+join <- string_removal(join, columns_to_clean, patterns_to_remove)
+join$length_name<-nchar(join$name_1)
+
+
+# Decide when we consider the names to be the same (length should de significant)
+join <- join %>%
+  mutate(
+    same_name = ifelse(
+      ((longest_common_str_length > 10 | (longest_common_str_length > 4 & longest_common_str_length <= 10 & longest_common_str_length > length_name / 2)) | ((name_1==name_2 | name_1==as.character(other_names)) & tolower(mapply(extract_json_value, name, "und"))!="school") | same_name==1),
+      1,
+      0
+    )
+  )
+
+
+join <- join %>%
+  select(-lcs, -alt_lcs, -longest_common_str_length, -alt_longest_common_str_length, -length_name)
+
+
+### 2. street similarity ----
+
+
+# split street and house number
+join <- join %>%
+  mutate(
+    house_number_1 = ifelse(grepl("\\b[0-9]+\\b", adresse_de_l_implantation), sub("^(.*\\s)(.*[0-9].*)$", "\\2", adresse_de_l_implantation), NA),
+    street_1 = tolower(ifelse(grepl("\\b[0-9]+\\b", adresse_de_l_implantation), sub("^(.*\\s)(.*[0-9].*)$", "\\1", adresse_de_l_implantation), adresse_de_l_implantation))
+  )
+
+# set hnr_2
+join <- join %>%
+  mutate(house_number_2 = tolower(addr_housenumber))
+
+# set hnr_t as missing if identical to street_2
+join <- join %>%
+  mutate(house_number_1 = ifelse(house_number_1 == street_1, NA, house_number_1))
+
+
+# SIMPLIFY STREET NAMES
+
+# remove accents
+join <- join %>%
+  mutate(
+    street_1 = stri_trans_general(street_1, "Latin-ASCII"),
+    street_2 = tolower(stri_trans_general(addr_street, "Latin-ASCII"))
+  )
+
+
+
+
+# deal with common abbreviations; remove usual additions to only compare the core of the street name
+
+replacements <- c(
+ "rue de ", "",
+ "rue des ", "",
+ "rue du ", "",
+ "rue", "",
+ "st\\.", "sint",
+ "^\\b(st)\\b(?=\\s|\\.)", "sint",
+ "^\\b(bd)\\b(?=\\s|\\.)", "boulevard",
+ "straat", "",
+ "steenweg","",
+ "plein", "",
+ "boulevard", "",
+ "avenue", "",
+ "-", " ",
+ "straße", "",
+ "strasse", "",
+ "laan", "",
+ "\\s+$", "",
+ "^\\s+", ""
+)
+# Define the columns to clean
+columns_to_clean <- c("street_1", "street_2")
+join <- string_replacement(join, columns_to_clean, replacements)
+# string_replacement is a function defined in utils.R
+
+# remove leading and trailing whitespaces
+join <- join %>%
+  mutate(
+    street_1 = trimws(street_1),
+    street_2 = trimws(street_2)
+  )
+
+
+# if result is empty string, replace with NA
+join <- join %>%
+  mutate(
+    street_1 = ifelse(street_1 == "", NA, street_1),
+    street_2 = ifelse(street_2 == "", NA, street_2)
+  )
+# END SIMPLIFY STREET NAMES
+
+# make sure the result is still text
+join$street_1 <- as.character(join$street_1)
+join$street_2 <- as.character(join$street_2)
+
+
+# calculate string distance between streets in both datasets
+join <- join %>%
+  mutate(streetsim = stringsim(street_1,street_2))
+
+# check if the street on one side is a substring of street on the other side
+join <- join %>%
+  mutate(
+    condition = nchar(street_1) > 3 & nchar(street_2) > 3,
+    substring_left_check = ifelse(condition, str_detect(street_2, street_1), FALSE),
+    substring_right_check = ifelse(condition, str_detect(street_1, street_2), FALSE),
+    streetsim = ifelse((substring_left_check | substring_right_check) & streetsim<0.9, 0.9, streetsim)
+  ) %>%
+  select(-condition, -substring_right_check, -substring_left_check)
+
+join <- join %>%
+  mutate(
+    house_number_1 = clean_string(house_number_1),
+    house_number_2 = clean_string(house_number_2)
+  )
+# make sure the housenumber is text
+join$house_number_1 <- as.character(join$house_number_1)
+join$house_number_2 <- as.character(join$house_number_2)
+
+join <- join %>%
+  mutate(hnr_sim = stringsim(as.character(house_number_1), as.character(house_number_2)))
+
+
+# check if the housenumber on one side is a substring of housenumber on the other side, if the number is at least two digits
+join <- join %>%
+  mutate(
+    condition = nchar(as.character(house_number_2)) > 1 & nchar(as.character(house_number_1)) > 1,
+    substring_left_check = ifelse(condition, str_detect(as.character(house_number_2), as.character(house_number_1)), FALSE),
+    substring_right_check = ifelse(condition, str_detect(as.character(house_number_1), as.character(house_number_2)), FALSE),
+    hnr_sim = ifelse((substring_left_check | substring_right_check) & hnr_sim<0.9 , 0.9, hnr_sim)
+  ) %>%
+  select(-condition, -substring_right_check, -substring_left_check)
+
+join <- join %>%
+  mutate(
+    hnr_sim = if_else(
+      !is.na(as.numeric(house_number_1)) & !is.na(as.numeric(house_number_2)),
+      ifelse(abs(as.numeric(house_number_1) - as.numeric(house_number_2)) < 10 & hnr_sim<0.9, 0.9, hnr_sim),
+      hnr_sim
+    )
+  )
+
+
+
+## end street similarity
+
+
+
+### 3. type of school ----
+
+
+# Extract the value of type_primary to a new column
+join <- join %>%
+  mutate(
+    type_kindergarten = as.numeric(coalesce(sapply(properties, extract_json_value, key = "type_kindergarten"), 0)),
+    type_primary      = as.numeric(coalesce(sapply(properties, extract_json_value, key = "type_primary"), 0)),
+    type_secondary    = as.numeric(coalesce(sapply(properties, extract_json_value, key = "type_secondary"), 0)),
+    type_tertiary     = as.numeric(coalesce(sapply(properties, extract_json_value, key = "type_tertiary"), 0)),
+    type_special_needs= as.numeric(coalesce(sapply(properties, extract_json_value, key = "type_special_needs"), 0))
+  )
+
+
+join$off_kindergarten <- ifelse(grepl("Maternel", join$type_d_enseignement), 1, 0)
+join$off_primary <- ifelse(grepl("Primaire", join$type_d_enseignement), 1, 0)
+join$off_secondary <- ifelse(join$niveau == "Secondaire", 1, 0)
+join$off_tertiary <- ifelse(join$niveau == "Supérieur", 1, 0)
+join$off_special_needs <- ifelse(join$genre == "Spécialisé", 1, 0)
+
+# if any combination of type is both 1, set same_school_type to 1
+join$same_school_type <- ifelse(join$off_kindergarten == 1 & join$type_kindergarten == "1", 1, 0) +
+  ifelse(join$off_primary == 1 & join$type_primary == "1", 1, 0) +
+  ifelse(join$off_secondary == 1 & join$type_secondary == "1", 1, 0) +
+  ifelse(join$off_tertiary == 1 & join$type_tertiary == "1", 1, 0) +
+  ifelse(join$off_special_needs == 1 & join$type_special_needs == "1", 1, 0)
+
+
+join <- join %>%
+  select(-name_1,-name_2,-other_names,-house_number_1, -house_number_2, -street_1, -street_2, -type_kindergarten, -type_primary, -type_secondary, -type_tertiary, -off_kindergarten, -off_primary, -off_secondary, -off_tertiary)
+
+
+### Make choices ----
+## combine choice elements
+
+# calculate address certainty
+join<- join %>%
+  mutate(address_certainty = case_when(
+    streetsim == 1 & hnr_sim == 1 ~ 1,
+    streetsim == 1 & is.na(hnr_sim) ~ 0.95,
+    streetsim >= 0.9 & hnr_sim >= 0.9 ~ 0.93,
+    streetsim >= 0.9 & is.na(hnr_sim) ~ 0.92,
+    streetsim >= 0.9 & hnr_sim < 0.9 ~ 0.85,
+    TRUE ~ 0
+  ))
+
+# status message
+choice_prep_time<-Sys.time()
+choice_prepping_time <- round(as.numeric(difftime(choice_prep_time, join_time, units = "secs")), 2)
+print(paste0("Prepared for choosing which links to keep (took ",choice_prepping_time," seconds), now making choices"))
+
+
+
+
+# SELECT only if certain quality thresholds met
+join <- join %>%
+  filter(distance < distance_matched_threshold | address_certainty >= 0.85 | same_school_type == 1 | same_name ==1)
+
+# order by distance
+join <- join %>%
+  group_by(ogc_fid) %>% 
+  arrange(distance) %>%
+  mutate(distance_id = row_number()) %>%
+  ungroup()
+
+# order by address certainty
+join <- join %>%
+  group_by(ogc_fid) %>% 
+  arrange(desc(address_certainty)) %>%
+  mutate(address_certainty_id = row_number()) %>%  
+  ungroup()
+
+# create scoring variable:
+  # the closest object gets 1 point if it is within threshold, 0.75 if it is within 2xtreshold. Further objects get 0.65 points if they are within the distance threshold
+  # the best address gets 0.75 points, other addresses with a decent score get 0.5 points
+  # if the names are the same, the object gets 1 point
+  # if the school types are the same, the object gets 0.5 points
+join <- join %>%
+  mutate(same_name=ifelse(is.na(same_name), 0, same_name)) %>%
+  mutate(
+    score = 
+      ifelse(distance_id == 1 & distance < distance_matched_threshold, 1, 0) +
+      ifelse(distance_id == 1 & distance > distance_matched_threshold & distance < 2*distance_matched_threshold, 0.75, 0) +
+      ifelse(distance_id >1 & distance < distance_matched_threshold, 0.65, 0) +
+      ifelse(address_certainty>0 & address_certainty_id == 1, 0.75, 0) + ifelse(address_certainty>0 & address_certainty_id > 1, 0.5, 0) +
+      ifelse(same_name == 1, 1, 0) + 
+      ifelse(same_school_type == 1, 0.5, 0)
+  )
+
+
+# keep only the cases where the score equals the max score for the ogc_fid
+join <- join %>%
+  group_by(ogc_fid) %>% 
+  filter(score == max(score)) %>%
+  ungroup()
+
+# if there's still more than one, keep the one with the closest distance (prepare filter)
+join <- join %>%
+  group_by(ogc_fid) %>% 
+  arrange(distance) %>%
+  mutate(
+    count=n(),
+    distance_id = row_number()
+  ) %>%
+  ungroup()
+
+
+# filter
+join <- join %>%
+  filter(count == 1 | (count>1 & distance_id == 1))
+
+
+# Minimum threshold to keep a link: if score<1.75 & distance > threshold, delete the row
+join <- join %>%
+  filter(score >= 1.75 | distance < distance_matched_threshold)
+
+
+
+# simplify data
+
+join_simplified <- join %>%
+  select(ogc_fid, osm_id=original_id) %>%
+  distinct()
+
+
+# status message
+choice_time<-Sys.time()
+choosing_time <- round(as.numeric(difftime(choice_time, choice_prep_time, units = "secs")), 2)
+print(paste0("Choices made (took ",choosing_time," seconds), now summarizing data"))
+
+
+brwa_joined <- left_join(brwa, join_simplified, by = "ogc_fid")
+
+
+# helper: hex EWKB -> sfc, NA -> POINT EMPTY, optional reprojection
+# (only the non-NA rows are parsed/transformed, so empties never go through PROJ)
+to_sfc <- function(hex, crs_in, crs_out = crs_in) {
+  out <- rep(list(st_point()), length(hex))              # POINT EMPTY placeholders
+  ok  <- !is.na(hex)
+  if (any(ok)) {
+    parsed <- st_as_sfc(structure(hex[ok], class = "WKB"), EWKB = TRUE)
+    if (is.na(st_crs(parsed))) parsed <- st_set_crs(parsed, crs_in)  # only if no SRID in the EWKB
+    if (st_crs(parsed) != st_crs(crs_out)) parsed <- st_transform(parsed, crs_out)
+    out[ok] <- unclass(parsed)
+  }
+  st_sfc(out, crs = crs_out)
+}
+
+# geocoded geometry is stored in 31370, reproject to 4326; original is already 4326
+brwa_joined$geocoded_geometry <- to_sfc(brwa_joined$geocoded_geometry_wkb, 31370, 4326)
+brwa_joined$original_geometry <- to_sfc(brwa_joined$original_geometry_wkb, 4326)
+
+# create the new geometry column: geocoded where usable, otherwise original
+use_geocoded <- !st_is_empty(brwa_joined$geocoded_geometry)
+
+geom <- brwa_joined$original_geometry
+geom[use_geocoded] <- brwa_joined$geocoded_geometry[use_geocoded]
+
+brwa_joined$geometry        <- geom
+brwa_joined$geometry_source <- ifelse(use_geocoded, "geocoded", "original")
+
+# make it an sf object and drop rows without a usable geometry
+brwa_joined <- brwa_joined %>%
+  st_as_sf(sf_column_name = "geometry") %>%
+  filter(!st_is_empty(geometry))
+
+
+# aggregation ID
+brwa_joined <- brwa_joined %>%
+  mutate(agg_id = ifelse(!is.na(osm_id),osm_id,geometry))
+
+# create a clean point geometry
+brwa_joined<-st_as_sf(brwa_joined, wkt="geometry")
+
+
+
+# merge osm_cleaned_orig
+
+brwa_joined <- left_join(brwa_joined, as.data.frame(osm_cleaned_orig), by = c("osm_id"="original_id"))
+
+
+# first add the type-d-enseignement numerical fields
+brwa_joined$type_kindergarten <- ifelse(grepl("Maternel", brwa_joined$type_d_enseignement), 1, 0)
+brwa_joined$type_primary <- ifelse(grepl("Primaire", brwa_joined$type_d_enseignement), 1, 0)
+brwa_joined$type_secondary <- ifelse(brwa_joined$niveau == "Secondaire", 1, 0)
+brwa_joined$type_tertiary <- ifelse(brwa_joined$niveau == "Supérieur", 1, 0)
+brwa_joined$type_special_needs <- ifelse(brwa_joined$genre == "Spécialisé", 1, 0)
+
+# create full id
+brwa_joined <- brwa_joined %>%
+  mutate(original_id=paste0(ndegfase_de_l_etablissement,'_',ndegfase_de_l_implantation))
+
+# aggregate
+brwa_summarized <- clean_empty_strings(brwa_joined) %>%
+  group_by(agg_id) %>%
+  summarize(
+    across(
+      c(type_d_enseignement, original_id, numero_bce_de_l_etablissement, nom_de_l_etablissement, adresse_de_l_implantation, code_postal_de_l_implantation, commune_de_l_implantation),
+      collapse_unique
+    ),
+    type_kindergarten = max(type_kindergarten),
+    type_primary = max(type_primary),
+    type_secondary = max(type_secondary),
+    type_tertiary = max(type_tertiary),
+    type_special_needs = max(type_special_needs),
+    osm_id=first(osm_id),
+    name=first(name),
+    properties_osm=first(properties),
+    geometry_point=first(geometry),
+    geometry_osm=first(osm_geometry_wkb))
+
+
+
+# create BRWA properties
+
+brwa_summarized <- brwa_summarized %>%
+  rowwise() %>%
+  mutate(off_properties = jsonlite::toJSON(
+    purrr::discard(list(
+      official_id = original_id,
+      address = paste0(
+        adresse_de_l_implantation, ", ",
+        code_postal_de_l_implantation, " ",
+        commune_de_l_implantation
+      ),
+      kbo_bce=numero_bce_de_l_etablissement,
+      school_types = type_d_enseignement,
+      name = ifelse(is.na(osm_id), NA, nom_de_l_etablissement),
+      type_kindergarten = type_kindergarten,
+      type_primary = type_primary,
+      type_secondary = type_secondary,
+      type_tertiary = type_tertiary,
+      type_special_needs = type_special_needs
+    ), is.na), auto_unbox = TRUE)) %>%
+  ungroup()
+
+brwa_summarized <- as.data.frame(brwa_summarized)
+
+
+
+# Ensure the CRS is set correctly for geometry columns if not already
+st_crs(brwa_summarized$geometry_point) <- 4326
+st_crs(brwa_summarized$geometry_osm) <- 4326
+
+# Use dplyr::case_when to conditionally assign geometries while preserving sf class
+brwa_summarized <- brwa_summarized %>%
+  rowwise() %>%
+  mutate(
+    original_id = ifelse(is.na(osm_id), original_id, paste0("https://osm.org/", osm_id)),
+    name = ifelse(is.na(osm_id), toJSON(list(fre = nom_de_l_etablissement), auto_unbox = TRUE), name),
+    name = ifelse(name == toJSON(list(und = "school"), auto_unbox = TRUE), toJSON(list(fre = nom_de_l_etablissement), auto_unbox = TRUE), name),
+    name_source = ifelse(is.na(osm_id), 'Fédération Wallonie-Bruxelles', 'OpenStreetMap + Fédération Wallonie-Bruxelles'),
+    geometry = case_when(
+      is.na(osm_id) ~ geometry_point,
+      TRUE ~ geometry_osm
+    )
+  ) %>%
+  ungroup()
+
+# Remove the unused geometry columns
+brwa_summarized <- brwa_summarized %>%
+  select(-geometry_point, -geometry_osm)
+
+# Ensure the resulting dataframe is an sf object
+brwa_summarized <- st_as_sf(brwa_summarized)
+
+# Check and set CRS if necessary
+st_crs(brwa_summarized) <- 4326
+
+# Verify if geometries are valid
+invalid_geometries <- brwa_summarized %>%
+  filter(!st_is_valid(geometry))
+
+
+#save the result beyond the function
+brwa_summarized <<- brwa_summarized %>%
+  select(original_id,name,properties_osm, off_properties, name_source)
+
+
+  }, 
+error = function(e) {
+  stop(paste("Error transforming BRWA data:", e))
+})
+  
+  # status message
+  finish<-Sys.time()
+  total_time <- round(as.numeric(difftime(finish, start_time, units = "secs")), 2)
+  print(paste0("Transformation of BRWA is done (took ",total_time," seconds)"))
+}
+
+
+# VLA transformation ----
+
+TransformVL <- function() {
+  tryCatch({
+    print("Start transformation of VLA data")
+    start_time <- Sys.time()
+
+  # connect to the database
+con_pg <- get_con()
+vla <- dbGetQuery(con_pg, "SELECT 
+	ogc_fid,
+	poid,
+	naam,
+	notitie,
+	telefoon,
+	email,
+	straat,
+	huisnummer,
+	busnummer,
+	postcode,
+	gemeente,
+	poitype,
+	categorie,
+	link1,
+	link2,
+  ST_AsHEXEWKB(geometry) as off_geometry -- is already in Lambert72
+FROM raw_data.vla_depov_poiservice_schools;")
+dbDisconnect(con_pg)
+
+
+# create vla as sf with the original geometry
+vla$off_geometry <- st_as_sfc(structure(vla$off_geometry, class = "WKB"), EWKB = TRUE)
+vla$off_geometry <- st_set_crs(vla$off_geometry, 31370)
+vla <- st_as_sf(vla)
+#st_write(vla, "C:/temp/logs/vla.geojson", driver = "GeoJSON")
+
+# status message
+download_time<-Sys.time()
+downloading_time <- round(as.numeric(difftime(download_time, start_time, units = "secs")), 2)
+print(paste0("Downloaded VLA data (took ",downloading_time," seconds), now joining to OSM data"))
+
+
+
+# join nearby objects from both datasets
+join <- st_join(vla, osm_cleaned, join = st_is_within_distance, dist = distance_raw_threshold)
+join <- as.data.frame(join)
+
+# add the geometry from the osm objects
+osm_cleaned_geo<-osm_cleaned %>% select(original_id, osm_geometry_wkb)
+osm_cleaned_geo<-as.data.frame(osm_cleaned_geo)
+join <- left_join(join, osm_cleaned_geo, by = "original_id")
+
+# Calculate distance between potential matches
+#join$distance <- mapply(calculate_distance, join$osm_geometry_wkb, join$geometry)
+# we use euclidian distance, as our default Hausdorf distance isn't great for point vs polygon comparisons (de facto it gives the furthest point from the nearby polygons)
+join$distance <- mapply(calculate_eucl_distance, join$osm_geometry_wkb, join$off_geometry)
+
+# keep a backup with all records, including the ones that do not have a link to an OSM geometry
+#join_all <- join
+#join<-join_all
+
+# status message
+join_time<-Sys.time()
+joining_time <- round(as.numeric(difftime(join_time, download_time, units = "secs")), 2)
+print(paste0("Joined VLA data to OSM (took ",joining_time," seconds), now preparing choosing which links to keep"))
+
+
+# keep only the records with a link to an OSM geometry
+join <- join %>% filter(!is.na(original_id))
+
+# acceptance elements:
+### 1. name similarity ----
+
+#extract name from languaged name + extract other_names from properties
+join$name_1<-tolower(join$naam)
+join$name_2 <- tolower(mapply(extract_json_value, join$name, "und"))
+join$other_names <- tolower(mapply(extract_json_value, join$properties, "other_names"))
+#note: extract_json_value requires loading utils.R
+
+# remove accents
+join <- join %>%
+  mutate(
+    name_1=stri_trans_general(name_1, "Latin-ASCII"),
+    name_2=stri_trans_general(name_2, "Latin-ASCII"),
+    other_names=stri_trans_general(other_names, "Latin-ASCII"),
+  )
+
+# check for identical names
+join <- join %>%
+  mutate(
+    same_name = ifelse(name_1==name_2 | name_1==other_names, 1, 0)
+  )
+
+
+
+
+# apply to these columns:
+columns_to_clean <- c("name_1", "name_2", "other_names")
+
+# default removals
+patterns_to_remove <- c("\"", "”", "“", "´")
+join <- string_removal(join, columns_to_clean, patterns_to_remove)
+# string_removal is a function defined in utils.R
+
+# remove words specific to the context
+patterns_to_remove <- c("college","instituut","gemeentelijke","gemeentelijk","basisschool","vrije ","lagere school","kleuterschool","onderwijs", "atheneum","middenschool","school","stedelijke","campus","college","basisonderwijs", "provinciaal", "provinciale")
+join <- string_removal(join, columns_to_clean, patterns_to_remove)
+
+
+# remove leading and trailing whitespaces
+join <- join %>%
+  mutate(
+    name_1 = trimws(name_1),
+    name_2 = trimws(name_2),
+    other_names = trimws(other_names)
+  )
+
+# find the longest common substring
+join <- join %>%
+  rowwise() %>%
+  mutate(lcs=LCSn(c(tolower(name_1), tolower(name_2)))) %>%
+  mutate(longest_common_str_length=nchar(lcs)) %>%
+  mutate(other_names=ifelse(is.na(other_names), " ", other_names)) %>%
+  mutate(alt_lcs=LCSn(c(tolower(name_1), tolower(other_names)))) %>%
+  mutate(alt_longest_common_str_length=nchar(alt_lcs)) %>%
+  mutate(longest_common_str_length=max(longest_common_str_length, alt_longest_common_str_length)) %>%
+  ungroup()
+
+
+# shorten name before calculating length
+patterns_to_remove <- c("go!", "provinciaal", "voor buitengewoon")
+columns_to_clean <- c("name_1", "name_2")
+join <- string_removal(join, columns_to_clean, patterns_to_remove)
+join$length_name<-nchar(join$name_1)
+
+
+
+
+
+# Decide when we consider the names to be the same (length should de significant)
+join <- join %>%
+  mutate(
+    same_name = ifelse(
+      ((longest_common_str_length > 10 | (longest_common_str_length > 4 & longest_common_str_length <= 10 & longest_common_str_length > length_name / 2)) | ((name_1==name_2 | name_1==as.character(other_names)) & tolower(mapply(extract_json_value, name, "und"))!="school") | same_name==1),
+      1,
+      0
+    )
+  )
+
+join <- join %>%
+  select(-lcs, -alt_lcs, -longest_common_str_length, -alt_longest_common_str_length, -length_name)
+
+
+### 2. street similarity ----
+
+
+# split street and house number
+join <- join %>%
+  mutate(
+    house_number_1 = tolower(huisnummer),
+    street_1 = tolower(straat)
+  )
+
+# set hnr_2
+join <- join %>%
+  mutate(house_number_2 = addr_housenumber)
+
+# set hnr_t as missing if identical to street_2
+join <- join %>%
+  mutate(house_number_1 = ifelse(house_number_1 == street_1, NA, house_number_1))
+
+
+# SIMPLIFY STREET NAMES
+
+# remove accents
+join <- join %>%
+  mutate(
+    street_1 = stri_trans_general(street_1, "Latin-ASCII"),
+    street_2 = tolower(stri_trans_general(addr_street, "Latin-ASCII"))
+  )
+
+
+
+# deal with common abbreviations; remove usual additions to only compare the core of the street name
+
+replacements <- c(
+  "rue de ", "",
+  "rue des ", "",
+  "rue du ", "",
+  "rue", "",
+  "st\\.", "sint",
+  "^\\b(st)\\b(?=\\s|\\.)", "sint",
+  "^\\b(bd)\\b(?=\\s|\\.)", "boulevard",
+  "straat", "",
+  "boulevard", "",
+  "avenue", "",
+  "-", " ",
+  "straße", "",
+  "strasse", "",
+  "laan", "",
+  "\\s+$", "",
+  "^\\s+", ""
+)
+# Define the columns to clean
+columns_to_clean <- c("street_1", "street_2")
+join <- string_replacement(join, columns_to_clean, replacements)
+# string_replacement is a function defined in utils.R
+
+# remove leading and trailing whitespaces
+join <- join %>%
+  mutate(
+    street_1 = trimws(street_1),
+    street_2 = trimws(street_2)
+  )
+
+
+# if result is empty string, replace with NA
+join <- join %>%
+  mutate(
+    street_1 = ifelse(street_1 == "", NA, street_1),
+    street_2 = ifelse(street_2 == "", NA, street_2)
+  )
+# END SIMPLIFY STREET NAMES
+
+# make sure the result is still text
+join$street_1 <- as.character(join$street_1)
+join$street_2 <- as.character(join$street_2)
+
+
+# calculate string distance between streets in both datasets
+join <- join %>%
+  mutate(streetsim = stringsim(street_1,street_2))
+
+# check if the street on one side is a substring of street on the other side
+join <- join %>%
+  mutate(
+    condition = nchar(street_1) > 3 & nchar(street_2) > 3,
+    substring_left_check = ifelse(condition, str_detect(street_2, street_1), FALSE),
+    substring_right_check = ifelse(condition, str_detect(street_1, street_2), FALSE),
+    streetsim = ifelse((substring_left_check | substring_right_check) & streetsim<0.9, 0.9, streetsim)
+  ) %>%
+  select(-condition, -substring_right_check, -substring_left_check)
+
+join <- join %>%
+  mutate(
+    house_number_1 = clean_string(house_number_1),
+    house_number_2 = clean_string(house_number_2)
+  )
+# make sure the housenumber is text
+join$house_number_1 <- as.character(join$house_number_1)
+join$house_number_2 <- as.character(join$house_number_2)
+
+join <- join %>%
+  mutate(hnr_sim = stringsim(as.character(house_number_1), as.character(house_number_2)))
+
+
+# check if the housenumber on one side is a substring of housenumber on the other side, if the number is at least two digits
+join <- join %>%
+  mutate(
+    condition = nchar(as.character(house_number_2)) > 1 & nchar(as.character(house_number_1)) > 1,
+    substring_left_check = ifelse(condition, str_detect(as.character(house_number_2), as.character(house_number_1)), FALSE),
+    substring_right_check = ifelse(condition, str_detect(as.character(house_number_1), as.character(house_number_2)), FALSE),
+    hnr_sim = ifelse((substring_left_check | substring_right_check) & hnr_sim<0.9 , 0.9, hnr_sim)
+  ) %>%
+  select(-condition, -substring_right_check, -substring_left_check)
+
+join <- join %>%
+  mutate(
+    hnr_sim = if_else(
+      !is.na(as.numeric(house_number_1)) & !is.na(as.numeric(house_number_2)),
+      ifelse(abs(as.numeric(house_number_1) - as.numeric(house_number_2)) < 10 & hnr_sim<0.9, 0.9, hnr_sim),
+      hnr_sim
+    )
+  )
+
+
+
+## end street similarity
+
+
+
+### 3. type of school ----
+
+# frequency table of poitype & categorie
+
+
+
+# Extract the value of type_primary to a new column
+join <- join %>%
+  mutate(
+    type_kindergarten = as.numeric(coalesce(sapply(properties, extract_json_value, key = "type_kindergarten"), 0)),
+    type_primary      = as.numeric(coalesce(sapply(properties, extract_json_value, key = "type_primary"), 0)),
+    type_secondary    = as.numeric(coalesce(sapply(properties, extract_json_value, key = "type_secondary"), 0)),
+    type_tertiary     = as.numeric(coalesce(sapply(properties, extract_json_value, key = "type_tertiary"), 0)),
+    type_special_needs= as.numeric(coalesce(sapply(properties, extract_json_value, key = "type_special_needs"), 0))
+  )
+
+join$off_kindergarten <- ifelse(grepl("kleuteronderwijs", join$poitype), 1, 0)
+join$off_primary <- ifelse(grepl("lager onderwijs", join$poitype), 1, 0)
+join$off_secondary <- ifelse(join$categorie == "Secundair onderwijs", 1, 0)
+join$off_tertiary <- ifelse(join$categorie == "Hoger onderwijs", 1, 0)
+join$off_special_needs <- ifelse(grepl("Buitengewoon", join$poitype), 1, 0)
+
+
+# if any combination of type is both 1, set same_school_type to 1
+join$same_school_type <- ifelse(join$off_kindergarten == 1 & join$type_kindergarten == "1", 1, 0) +
+  ifelse(join$off_primary == 1 & join$type_primary == "1", 1, 0) +
+  ifelse(join$off_secondary == 1 & join$type_secondary == "1", 1, 0) +
+  ifelse(join$off_tertiary == 1 & join$type_tertiary == "1", 1, 0) +
+  ifelse(join$off_special_needs == 1 & join$type_special_needs == "1", 1, 0)
+
+
+join <- join %>%
+  select(-name_1,-name_2,-other_names,-house_number_1, -house_number_2, -street_1, -street_2, -type_kindergarten, -type_primary, -type_secondary, -type_tertiary, -off_kindergarten, -off_primary, -off_secondary, -off_tertiary, -off_special_needs, -type_special_needs)
+
+## combine choice elements
+
+# calculate address certainty
+join<- join %>%
+  mutate(address_certainty = case_when(
+    streetsim == 1 & hnr_sim == 1 ~ 1,
+    streetsim == 1 & is.na(hnr_sim) ~ 0.95,
+    streetsim >= 0.9 & hnr_sim >= 0.9 ~ 0.93,
+    streetsim >= 0.9 & is.na(hnr_sim) ~ 0.92,
+    streetsim >= 0.9 & hnr_sim < 0.9 ~ 0.85,
+    TRUE ~ 0
+  ))
+
+# status message
+choice_prep_time<-Sys.time()
+choice_prepping_time <- round(as.numeric(difftime(choice_prep_time, join_time, units = "secs")), 2)
+print(paste0("Prepared for choosing which links to keep (took ",choice_prepping_time," seconds), now making choices"))
+
+
+
+### Make choices ----
+# SELECT only if certain quality thresholds met
+join <- join %>%
+  filter(distance < distance_matched_threshold | address_certainty >= 0.85 | same_school_type == 1 | same_name ==1)
+
+# order by distance
+join <- join %>%
+  group_by(ogc_fid) %>% 
+  arrange(distance) %>%
+  mutate(distance_id = row_number()) %>%
+  ungroup()
+
+# order by address certainty
+join <- join %>%
+  group_by(ogc_fid) %>% 
+  arrange(desc(address_certainty)) %>%
+  mutate(address_certainty_id = row_number()) %>%  
+  ungroup()
+
+# create scoring variable:
+# the closest object gets 1 point if it is within threshold, 0.75 if it is within 2xtreshold. Further objects get 0.65 points if they are within the distance threshold
+# the best address gets 0.75 points, other addresses with a decent score get 0.5 points
+# if the names are the same, the object gets 1 point
+# if the school types are the same, the object gets 0.5 points
+join <- join %>%
+  mutate(same_name=ifelse(is.na(same_name), 0, same_name)) %>%
+  mutate(
+    score = 
+      ifelse(distance_id == 1 & distance < distance_matched_threshold, 1, 0) +
+      ifelse(distance_id == 1 & distance > distance_matched_threshold & distance < 2*distance_matched_threshold, 0.75, 0) +
+      ifelse(distance_id >1 & distance < distance_matched_threshold, 0.65, 0) +
+      ifelse(address_certainty>0 & address_certainty_id == 1, 0.75, 0) + ifelse(address_certainty>0 & address_certainty_id > 1, 0.5, 0) +
+      ifelse(same_name == 1, 1, 0) + 
+      ifelse(same_school_type == 1, 0.5, 0)
+  )
+
+
+
+# keep only the cases where the score equals the max score for the ogc_fid
+join <- join %>%
+  group_by(ogc_fid) %>% 
+  filter(score == max(score)) %>%
+  ungroup()
+
+# if there's still more than one, keep the one with the closest distance (prepare filter)
+join <- join %>%
+  group_by(ogc_fid) %>% 
+  arrange(distance) %>%
+  mutate(
+    count=n(),
+    distance_id = row_number()
+  ) %>%
+  ungroup()
+# filter
+join <- join %>%
+  filter(count == 1 | (count>1 & distance_id == 1))
+
+
+# Minimum threshold to keep a link: if score<1.75 & distance > threshold, delete the row
+join <- join %>%
+  filter(score >= 1.75 | distance < distance_matched_threshold)
+
+
+# simplify data
+
+join_simplified <- join %>%
+  select(ogc_fid, osm_id=original_id) %>%
+  distinct()
+
+vla_joined <- left_join(vla, join_simplified, by = "ogc_fid")
+
+vla_joined <- st_as_sf(vla_joined, wkt="off_geometry")
+vla_joined$off_geometry <- st_set_crs(vla_joined$off_geometry, 31370)
+vla_joined <- st_transform(vla_joined, 4326)
+
+
+# aggregation ID
+vla_joined <- vla_joined %>%
+  mutate(agg_id = ifelse(!is.na(osm_id),osm_id,st_as_text(off_geometry)))
+
+
+# merge osm_cleaned_orig
+vla_joined <- left_join(vla_joined, as.data.frame(osm_cleaned_orig), by = c("osm_id"="original_id"))
+
+
+
+# status message
+choice_time<-Sys.time()
+choosing_time <- round(as.numeric(difftime(choice_time, choice_prep_time, units = "secs")), 2)
+print(paste0("Choices made (took ",choosing_time," seconds), now summarizing data"))
+
+# create the school types again
+vla_joined$type_kindergarten <- ifelse(grepl("kleuteronderwijs", vla_joined$poitype), 1, 0)
+vla_joined$type_primary <- ifelse(grepl("lager onderwijs", vla_joined$poitype), 1, 0)
+vla_joined$type_secondary <- ifelse(vla_joined$categorie == "Secundair onderwijs", 1, 0)
+vla_joined$type_tertiary <- ifelse(vla_joined$categorie == "Hoger onderwijs", 1, 0)
+vla_joined$type_special_needs <- ifelse(grepl("Buitengewoon", vla_joined$poitype), 1, 0)
+
+# prepare addresses
+# Step 1: Prepare Address Data (prep_add0)
+address_unique <- as.data.frame(vla_joined) %>%
+  select(agg_id, straat, huisnummer) %>%
+  distinct()
+# Step 2: Concatenate House Numbers (prep_add1) with reframe and order by straat and huisnummer
+address_unique <- address_unique %>%
+  group_by(agg_id, straat) %>%
+  reframe(
+    address = paste0(straat, ' ', str_c(sort(huisnummer), collapse = '-'))
+  )
+# Step 3: Create Unique Addresses (address_unique) with alphabetical ordering
+address_unique <- address_unique %>%
+  group_by(agg_id) %>%
+  summarize(
+    address = paste(unique(address), collapse = '; ')
+  )
+# join to vla_joined
+vla_joined <- left_join(vla_joined, address_unique, by = "agg_id")
+
+
+
+
+
+# aggregate
+vla_summarized <- clean_empty_strings(vla_joined) %>%
+  group_by(agg_id) %>%
+  summarize(
+    across(
+      c(ogc_fid, naam, poid, telefoon, email, poitype, link1, link2),
+      collapse_unique
+    ),
+    postcode=first(postcode),
+    municipality=first(gemeente),
+    address=first(address),
+    type_kindergarten = max(type_kindergarten),
+    type_primary = max(type_primary),
+    type_secondary = max(type_secondary),
+    type_tertiary = max(type_tertiary),
+    type_special_needs = max(type_special_needs),
+    osm_id=first(osm_id),
+    name=first(name),
+    properties_osm=first(properties),
+    geometry_point=first(off_geometry),
+    geometry_osm=first(osm_geometry_wkb))
+
+
+# create vla properties
+
+vla_summarized <- vla_summarized %>%
+  rowwise() %>%
+  mutate(off_properties = jsonlite::toJSON(
+    purrr::discard(list(
+      official_id = poid,
+      address = paste0(
+        address, ", ",
+        postcode, " ",
+        municipality
+      ),
+      website_administrative = link1,
+      local_website = link2,
+      local_phone = telefoon,
+      local_email = email,
+      school_types = poitype,
+      type_kindergarten = type_kindergarten,
+      type_primary = type_primary,
+      type_secondary = type_secondary,
+      type_tertiary = type_tertiary,
+      type_special_needs = type_special_needs
+    ), is.na), auto_unbox = TRUE)) %>%
+  ungroup()
+
+
+vla_summarized <- as.data.frame(vla_summarized)
+
+# Ensure the CRS is set correctly for geometry columns if not already
+st_crs(vla_summarized$geometry_point) <- 4326
+st_crs(vla_summarized$geometry_osm) <- 4326
+
+# Use dplyr::case_when to conditionally assign geometries while preserving sf class
+vla_summarized <- vla_summarized %>%
+  rowwise() %>%
+  mutate(
+    original_id = ifelse(is.na(osm_id), poid, paste0("https://osm.org/", osm_id)),
+    name = ifelse(is.na(osm_id), toJSON(list(dut = naam), auto_unbox = TRUE), name),
+    name = ifelse(name == toJSON(list(und = "school"), auto_unbox = TRUE), toJSON(list(dut = naam), auto_unbox = TRUE), name),
+    name_source = ifelse(is.na(osm_id), 'Departement Onderwijs en Vorming', 'OpenStreetMap + Departement Onderwijs en Vorming'),
+    geometry = case_when(
+      is.na(osm_id) ~ geometry_point,
+      TRUE ~ geometry_osm
+    )
+  ) %>%
+  ungroup()
+
+
+
+# Remove the unused geometry columns
+vla_summarized <- vla_summarized %>%
+  select(-geometry_point, -geometry_osm)
+
+# Ensure the resulting dataframe is an sf object
+vla_summarized <- st_as_sf(vla_summarized)
+
+# Check and set CRS if necessary
+st_crs(vla_summarized) <- 4326
+
+
+
+# Save the results beyond the function
+vla_summarized <<- vla_summarized %>%
+  select(original_id,name,properties_osm, off_properties, name_source)
+
+
+
+}, 
+error = function(e) {
+  stop(paste("Error transforming VLA data:", e))
+})
+
+# status message
+finish<-Sys.time()
+total_time <- round(as.numeric(difftime(finish, start_time, units = "secs")), 2)
+print(paste0("Transformation of VLA is done (took ",total_time," seconds)"))
+}
+
+
+
+
+
+
+
+
+# GER transformation ----
+
+TransformGER <- function(){ 
+  tryCatch({
+    print("Start transformation of GER data")
+    start_time <- Sys.time()
+    
+
+con_pg <- get_con()
+ger <- dbGetQuery(con_pg, "SELECT 
+  row_number() OVER (ORDER BY schule) AS ogc_fid,
+	type AS type,
+	Schule as school,
+	Straße as street,
+	\"plz.und.ort\" as zip,
+	Gemeinde as municipality,
+	Schulleiter AS contact,
+	\"e.mail.1\" as email,
+  ST_AsHEXEWKB(geometry) as off_geometry -- is already in Lambert72
+FROM raw_data.ger_dgov_email_schools_g;")
+
+dbDisconnect(con_pg)
+
+
+
+
+# create ger as sf with the original geometry
+ger$off_geometry <- st_as_sfc(structure(ger$off_geometry, class = "WKB"), EWKB = TRUE)
+ger$off_geometry <- st_set_crs(ger$off_geometry, 31370)
+ger <- st_as_sf(ger)
+
+# status message
+download_time<-Sys.time()
+downloading_time <- round(as.numeric(difftime(download_time, start_time, units = "secs")), 2)
+print(paste0("Downloaded GER data (took ",downloading_time," seconds), now joining to OSM data"))
+
+
+
+# join nearby objects from both datasets
+join <- st_join(ger, osm_cleaned, join = st_is_within_distance, dist = distance_raw_threshold)
+join <- as.data.frame(join)
+
+# add the geometry from the osm objects
+osm_cleaned_geo<-osm_cleaned %>% select(original_id, osm_geometry_wkb)
+osm_cleaned_geo<-as.data.frame(osm_cleaned_geo)
+join <- left_join(join, osm_cleaned_geo, by = "original_id")
+
+# Calculate distance between potential matches
+#join$distance <- mapply(calculate_distance, join$osm_geometry_wkb, join$geometry)
+# we use euclidian distance, as our default Hausdorf distance isn't great for point vs polygon comparisons (de facto it gives the furthest point from the nearby polygons)
+join$distance <- mapply(calculate_eucl_distance, join$osm_geometry_wkb, join$off_geometry)
+
+# keep a backup with all records, including the ones that do not have a link to an OSM geometry
+#join_all <- join
+#join<-join_all
+
+# status message
+join_time<-Sys.time()
+joining_time <- round(as.numeric(difftime(join_time, download_time, units = "secs")), 2)
+print(paste0("Joined GER data to OSM (took ",joining_time," seconds), now preparing choosing which links to keep"))
+
+
+# keep only the records with a link to an OSM geometry
+join <- join %>% filter(!is.na(original_id))
+
+# acceptance elements:
+### 1. name similarity ----
+
+#extract name from languaged name + extract other_names from properties
+join$name_1<-tolower(join$school)
+join$name_2 <- tolower(mapply(extract_json_value, join$name, "und"))
+join$other_names <- tolower(mapply(extract_json_value, join$properties, "other_names"))
+#note: extract_json_value requires loading utils.R
+
+# remove accents
+join <- join %>%
+  mutate(
+    name_1=stri_trans_general(name_1, "Latin-ASCII"),
+    name_2=stri_trans_general(name_2, "Latin-ASCII"),
+    other_names=stri_trans_general(other_names, "Latin-ASCII"),
+  )
+
+# check for identical names
+join <- join %>%
+  mutate(
+    same_name = ifelse(name_1==name_2 | name_1==other_names, 1, 0)
+  )
+
+
+
+
+# apply to these columns:
+columns_to_clean <- c("name_1", "name_2", "other_names")
+
+# default removals
+patterns_to_remove <- c("\"", "”", "“", "´")
+join <- string_removal(join, columns_to_clean, patterns_to_remove)
+# string_removal is a function defined in utils.R
+
+# remove words specific to the context
+patterns_to_remove <- c("gemeindegrundschule","gemeindeschule","schule")
+join <- string_removal(join, columns_to_clean, patterns_to_remove)
+
+
+# remove leading and trailing whitespaces
+join <- join %>%
+  mutate(
+    name_1 = trimws(name_1),
+    name_2 = trimws(name_2),
+    other_names = trimws(other_names)
+  )
+
+# find the longest common substring
+join <- join %>%
+  rowwise() %>%
+  mutate(lcs=LCSn(c(tolower(name_1), tolower(name_2)))) %>%
+  mutate(longest_common_str_length=nchar(lcs)) %>%
+  mutate(other_names=ifelse(is.na(other_names), " ", other_names)) %>%
+  mutate(alt_lcs=LCSn(c(tolower(name_1), tolower(other_names)))) %>%
+  mutate(alt_longest_common_str_length=nchar(alt_lcs)) %>%
+  mutate(longest_common_str_length=max(longest_common_str_length, alt_longest_common_str_length)) %>%
+  ungroup()
+
+
+# shorten name before calculating length
+patterns_to_remove <- c("go!", "provinciaal", "voor buitengewoon")
+columns_to_clean <- c("name_1", "name_2")
+join <- string_removal(join, columns_to_clean, patterns_to_remove)
+join$length_name<-nchar(join$name_1)
+
+
+# Decide when we consider the names to be the same (length should de significant)
+join <- join %>%
+  mutate(
+    same_name = ifelse(
+      ((longest_common_str_length > 10 | (longest_common_str_length > 4 & longest_common_str_length <= 10 & longest_common_str_length > length_name / 2)) | ((name_1==name_2 | name_1==as.character(other_names)) & tolower(mapply(extract_json_value, name, "und"))!="school") | same_name==1),
+      1,
+      0
+    )
+  )
+
+join <- join %>%
+  select(-lcs, -alt_lcs, -longest_common_str_length, -alt_longest_common_str_length, -length_name)
+
+
+### 2. street similarity ----
+
+
+# split street and house number
+join <- join %>%
+  mutate(
+    house_number_1 = ifelse(grepl("\\b[0-9]+\\b", street), sub("^(.*\\s)(.*[0-9].*)$", "\\2", street), NA),
+    street_1 = tolower(ifelse(grepl("\\b[0-9]+\\b", street), sub("^(.*\\s)(.*[0-9].*)$", "\\1", street), street))
+  )
+
+# set hnr_2
+join <- join %>%
+  mutate(house_number_2 = addr_housenumber)
+
+# set hnr_t as missing if identical to street_2
+join <- join %>%
+  mutate(house_number_1 = ifelse(house_number_1 == street_1, NA, house_number_1))
+
+
+# SIMPLIFY STREET NAMES
+
+# remove accents
+join <- join %>%
+  mutate(
+    street_1 = stri_trans_general(street_1, "Latin-ASCII"),
+    street_2 = tolower(stri_trans_general(addr_street, "Latin-ASCII"))
+  )
+
+
+
+
+
+
+
+# deal with common abbreviations; remove usual additions to only compare the core of the street name
+
+replacements <- c(
+  "rue de ", "",
+  "rue des ", "",
+  "rue du ", "",
+  "rue", "",
+  "st\\.", "sint",
+  "^\\b(st)\\b(?=\\s|\\.)", "sint",
+  "^\\b(bd)\\b(?=\\s|\\.)", "boulevard",
+  "straat", "",
+  "boulevard", "",
+  "avenue", "",
+  "-", " ",
+  "straße", "",
+  "strasse", "",
+  "laan", "",
+  "\\s+$", "",
+  "^\\s+", ""
+)
+# Define the columns to clean
+columns_to_clean <- c("street_1", "street_2")
+join <- string_replacement(join, columns_to_clean, replacements)
+# string_replacement is a function defined in utils.R
+
+# remove leading and trailing whitespaces
+join <- join %>%
+  mutate(
+    street_1 = trimws(street_1),
+    street_2 = trimws(street_2)
+  )
+
+
+# if result is empty string, replace with NA
+join <- join %>%
+  mutate(
+    street_1 = ifelse(street_1 == "", NA, street_1),
+    street_2 = ifelse(street_2 == "", NA, street_2)
+  )
+# END SIMPLIFY STREET NAMES
+
+# make sure the result is still text
+join$street_1 <- as.character(join$street_1)
+join$street_2 <- as.character(join$street_2)
+
+
+# calculate string distance between streets in both datasets
+join <- join %>%
+  mutate(streetsim = stringsim(street_1,street_2))
+
+# check if the street on one side is a substring of street on the other side
+join <- join %>%
+  mutate(
+    condition = nchar(street_1) > 3 & nchar(street_2) > 3,
+    substring_left_check = ifelse(condition, str_detect(street_2, street_1), FALSE),
+    substring_right_check = ifelse(condition, str_detect(street_1, street_2), FALSE),
+    streetsim = ifelse((substring_left_check | substring_right_check) & streetsim<0.9, 0.9, streetsim)
+  ) %>%
+  select(-condition, -substring_right_check, -substring_left_check)
+
+
+
+join <- join %>%
+  mutate(
+    house_number_1 = clean_string(house_number_1),
+    house_number_2 = clean_string(house_number_2)
+  )
+
+# make sure the housenumber is text
+join$house_number_1 <- as.character(join$house_number_1)
+join$house_number_2 <- as.character(join$house_number_2)
+
+join <- join %>%
+  mutate(hnr_sim = stringsim(as.character(house_number_1), as.character(house_number_2)))
+
+
+
+
+# check if the housenumber on one side is a substring of housenumber on the other side, if the number is at least two digits
+join <- join %>%
+  mutate(
+    condition = nchar(as.character(house_number_2)) > 1 & nchar(as.character(house_number_1)) > 1,
+    substring_left_check = ifelse(condition, str_detect(as.character(house_number_2), as.character(house_number_1)), FALSE),
+    substring_right_check = ifelse(condition, str_detect(as.character(house_number_1), as.character(house_number_2)), FALSE),
+    hnr_sim = ifelse((substring_left_check | substring_right_check) & hnr_sim<0.9 , 0.9, hnr_sim)
+  ) %>%
+  select(-condition, -substring_right_check, -substring_left_check)
+
+join <- join %>%
+  mutate(
+    hnr_sim = if_else(
+      !is.na(as.numeric(house_number_1)) & !is.na(as.numeric(house_number_2)),
+      ifelse(abs(as.numeric(house_number_1) - as.numeric(house_number_2)) < 10 & hnr_sim<0.9, 0.9, hnr_sim),
+      hnr_sim
+    )
+  )
+
+
+
+## end street similarity
+
+
+
+### 3. type of school ----
+
+# Extract the value of type_primary to a new column
+join <- join %>%
+  mutate(
+    type_kindergarten = as.numeric(coalesce(sapply(properties, extract_json_value, key = "type_kindergarten"), 0)),
+    type_primary      = as.numeric(coalesce(sapply(properties, extract_json_value, key = "type_primary"), 0)),
+    type_secondary    = as.numeric(coalesce(sapply(properties, extract_json_value, key = "type_secondary"), 0)),
+    type_tertiary     = as.numeric(coalesce(sapply(properties, extract_json_value, key = "type_tertiary"), 0))
+  )
+# NOTE: no special education defined in GER schools
+
+join$ger_kindergarten <- ifelse(join$type == "grundschule", 1, 0)
+join$ger_primary <- ifelse(join$type == "grundschule", 1, 0)
+join$ger_secondary <- ifelse(join$type == "sekundarschule", 1, 0)
+join$ger_tertiary <- ifelse(join$type == "hochschule" | join$type == "förderschule" , 1, 0)
+
+
+# if any combination of type is both 1, set same_school_type to 1
+join$same_school_type <- ifelse(join$ger_kindergarten == 1 & join$type_kindergarten == "1", 1, 0) +
+  ifelse(join$ger_primary == 1 & join$type_primary == "1", 1, 0) +
+  ifelse(join$ger_secondary == 1 & join$type_secondary == "1", 1, 0) +
+  ifelse(join$ger_tertiary == 1 & join$type_tertiary == "1", 1, 0)
+
+
+join <- join %>%
+  select(-name_1,-name_2,-other_names,-house_number_1, -house_number_2, -street_1, -street_2, -type_kindergarten, -type_primary, -type_secondary, -type_tertiary, -ger_kindergarten, -ger_primary, -ger_secondary, -ger_tertiary)
+
+
+## combine choice elements
+
+# calculate address certainty
+join<- join %>%
+  mutate(address_certainty = case_when(
+    streetsim == 1 & hnr_sim == 1 ~ 1,
+    streetsim == 1 & is.na(hnr_sim) ~ 0.95,
+    streetsim >= 0.9 & hnr_sim >= 0.9 ~ 0.93,
+    streetsim >= 0.9 & is.na(hnr_sim) ~ 0.92,
+    streetsim >= 0.9 & hnr_sim < 0.9 ~ 0.85,
+    TRUE ~ 0
+  ))
+
+
+# status message
+choice_prep_time<-Sys.time()
+choice_prepping_time <- round(as.numeric(difftime(choice_prep_time, join_time, units = "secs")), 2)
+print(paste0("Prepared for choosing which links to keep (took ",choice_prepping_time," seconds), now making choices"))
+
+
+### Make choices ----
+# SELECT only if certain quality thresholds met
+join <- join %>%
+  filter(distance < distance_matched_threshold | address_certainty >= 0.85 | same_school_type == 1 | same_name ==1)
+
+# order by distance
+join <- join %>%
+  group_by(ogc_fid) %>% 
+  arrange(distance) %>%
+  mutate(distance_id = row_number()) %>%
+  ungroup()
+
+# order by address certainty
+join <- join %>%
+  group_by(ogc_fid) %>% 
+  arrange(desc(address_certainty)) %>%
+  mutate(address_certainty_id = row_number()) %>%  
+  ungroup()
+
+# create scoring variable:
+# the closest object gets 1 point if it is within threshold, 0.75 if it is within 2xtreshold. Further objects get 0.65 points if they are within the distance threshold
+# the best address gets 0.75 points, other addresses with a decent score get 0.5 points
+# if the names are the same, the object gets 1 point
+# if the school types are the same, the object gets 0.5 points
+join <- join %>%
+  mutate(same_name=ifelse(is.na(same_name), 0, same_name)) %>%
+  mutate(
+    score = 
+      ifelse(distance_id == 1 & distance < distance_matched_threshold, 1, 0) +
+      ifelse(distance_id == 1 & distance > distance_matched_threshold & distance < 2*distance_matched_threshold, 0.75, 0) +
+      ifelse(distance_id >1 & distance < distance_matched_threshold, 0.65, 0) +
+      ifelse(address_certainty>0 & address_certainty_id == 1, 0.75, 0) + ifelse(address_certainty>0 & address_certainty_id > 1, 0.5, 0) +
+      ifelse(same_name == 1, 1, 0) + 
+      ifelse(same_school_type == 1, 0.5, 0)
+  )
+
+
+# keep only the cases where the score equals the max score for the ogc_fid
+join <- join %>%
+  group_by(ogc_fid) %>% 
+  filter(score == max(score)) %>%
+  ungroup()
+
+# if there's still more than one, keep the one with the closest distance (prepare filter)
+join <- join %>%
+  group_by(ogc_fid) %>% 
+  arrange(distance) %>%
+  mutate(
+    count=n(),
+    distance_id = row_number()
+  ) %>%
+  ungroup()
+
+# filter
+join <- join %>%
+  filter(count == 1 | (count>1 & distance_id == 1))
+
+
+# Minimum threshold to keep a link: if score<1.75 & distance > threshold, delete the row
+join <- join %>%
+  filter(score >= 1.75 | distance < distance_matched_threshold)
+
+
+
+# status message
+choice_time<-Sys.time()
+choosing_time <- round(as.numeric(difftime(choice_time, choice_prep_time, units = "secs")), 2)
+print(paste0("Choices made (took ",choosing_time," seconds), now summarizing data"))
+
+
+# simplify data
+
+join_simplified <- join %>%
+  select(ogc_fid, osm_id=original_id) %>%
+  distinct()
+
+ger_joined <- left_join(ger, join_simplified, by = "ogc_fid")
+
+ger_joined <- st_as_sf(ger_joined, wkt="off_geometry")
+ger_joined$off_geometry <- st_set_crs(ger_joined$off_geometry, 31370)
+ger_joined <- st_transform(ger_joined, 4326)
+
+
+# aggregation ID
+ger_joined <- ger_joined %>%
+  mutate(agg_id = ifelse(!is.na(osm_id),osm_id,st_as_text(off_geometry)))
+
+
+# merge osm_cleaned_orig
+ger_joined <- left_join(ger_joined, as.data.frame(osm_cleaned_orig), by = c("osm_id"="original_id"))
+
+
+# create the school types again
+ger_joined$type_kindergarten <- ifelse(ger_joined$type == "grundschule", 1, 0)
+ger_joined$type_primary <- ifelse(ger_joined$type == "grundschule", 1, 0)
+ger_joined$type_secondary <- ifelse(ger_joined$type == "sekundarschule", 1, 0)
+ger_joined$type_tertiary <- ifelse(ger_joined$type == "hochschule" | ger_joined$type == "förderschule" , 1, 0)
+
+
+
+
+
+# prepare addresses
+# Step 1: Prepare Address Data (prep_add0)
+
+
+# aggregate
+ger_summarized <- clean_empty_strings(ger_joined) %>%
+  group_by(agg_id) %>%
+  summarize(
+    across(
+      c(type, school, street, zip, municipality, email, contact),
+      collapse_unique
+    ),
+    type_kindergarten = max(type_kindergarten),
+    type_primary = max(type_primary),
+    type_secondary = max(type_secondary),
+    type_tertiary = max(type_tertiary),
+    osm_id=first(osm_id),
+    name=first(name),
+    properties_osm=first(properties),
+    geometry_point=first(off_geometry),
+    geometry_osm=first(osm_geometry_wkb))
+
+# create ger properties
+ger_summarized <- ger_summarized %>%
+  rowwise() %>%
+  mutate(off_properties = jsonlite::toJSON(
+    purrr::discard(list(
+      address = paste0(
+        street, ", ",
+        zip
+      ),
+      local_email = email,
+      school_types = type,
+      contact_person = contact,
+      type_kindergarten = type_kindergarten,
+      type_primary = type_primary,
+      type_secondary = type_secondary,
+      type_tertiary = type_tertiary
+    ), is.na), auto_unbox = TRUE)) %>%
+  ungroup()
+
+
+ger_summarized <- as.data.frame(ger_summarized)
+
+
+
+# Ensure the CRS is set correctly for geometry columns if not already
+st_crs(ger_summarized$geometry_point) <- 4326
+st_crs(ger_summarized$geometry_osm) <- 4326
+
+# Use dplyr::case_when to conditionally assign geometries while preserving sf class
+ger_summarized <- ger_summarized %>%
+rowwise() %>%
+  mutate(
+    original_id = ifelse(is.na(osm_id), "none provided", paste0("https://osm.org/", osm_id)),
+    name = ifelse(is.na(osm_id), toJSON(list(ger = school), auto_unbox = TRUE), name),
+    name = ifelse(name == toJSON(list(und = "school"), auto_unbox = TRUE), toJSON(list(ger = school), auto_unbox = TRUE), name),
+    name_source = ifelse(is.na(osm_id), 'Ostbelgien Bildung', 'OpenStreetMap + Ostbelgien Bildung'),
+    geometry = case_when(
+      is.na(osm_id) ~ geometry_point,
+      TRUE ~ geometry_osm
+    )
+  ) %>%
+  ungroup()
+
+
+# Remove the unused geometry columns
+ger_summarized <- ger_summarized %>%
+  select(-geometry_point, -geometry_osm)
+
+# Ensure the resulting dataframe is an sf object
+ger_summarized <- st_as_sf(ger_summarized)
+
+# Check and set CRS if necessary
+st_crs(ger_summarized) <- 4326
+
+# Verify if geometries are valid
+invalid_geometries <- ger_summarized %>%
+  filter(!st_is_valid(geometry))
+
+ger_summarized <<- ger_summarized %>%
+  select(original_id,name,properties_osm, off_properties, name_source)
+
+  }, 
+error = function(e) {
+  stop(paste("Error transforming GER data:", e))
+})
+  
+  # status message
+  finish<-Sys.time()
+  total_time <- round(as.numeric(difftime(finish, start_time, units = "secs")), 2)
+  print(paste0("Transformation of GER is done (took ",total_time," seconds)"))
+}
+
+
+
+
+# Merge the regions ----
+
+MergeRegions <- function(){ 
+  tryCatch({
+    print("Merge the regions & upload to ingestion")
+    start_time <- Sys.time()
+    
+
+all_regions <- rbind(ger_summarized, brwa_summarized, vla_summarized)
+
+# add created at with current date in YYYY-MM-DD format
+all_regions$created_at <- Sys.Date()
+
+
+# add objects from OSM polygons that are not in the regions
+
+# select original_id from all_regions where it starts with https://osm.org
+osm_ids <- as.data.frame(all_regions) %>%
+  filter(str_detect(original_id, "https://osm.org")) %>%
+  select(original_id)
+
+osm_cleaned_id <- osm_cleaned_orig %>%
+  mutate(original_id = paste0("https://osm.org/", original_id))
+
+
+osm_add <- osm_cleaned_id %>%
+  anti_join(osm_ids, by = c("original_id" = "original_id")) %>%
+  rename(properties_osm = properties) %>%
+  rename(geometry = osm_geometry_wkb) %>%
+  select(-addr_street,-addr_housenumber, -legend_item,-categorie_name) %>%
+  mutate(off_properties=NA)
+all_regions <- rbind(all_regions, osm_add)
+
+
+# add all OSM points outside of Belgium
+# TODO: outside of Belgium, this reintroduces schools that were already merged to a polygon
+con_pg <- get_con()
+osm_school_point <- dbGetQuery(con_pg, "SELECT 
+  original_id, name, name_source, properties AS properties_osm, NULL as off_properties, created_at, ST_AsHEXEWKB(geometry) as geometry
+  FROM ingestion.osm_school_point;")
+dbDisconnect(con_pg)
+
+osm_school_point$geometry <- st_as_sfc(structure(osm_school_point$geometry, class = "WKB"), EWKB = TRUE)
+osm_school_point$geometry <- st_set_crs(osm_school_point$geometry, 4326)
+osm_school_point <- st_as_sf(osm_school_point)
+
+all_regions <- rbind(all_regions, osm_school_point)
+
+
+# merge brussels schools
+all_regions <- all_regions %>%
+  group_by(original_id) %>% 
+  mutate(
+    count=n(),
+    group_order = row_number()
+  ) %>%
+  ungroup()
+
+
+doubles <- all_regions %>%
+  filter(count==2)
+
+all_regions <- all_regions %>% 
+  mutate(
+    name_source = ifelse(count==2, "OpenStreetMap + Fédération Wallonie-Bruxelles + Departement Onderwijs en Vorming", name_source))
+
+# to better handle JSON
+suppressPackageStartupMessages(library(jqr))
+
+# Define the jq expression
+jq_expression_fwb <- paste0(". | {\"",dl_fwb,"\": .}")
+jq_expression_dov <- paste0(". | {\"",dl_dov,"\": .}")
+jq_expression_ob <- paste0(". | {\"",dl_ob,"\": .}")
+
+# Apply jq transformation cell by cell within the off_properties column
+doubles <- as.data.frame(doubles) %>%
+  mutate(off_properties = ifelse(grepl("Fédération Wallonie-Bruxelles", name_source), jqr::jq(off_properties, jq_expression_fwb), jqr::jq(off_properties, jq_expression_dov)))
+
+doubles <-doubles %>%
+  group_by(original_id) %>%
+  summarize(off_properties_merged=paste(unique(off_properties), collapse = '; '))
+
+# deactivating jqr as it affects general R behavior
+suppressPackageStartupMessages(detach("package:jqr", unload = TRUE))
+
+# add the result to the all_regions
+all_regions <- all_regions %>%
+  left_join(doubles, by="original_id") %>%
+  mutate(off_properties = ifelse(!is.na(off_properties_merged), off_properties_merged, off_properties)) %>%
+  filter((count==2 & group_order==1) | count!= 2) %>%
+  select(-count, -group_order, -off_properties_merged)
+
+# end merge brussels schools
+
+# add data_list_id
+all_regions <- all_regions %>%
+  mutate(data_list_id = case_when(
+  name_source == 'Ostbelgien Bildung' ~ dl_ob,
+  name_source == 'OpenStreetMap + Fédération Wallonie-Bruxelles + Departement Onderwijs en Vorming' ~ dl_osm,
+  name_source == 'OpenStreetMap + Departement Onderwijs en Vorming' ~ dl_osm,
+  name_source == 'Fédération Wallonie-Bruxelles' ~ dl_fwb,
+  name_source == 'OpenStreetMap + Fédération Wallonie-Bruxelles' ~ dl_osm,
+  name_source == 'Departement Onderwijs en Vorming' ~ dl_dov,
+  name_source == 'OpenStreetMap (polygon data)' ~ dl_osm,
+  name_source == 'OpenStreetMap (point data)' ~ dl_osm,
+  name_source == 'OpenStreetMap + Ostbelgien Bildung' ~ dl_osm,
+  TRUE ~ NA_character_
+)) 
+
+# add legend item
+all_regions <- all_regions %>% 
+  mutate(legend_item = toJSON(list(
+    ger = 'schüle',
+    dut = 'school',
+    fre = 'école',
+    eng = 'school'
+  ), auto_unbox = TRUE)) %>%
+  mutate(legend_item_id = .env$legend_item_id)
+
+# add properties
+all_regions <- all_regions %>% 
+  mutate(properties = ifelse(grepl("OpenStreetMap", name_source), properties_osm, off_properties))
+
+# add properties_secondary
+
+suppressPackageStartupMessages(library(jqr))
+
+
+# Function to apply jq transformation safely
+apply_jq_safe <- function(json_str, jq_expr) {
+  if (!is.na(json_str) && json_str != "") {
+    tryCatch(
+      jqr::jq(json_str, jq_expr),
+      error = function(e) {
+        json_str  # return the original json_str if jq fails
+      }
+    )
+  } else {
+    json_str  # return the original json_str if it is NA or empty
+  }
+}
+
+# Apply jq transformation cell by cell within the off_properties column
+all_regions <- all_regions %>%
+  mutate(properties_secondary = case_when(
+    "OpenStreetMap + Fédération Wallonie-Bruxelles"== name_source ~ sapply(off_properties, apply_jq_safe, jq_expression_fwb),
+    "OpenStreetMap + Departement Onderwijs en Vorming"== name_source ~ sapply(off_properties, apply_jq_safe, jq_expression_dov),
+    "OpenStreetMap + Ostbelgien Bildung"== name_source ~ sapply(off_properties, apply_jq_safe, jq_expression_ob),
+    "OpenStreetMap + Fédération Wallonie-Bruxelles + Departement Onderwijs en Vorming"==name_source ~ off_properties
+  ))
+# deactivating jqr as it affects general R behavior
+suppressPackageStartupMessages(detach("package:jqr", unload = TRUE))
+
+# set risk_level
+all_regions <- all_regions %>%
+  rowwise() %>%
+  mutate(
+    type_kindergarten_off = extract_json_value(off_properties, "type_kindergarten"),
+    type_kindergarten_osm = extract_json_value(properties_osm, "type_kindergarten"),
+    type_primary_off = extract_json_value(off_properties, "type_primary"),
+    type_primary_osm = extract_json_value(properties_osm, "type_primary"),
+    type_special_needs_off = extract_json_value(off_properties, "type_special_needs"),
+    type_special_needs_osm = extract_json_value(properties_osm, "type_special_needs"),
+    risk_level = case_when(
+      type_kindergarten_off == 1 | type_kindergarten_osm == 1 | type_special_needs_off==1 | type_special_needs_osm==1 ~ 3,
+      type_primary_off == 1 | type_primary_osm == 1 ~ 2,
+      TRUE ~ 1
+    )
+  ) %>%
+  ungroup() %>%
+  select(-type_kindergarten_off, -type_kindergarten_osm, -type_primary_off, -type_primary_osm, -type_special_needs_off, -type_special_needs_osm)  # Remove intermediate columns
+
+# check for invalid, missing, empty geometries and geometrycollections
+test_raw <- all_regions %>%
+  filter(is.na(geometry) |  !st_is_valid(geometry) | st_is(geometry, "GEOMETRYCOLLECTION") | st_is_empty(geometry))
+print(paste0("The number of invalid, missing, empty geometries and geometrycollections is: ", nrow(test_raw)))
+
+# generate UUID & keep only relevant columns
+all_regions <- all_regions %>%
+  mutate(id = uuid::UUIDgenerate()) %>%
+  select(id,original_id, name, legend_item, legend_item_id, data_list_id, risk_level, properties, properties_secondary, created_at)
+
+
+
+# Upload to ingestion table ----
+
+# Importing JSONB is apparently an issue, so we first turn those fields into text
+table_without_jsonb<- all_regions
+table_without_jsonb$name <- as.character(table_without_jsonb$name)
+table_without_jsonb$legend_item <- as.character(table_without_jsonb$legend_item)
+table_without_jsonb$properties <- as.character(table_without_jsonb$properties)
+table_without_jsonb$properties_secondary <- as.character(table_without_jsonb$properties_secondary)
+
+# slight reformat to make valid JSON
+table_without_jsonb$properties_secondary <- gsub("}}; {", "},", table_without_jsonb$properties_secondary, fixed = TRUE)
+
+# now push it to a Postgres test table
+con_pg<-get_con()
+table_id <- DBI::Id(
+  schema  = "ingestion",
+  table   = "schools")
+table_id_t <- paste0("ingestion.schools")
+print(paste0("Import ingestion table to postgres at ", table_id_t))
+dbWriteTable(con_pg, table_id, table_without_jsonb, overwrite = TRUE, row.names = FALSE )
+dbDisconnect(con_pg)
+
+
+# SQL statement to update the table structure
+sql <- c("UPDATE ingestion.schools SET geometry = ST_ReducePrecision(geometry, 1e-8);",
+"ALTER TABLE ingestion.schools 
+ALTER COLUMN id SET DATA TYPE uuid USING id::uuid,
+ALTER COLUMN id SET DEFAULT gen_random_uuid(),
+ALTER COLUMN name SET DATA TYPE jsonb USING name::jsonb,
+ALTER COLUMN legend_item SET DATA TYPE jsonb USING legend_item::jsonb,
+ALTER COLUMN legend_item_id SET DATA TYPE uuid USING legend_item_id::uuid,
+ALTER COLUMN data_list_id SET DATA TYPE uuid USING data_list_id::uuid,
+ALTER COLUMN risk_level SET DATA TYPE integer USING risk_level::integer,
+ALTER COLUMN properties SET DATA TYPE jsonb USING properties::jsonb,
+ALTER COLUMN properties_secondary SET DATA TYPE jsonb USING properties_secondary::jsonb,
+ALTER COLUMN created_at SET DATA TYPE timestamp with time zone USING created_at::timestamp with time zone,
+ADD COLUMN imported_at timestamp with time zone,
+ADD COLUMN tags jsonb,
+ADD COLUMN deleted_at timestamp with time zone,
+ADD COLUMN updated_at timestamp with time zone,
+ADD COLUMN created_by uuid,
+ADD COLUMN updated_by uuid,
+ALTER COLUMN geometry TYPE geometry(Geometry,4326) USING geometry::geometry(Geometry,4326);")
+
+# Execute the SQL statements
+con_pg<-get_con()
+for (sql_command in sql) {
+  dbExecute(con_pg, sql_command)
+}
+# Close the connection
+dbDisconnect(con_pg)
+
+
+
+  }, 
+error = function(e) {
+  stop(paste("Error merging regions & uploading to ingestion:", e))
+})
+  
+  # status message
+  finish<-Sys.time()
+  total_time <- round(as.numeric(difftime(finish, start_time, units = "secs")), 2)
+  print(paste0("Done merging the regions & uploading to ingestion (took ",total_time," seconds)"))
+}
+
+
+
+
+### Execute the SQL commands ----
+
+
+TransformOSMpoints <- function() {execute_sql_commands(sql_commands_osm_points, "OSM points transformation")}
+TransformOSMpolygons <- function() {execute_sql_commands(sql_commands_osm_polygons, "OSM polygons transformation")}
+
+### Run the update ----
+
+# set do_name_comparison or remove to not use name distance
+
+# During the name comparison these words are removed because they have little meaning. Otherwise "gemeentelijke basisschool sint-jan" and "gemeentelijke basisschool sint-pieter" would be considered a pretty close match
+
+to_ignore_in_name <- c("college","instituts","institut","communale","fondamentale","fondamental","enseignement","provinciale", "provincial","specialize", "ecole","athenee","secondair","secondaire","instituut","gemeentelijke","gemeentelijk","basisschool","vrije ","lagere school","kleuterschool","onderwijs", "atheneum","middenschool","school","stedelijke","campus","college","basisonderwijs", "provinciaal","gemeindegrundschule","gemeindeschule","schule")
+
+
+
+run_smart_update = function() {
+  smart_update_process("schools", 50, 200, 100, format(Sys.Date(), "%Y-%m-%d"), allow_update_even_if_checks_fail=overrule_checks, do_name_comparison=TRUE, ignore_in_name=to_ignore_in_name, dry_run=do_dry_run,reuse_ingestion_data=reuse_ingestion_data)
+}
+
+
+# Main function -----------------------------------------------------------
+# """"""""""""""""""""----
+
+main_function = function() {
+ if (!reuse_ingestion_data) {
+  geojson_vl<-DownloadFlanders()
+  geojson_brwa<-DownloadBRWA()
+  ger<-DownloadGER()
+  DownloadOSM()
+  CreateImportTable(dataset = geojson_vl, schema = "raw_data", table_name = "vla_depov_poiservice_schools")  
+  CreateImportTable(dataset = geojson_brwa, schema = "raw_data", table_name = "brwa_cfwb_odata_schools")  
+  CreateImportTable(dataset = ger, schema = "raw_data", table_name = "ger_dgov_email_schools")  
+  CreateImportTable(dataset = osm_mpoly, schema = "raw_data", table_name = "osm_school_polygon")  
+  CreateImportTable(dataset = osm_points, schema = "raw_data", table_name = "osm_school_point")  
+  geocoding <- geocoder()
+  brwa_cfwb_odata_schools<-geocoding$GeocodeAndUploadBRWA()
+  ger_dgov_email_schools<-geocoding$GeocodeAndUploadGer()
+  CreateImportTable(dataset = brwa_cfwb_odata_schools, schema = "raw_data", table_name = "brwa_cfwb_odata_schools_gl")  
+  CreateImportTable(dataset = ger_dgov_email_schools, schema = "raw_data", table_name = "ger_dgov_email_schools_g")  
+  TransformOSMpoints()
+  TransformOSMpolygons()
+  DownloadProcessedOSMpoly()
+  TransformBRWA()
+  TransformVL()
+  TransformGER()
+  MergeRegions()
+ }
+  run_smart_update()
+  #create_fdw_views()
+}
+
+if(run_status){
+  main_function()
+}

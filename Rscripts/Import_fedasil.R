@@ -84,20 +84,15 @@ url <- "https://www.fedasil.be/nl/opvangcentra"
 webpage <- read_html(url)
 
 
-
-
-# Read the page
-url <- "https://www.fedasil.be/nl/opvangcentra"
-webpage <- read_html(url)
-
-
 # TRANSFORM ----
 # """""""""""""""""" ----
 
 # Extract all map points
 locations <- html_elements(webpage, ".geolocation-location")
 
-
+#library(xml2)
+#as_list(locations[[106]])
+# Two locations are missing a name. At parse time, they are impossible to identify automatically, so their properties may be incorrect.
 
 parse_location_info <- function(loc) {
   id <- html_attr(loc, "data-views-row-index") 
@@ -216,6 +211,8 @@ data_merged <- data_merged %>%
   ) %>%
   ungroup()
 
+# set empty strings as null
+data_merged <- clean_empty_strings(data_merged)
 
 
 
@@ -258,7 +255,7 @@ ingestion_table_sql <- c("DROP TABLE IF EXISTS ingestion.asylum_reception_centre
     original_id text,  
     name jsonb,
     legend_item jsonb,
-	legend_item_id uuid,
+	  legend_item_id uuid,
     data_list_id uuid,
     risk_level integer,
     properties jsonb,
@@ -279,7 +276,9 @@ ingestion_table_sql <- c("DROP TABLE IF EXISTS ingestion.asylum_reception_centre
     jsonb_strip_nulls(jsonb_build_object(
       'und', CASE 
       WHEN name='Aanmeldcentrum' OR COUNT(*) OVER (PARTITION BY name) > 1 THEN name || ' ' || place
-      ELSE name END)) AS name,
+      WHEN name IS NOT null AND name !='' THEN name
+	  WHEN place IS NOT null AND place !='' THEN place
+	  ELSE 'reception centre for asylum seekers' END)) AS name,
     jsonb_build_object(
       'dut', 'opvangcentrum voor asielzoekers',
       'fre', 'centre d''accueil pour demandeurs d''asile',
@@ -287,10 +286,10 @@ ingestion_table_sql <- c("DROP TABLE IF EXISTS ingestion.asylum_reception_centre
     as legend_item,
     JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
 	  'asylum_centre_operator_type', partner_type,
-      'email', email,
-      'phone', phone,
-      'website', url,
-      'address', LTRIM(CONCAT(REPLACE(street_housenumber,',',''),', ',street_housenumber)))) as properties,
+      'local_email', NULLIF(email,''),
+      'local_phone', NULLIF(phone,''),
+      'local_website', NULLIF(url,''),
+      'address', NULLIF(CONCAT_WS(', ', NULLIF(REPLACE(street_housenumber,',',''),''), NULLIF(postcode_municipality,'')), ''))) as properties,
     2 as risk_level,
     geometry
     FROM
@@ -306,7 +305,7 @@ ingestion_table_sql <- c("DROP TABLE IF EXISTS ingestion.asylum_reception_centre
   '",data_list_id,"'::uuid as data_list_id,
   risk_level,
   properties,
-  geometry,
+  ST_ReducePrecision(geometry, 1e-8) as geometry,
   CURRENT_DATE as created_at
   FROM cleaned;"),
 "ALTER TABLE IF EXISTS ingestion.asylum_reception_centres OWNER to pgn_group_data_team_w;",

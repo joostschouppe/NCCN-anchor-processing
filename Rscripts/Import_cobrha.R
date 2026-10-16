@@ -30,6 +30,7 @@ log_folder <- Sys.getenv("RSCRIPT_LOG_FOLDER")
 # run status
 run_status<-Sys.getenv("RUN_STATUS")
 ## this is set to false and prevents any accidental changes to the database by switching off the main_function(). On Airflow, this is set to true.
+## WARNING: if you manually set this to true, your local private key will be deleted by an unlink operation down the line.
 run_status<-ifelse(tolower(run_status) == "true", TRUE, FALSE)
 
 
@@ -56,6 +57,10 @@ if (run_status==FALSE) {
   Sys.chmod(private_key, mode = "600")
   print(paste0("Created private key at ", private_key))
   print(paste0("File permissions for private key are set to ",as.octmode(file.info(private_key)$mode)))
+  print(paste0("File size after write (to check if content was actually written): ", file.info(private_key)$size))
+  if (file.info(private_key)$size < 100) { 
+    stop("The private key file is very short, it is likely not being read correctly")
+  } 
 }
 
 
@@ -71,46 +76,24 @@ source(paste0(rscript_folder,"/utils.R"))
 library(rvest)
 library(readxl)
 
-
+# DEBUGGING HINTS
+# the raw public & private keys (for old-school Cobrha and Cobrha-Plus, each have ACC & PRD versions) are archived inside the KeePass vault (ParagonDataChannel/Gedeelde%20documenten/Paragon%20Data%20Channel/Server/data_team_pwd.kdbx)
+# the private key for this script is kept in an encrypted Key under Admin>Variables in Airflow
+# in a previous iteration, a lot of extra options were added to the sftp command because their server was very old
+# in this iteration, we only kept -oStrictHostKeyChecking=no. That is needed because when your first connect to a new server, you would normally be prompted about fingerprinting. This setting lets you skip the question.
+# for testing, you can access the docker VM. If you skip the unlink commands below, in the folder /opt/airflow/data, you will find the RSA key that was created for the task. So if you just create a batch_file in that same folder manually, you can hard-code the connection to start debugging where it goes wrong. Sample code (test both with and without the stricthost setting mentioned above):
+# sftp -i id_rsa prd-cobrha-nccn@transfer.ehealth.fgov.be < batch_file.txt
 
 
 
 # EXTRACT ----
 # """""""""""""""""" ----
 
-# Function to retry downloading a file with PSFTP
-retry_download <- function(sftp_options, max_attempts = 7, intervals = c(3, 10, 30)) {
-  for (attempt in seq_len(max_attempts)) {
-    message(paste("Attempt", attempt, "of", max_attempts, "to download file via SFTP..."))
-    
-    # Run SFTP command
-    result <- system2("sftp", args = sftp_options, stdout = TRUE, stderr = TRUE)
-    
-    # Print output for debugging
-    print(result)
-    
-    # Check if the download was successful
-    if (!any(grepl("Permission denied|No more authentication methods to try|Connection closed", result))) {
-      message("Download successful!")
-      return(TRUE)
-    }
-    
-    # If this is the last attempt, throw an error
-    if (attempt == max_attempts) {
-      stop("Failed to download via SFTP after ", max_attempts, " attempts.")
-    }
-    
-    # Wait before retrying
-    Sys.sleep(intervals[min(attempt, length(intervals))])
-  }
-}
-
-
 
 # DOWNLOAD DATA FROM COBRHA SERVER ----
 
 # Define the remote directory
-remote_dir <- "/Listing"
+remote_dir <- "Listing"
 
 # Create a temporary file to store the PSFTP batch commands
 batch_file <- tempfile(fileext = ".txt")
@@ -126,52 +109,23 @@ writeLines(c(
 # Run the command and capture the output (file listing)
 output <- system2("sftp", args = c(
   "-i", private_key,
-  "-oBatchMode=yes",
-  "-o IdentitiesOnly=yes",
   "-oStrictHostKeyChecking=no",
-  "-oHostKeyAlgorithms=+ssh-rsa",
-  "-oKexAlgorithms=+diffie-hellman-group-exchange-sha1",
-  "-oPubkeyAcceptedAlgorithms=+ssh-rsa",
-  "-oMACs=+hmac-sha1",
   sftp_server
 ), stdin = batch_file, stdout = TRUE, stderr = TRUE)
 
 
-# Test if the output looks fine; try again if not
-# Initialize a counter for retries
-retries <- 0
-max_retries <- 7
-
-# Loop to check the condition up to 5 times
-while (!any(grepl("Connected to sftp.ehealth.fgov.be.", output)) && retries < max_retries) {
-  retries <- retries + 1
-  # Wait for 5 seconds
-  Sys.sleep(5)
-  # Re-run the command and update the output
-  output <- system2("sftp", args = c(
-    "-i", private_key,
-    "-oBatchMode=yes",
-    "-o IdentitiesOnly=yes",
-    "-oStrictHostKeyChecking=no",
-    "-oHostKeyAlgorithms=+ssh-rsa",
-    "-oKexAlgorithms=+diffie-hellman-group-exchange-sha1",
-    "-oPubkeyAcceptedAlgorithms=+ssh-rsa",
-    "-oMACs=+hmac-sha1",
-    sftp_server
-  ), stdin = batch_file, stdout = TRUE, stderr = TRUE)
-  message(paste0("Retry ",retries," to get the file list"))
-}
 
 # Print the output to check
 cat(output, sep = "\n")
 
-# Stop execution if the condition is still not met after 5 retries
-if (!any(grepl("Connected to sftp.ehealth.fgov.be.", output))) {
-  stop(paste0("Did not manage to get the eHealth file list after ",max_retries+1," tries. Exiting."))
-}
 
 # Extract only lines that look like filenames
 file_names <- unlist(regmatches(output, gregexpr("HCI_NCCN_\\d{4}-\\d{2}-\\d{2}_\\d{2}-\\d{2}-\\d{2}\\.zip", output)))
+
+if (length(file_names) == 0) {
+  stop("No files matching pattern 'HCI_NCCN_YYYY-MM-DD_HH-MM-SS.zip' found in SFTP listing of ", remote_dir,
+       ". Raw listing output was:\n", paste(output, collapse = "\n"))
+}
 
 # Sort filenames lexicographically (YYYY-MM-DD_HH-MM-SS ensures correct order)
 file_lines_sorted <- sort(file_names, decreasing = TRUE)
@@ -198,31 +152,30 @@ batch_file <- tempfile(fileext = ".txt")
 writeLines(batch_content, batch_file)
 
 
+output <- system2("sftp", args = c(
+  "-i", private_key,
+  "-oStrictHostKeyChecking=no",
+  sftp_server
+), stdin = batch_file, stdout = TRUE, stderr = TRUE)
+
+
 
 # Define SFTP options
 sftp_options <- c(
   "-i", private_key,
   "-oStrictHostKeyChecking=no",
-  "-oHostKeyAlgorithms=+ssh-rsa",
-  "-oKexAlgorithms=+diffie-hellman-group-exchange-sha1",
-  "-oPubkeyAcceptedAlgorithms=+ssh-rsa",
-  "-oMACs=+hmac-sha1",
   "-b", batch_file,  # Batch file with commands
   sftp_server  # Server address must be last
 )
 
-
-
-
 # Run the SFTP command
+result <- system2("sftp", args = sftp_options, stdout = TRUE, stderr = TRUE)
 
-retry_download(sftp_options)
-
-# Clean up the temporary batch file
+# Clean up the temporary batch file & remove the private key
 unlink(batch_file)
-
-
-
+if (run_status==FALSE) {
+  unlink(private_key)
+}
 
 # Unzip "most_recent_file" at "temporary_folder"
 unzip(paste0(temporary_folder,"/",most_recent_file),exdir = temporary_folder)
@@ -348,29 +301,29 @@ data_to_geocode <- data_to_geocode %>% mutate(street = ifelse(site_street=="", h
 data_to_geocode <- data_to_geocode %>% mutate(house_number = ifelse(site_house_number=="", hco_house_number, site_house_number))
 
 #if (nrow(data_empty_zip) > 0) {
-  # select the ones with missing zip
-  data_to_geocode_missing_zip <- data_to_geocode %>% filter(zip_code=="" | is.na(zip_code))
-  # join with zip_all
-  data_to_geocode_missing_zip <- left_join(data_to_geocode_missing_zip, zip_all, by = c("municipality" = "municipality"), relationship= "many-to-many")
-  # set ad_hoc_id_bis to concat ad_hoc_id and row_number
-  data_to_geocode_missing_zip <- data_to_geocode_missing_zip %>% mutate(ad_hoc_id_bis = paste0(ad_hoc_id, "_", row_number()))
-  # set identifier as missing zip
-  data_to_geocode_missing_zip <- data_to_geocode_missing_zip %>% mutate(missing_zip=1)
-  # select objects with known zip code
-  data_to_geocode_known_zip <- data_to_geocode %>% filter(zip_code!="" & !is.na(zip_code))
-  # add ad_hoc_id_bis
-  data_to_geocode_known_zip <- data_to_geocode_known_zip %>% mutate(ad_hoc_id_bis = paste0(ad_hoc_id, "_0"))
-  # set identifier as not missing zip
-  data_to_geocode_known_zip <- data_to_geocode_known_zip %>% mutate(missing_zip=0)
-  # add nis code from nis_all
-  data_to_geocode_known_zip <- left_join(data_to_geocode_known_zip, nis_all, by = c("municipality" = "municipality"))
-  # recreate data_to_geocode from both parts
-  data_to_geocode <- bind_rows(data_to_geocode_missing_zip, data_to_geocode_known_zip)
+# select the ones with missing zip
+data_to_geocode_missing_zip <- data_to_geocode %>% filter(zip_code=="" | is.na(zip_code))
+# join with zip_all
+data_to_geocode_missing_zip <- left_join(data_to_geocode_missing_zip, zip_all, by = c("municipality" = "municipality"), relationship= "many-to-many")
+# set ad_hoc_id_bis to concat ad_hoc_id and row_number
+data_to_geocode_missing_zip <- data_to_geocode_missing_zip %>% mutate(ad_hoc_id_bis = paste0(ad_hoc_id, "_", row_number()))
+# set identifier as missing zip
+data_to_geocode_missing_zip <- data_to_geocode_missing_zip %>% mutate(missing_zip=1)
+# select objects with known zip code
+data_to_geocode_known_zip <- data_to_geocode %>% filter(zip_code!="" & !is.na(zip_code))
+# add ad_hoc_id_bis
+data_to_geocode_known_zip <- data_to_geocode_known_zip %>% mutate(ad_hoc_id_bis = paste0(ad_hoc_id, "_0"))
+# set identifier as not missing zip
+data_to_geocode_known_zip <- data_to_geocode_known_zip %>% mutate(missing_zip=0)
+# add nis code from nis_all
+data_to_geocode_known_zip <- left_join(data_to_geocode_known_zip, nis_all, by = c("municipality" = "municipality"))
+# recreate data_to_geocode from both parts
+data_to_geocode <- bind_rows(data_to_geocode_missing_zip, data_to_geocode_known_zip)
 #}
 
 # set zip_code to the postcode value if it is na or missing
 data_to_geocode <- data_to_geocode %>% mutate(zip_code = ifelse(is.na(zip_code) | zip_code=="", postcode, zip_code))
- #%>% select(-postcode, -municipality_id)
+#%>% select(-postcode, -municipality_id)
 
 data_input_geocode <- data_to_geocode %>% select(ad_hoc_id,ad_hoc_id_bis, street, house_number, zip_code, municipality)
 

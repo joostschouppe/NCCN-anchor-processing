@@ -44,6 +44,11 @@ overrule_checks<-Sys.getenv("OVERRULE_CHECKS")
 overrule_checks<-ifelse(tolower(overrule_checks) == "true", TRUE, FALSE)
 log_folder <- Sys.getenv("RSCRIPT_LOG_FOLDER")
 
+# Set location for files received by email
+offline_storage <-Sys.getenv("OFFLINE_STORAGE")
+
+
+
 # Extra libraries -------------------------------
 # """""""""""""""""" ----------------------
 
@@ -62,8 +67,19 @@ options(scipen = 999)
 
 ## Load data ----
 
+# the data contains a lot of duplicates
+# they are hard to detect automatically
+# when they are full duplicates, add deleted=yes in the excel
+# when they are full duplicates but with other contact info, change the volgnummer to be the same
+
+# the data may contain obviously wrong dates. Check camps starting or ending before or after the summer; ending before they start
+
+# review the addresses of objects that are not geocoded
+# have a look at the x and y columns. Convert notations like 12°12'12'' to decimal
+# check for huge numbers - usually they can be converted by manually adding a comma after 5 or 51 (depending on whether it's an X or Y)
+
 # open excel "C:\temp\scouts\sjabloon-limburg-scout-paragon.xlsx"
-scout <- read_excel("C:/temp/scouts/sjabloon-limburg-scout-paragon-2025.xlsx")
+scout <- read_excel(file.path(offline_storage, "scout/20260702 Gegevens jeugdkampen Limburg 2026.xlsx"))
 
 # remove if deleted=yes
 scout <- scout %>%
@@ -76,7 +92,7 @@ scout_geocoded <- phaco_geocode(data_to_geocode=t_adresse <- scout_sel, colonne_
 
 ## change geometry column name and add results to all records
 full_geocode <- scout_geocoded$data_geocoded_sf
-simple_geocode <- scout_geocoded$data_geocoded_sf[, c("volgnummer", "street_FINAL_detected", "type_geocoding", "tx_munty_descr_nl")]
+simple_geocode <- scout_geocoded$data_geocoded_sf[, c("volgnummer", "street_detected", "type_geocoding", "tx_munty_descr_nl")]
 scout <- left_join(scout, simple_geocode, by = "volgnummer")
 
 # select records without valid geometry
@@ -88,7 +104,7 @@ scout_nofind <- scout %>%
 # create geometry_scout from x and y columns
 scout_sf <- scout %>%
   mutate(geometry_scout = st_sfc(
-    map2(y, x, ~ st_point(c(.x, .y))),
+    map2(x, y, ~ st_point(c(.x, .y))),
     crs = 4326
   ))
 # transform to lambert 72
@@ -98,17 +114,18 @@ scout_sf$geometry_scout <- st_transform(scout_sf$geometry_scout, 31370)
 scout_sf <- scout_sf %>%
   mutate(distance = as.numeric(st_distance(geometry, geometry_scout, by_element = TRUE)))
 
-# if scout geometry available, remove phaco geom
-# if municipality is not identical, flag as possible issue
-# if address not found, flag as issue
-
 
 # decide which geom to use
+## if the distance is great, trust address not coordinates
+## if there are no coordinates, use the geocoded location
+## in all other cases prefer the provided coordinates
 scout_sf <- scout_sf %>%
   mutate(new_geometry = 
-           case_when(st_is_empty(geometry_scout) ~ geometry,
+           case_when(distance>1500 ~ geometry,
+                st_is_empty(geometry_scout) ~ geometry,
                       TRUE ~ geometry_scout))
-
+# if municipality is not identical, flag as possible issue
+# if address not found, flag as issue
 scout_sf <- scout_sf %>%
   mutate(quality_remark = 
            case_when(
@@ -116,8 +133,25 @@ scout_sf <- scout_sf %>%
                                city != tx_munty_descr_nl ~ "municipality name mismatch between raw data and location",
                                distance > 499 ~ "address over 500 meters from raw data location",
                                str_detect(type_geocoding, "elargissement_adj") ~ "post number mismatch between raw data and found address"))
-                               
-         
+
+scout_sf$geometry_scout <- st_transform(scout_sf$geometry_scout, 4326)
+scout_sf$new_geometry <- st_transform(scout_sf$new_geometry, 4326)
+scout_sf$geometry <- st_transform(scout_sf$geometry, 4326)
+
+# save a field with an URL with an OSM route from one geometry to the other
+scout_sf <- scout_sf %>%
+  mutate(
+    osm_route_url = {
+      coords_from <- st_coordinates(geometry)
+      coords_to   <- st_coordinates(new_geometry)
+      sprintf(
+        "https://www.openstreetmap.org/directions?from=%.6f%%2C%.6f&to=%.6f%%2C%.6f",
+        coords_from[, "Y"], coords_from[, "X"],
+        coords_to[, "Y"],   coords_to[, "X"]
+      )
+    }
+  )
+ 
 
 # remove unneeded geometry columns
 scout_sf<-as.data.frame(scout_sf) %>%
@@ -128,16 +162,56 @@ scout_sf<-as.data.frame(scout_sf) %>%
 scout_sf <- scout_sf %>%
   st_set_geometry("geometry")
 
-# transform to 4326
-scout_sf <- st_transform(scout_sf, 4326)
+
+# clean phone number
+
+
 
 # write to geojson at C:\temp\scouts\
-#st_write(scout_sf, "C:/temp/scouts/sjabloon-limburg-scout-paragon-2025.geojson", driver = "GeoJSON", delete_dsn = TRUE)
+#st_write(scout_sf, file.path(offline_storage, "scout/Gegevens jeugdkampen Limburg 2026 processed.geojson"), driver = "GeoJSON", delete_dsn = TRUE)
 # write to KML
 #st_write(scout_sf, "C:/temp/scouts/sjabloon-limburg-scout-paragon-2025.kml", driver = "kml", delete_dsn = TRUE)
 # write to XLSX
-#write_xlsx(scout_sf, "C:/temp/scouts/sjabloon-limburg-scout-paragon-processed-2025.xlsx")
+#write_xlsx(scout_sf, file.path(offline_storage, "scout/delivery 2 Gegevens jeugdkampen Limburg 2026 processed.xlsx"))
 
+
+
+standardize_be_phone <- function(x) {
+  # Strip everything except digits and leading +
+  cleaned <- gsub("[^0-9+]", "", x)
+  
+  # Case 1: already has country code with +
+  has_plus <- grepl("^\\+", cleaned)
+  
+  # Case 2: starts with 00 (alt international prefix) -> convert to +
+  cleaned <- ifelse(grepl("^00", cleaned), paste0("+", substring(cleaned, 3)), cleaned)
+  has_plus <- grepl("^\\+", cleaned)
+  
+  # Case 3: starts with country code 32 but no + (e.g. "32488595528")
+  starts_32_no_plus <- !has_plus & grepl("^32", cleaned) & nchar(cleaned) %in% c(10, 11)
+  cleaned <- ifelse(starts_32_no_plus, paste0("+", cleaned), cleaned)
+  has_plus <- grepl("^\\+", cleaned)
+  
+  # Case 4: starts with 0 (standard BE local format) -> replace 0 with +32
+  starts_0 <- !has_plus & grepl("^0", cleaned)
+  cleaned <- ifelse(starts_0, paste0("+32", substring(cleaned, 2)), cleaned)
+  has_plus <- grepl("^\\+", cleaned)
+  
+  # Case 5: no +, no leading 0, no 32 prefix -> bare 9-digit number missing leading 0
+  # e.g. "478335088" (9 digits) -> add +32
+  bare_8_or_9digit <- !has_plus & grepl("^[0-9]{8,9}$", cleaned)
+  cleaned <- ifelse(bare_8_or_9digit, paste0("+32", cleaned), cleaned)
+  
+  cleaned
+}
+
+scout_sf <- scout_sf %>%
+  rename(phone = `tags (keyword)`)
+
+
+
+scout_sf <- scout_sf %>%
+  mutate(phone_cleaned=standardize_be_phone(phone))
 
 
 
@@ -172,7 +246,7 @@ ingestion_table_sql <- c(
   paste0("with base as (select *, 
 	LTRIM(CONCAT(street, ' ' || CASE WHEN \"number\" IS NULL or \"number\" = '0' THEN 'w/n' ELSE number END, ', ' || CONCAT((\"ZIP\" || ' '), city)))
 	AS address
-	FROM raw_data.scout_limburg),
+	FROM raw_data.scout_limburg_2026),
 
 aggregated as (
 select 
@@ -180,7 +254,7 @@ volgnummer as original_id,
 STRING_AGG(DISTINCT name,'; ') AS name,
 STRING_AGG(DISTINCT address,'; ') AS address,
 STRING_AGG(DISTINCT risk,'; ') AS contact_person,
-STRING_AGG(DISTINCT \"tags (keyword)\",'; ') AS local_phone,
+STRING_AGG(DISTINCT phone_cleaned,'; ') AS local_phone,
 MIN(\"start date\") as start_date,
 MAX(\"end date\") as end_date,
 MIN(quality_remark) as quality_remark,
@@ -225,7 +299,7 @@ JSONB_STRIP_NULLS(JSONB_BUILD_OBJECT(
 	'start_date',start_date,
 	'end_date',end_date
 )),
-geometry,
+ST_ReducePrecision(geometry, 1e-8),
 CURRENT_DATE as created_at
 FROM cleaned;
 "),
@@ -236,17 +310,21 @@ FROM cleaned;
 
 create_ingestion_table <- function() {execute_sql_commands(ingestion_table_sql, "Ingestion table")}
 
-# set to TRUE if you want to update the transformation table even if the checks fail. 
-update_even_if_checks_fail<-FALSE
 
 
+
+
+do_dry_run<-TRUE #set to FALSE when you're happy with results
+reuse_ingestion_data<-FALSE 
+overrule_checks<-TRUE # set to TRUE because the checks will likely fail, as it is normal in this case that a very high percentage of records change
 run_smart_update = function() {
-  smart_update_process("scout_camps", 50, 100, 50, format(Sys.Date(), "%Y-%m-%d"), update_even_if_checks_fail)
+  smart_update_process("scout_camps", 50, 100, 50, format(Sys.Date(), "%Y-%m-%d"), allow_update_even_if_checks_fail=overrule_checks, dry_run=do_dry_run,reuse_ingestion_data=reuse_ingestion_data)
 }
 
 
+
 main_function = function() {
-  CreateImportTable(dataset = scout_sf, schema = "raw_data", table_name = "scout_limburg")  
+  CreateImportTable(dataset = scout_sf, schema = "raw_data", table_name = "scout_limburg_2026")  
   create_ingestion_table()
   run_smart_update()
   #create_transformation_table()
